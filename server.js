@@ -95,22 +95,22 @@ app.get('/api/me', requireAuth, (req, res) => {
 
 app.get('/api/users', requireAuth, (req, res) => {
   const cols = req.user.role === 'admin'
-    ? 'id, name, email, phone, role, role_id, color, hourly_rate, pin'
-    : 'id, name, email, phone, role, role_id, color';
+    ? 'id, name, email, phone, role, position_id, color, hourly_rate, pin'
+    : 'id, name, email, phone, role, position_id, color';
   res.json({ users: db.prepare(`SELECT ${cols} FROM users ORDER BY name`).all() });
 });
 
 app.patch('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
   const target = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.id));
   if (!target) return res.status(404).json({ error: 'User not found' });
-  const { role = target.role, hourly_rate = target.hourly_rate, role_id } = req.body || {};
+  const { role = target.role, hourly_rate = target.hourly_rate, position_id } = req.body || {};
   if (!['admin', 'member'].includes(role)) return res.status(400).json({ error: 'Invalid role' });
 
-  // A position (sub-job) with admin permission makes the person an admin.
-  const newRoleId = role_id === undefined ? target.role_id : (Number(role_id) || null);
+  // A position with admin permission makes the person an admin.
+  const newPositionId = position_id === undefined ? target.position_id : (Number(position_id) || null);
   let newRole = role;
-  if (newRoleId) {
-    const position = db.prepare('SELECT * FROM roles WHERE id = ?').get(newRoleId);
+  if (newPositionId) {
+    const position = db.prepare('SELECT * FROM positions WHERE id = ?').get(newPositionId);
     if (!position) return res.status(400).json({ error: 'Unknown position' });
     newRole = position.is_admin ? 'admin' : 'member';
   }
@@ -122,8 +122,8 @@ app.patch('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
     if (!admins) return res.status(400).json({ error: 'There must be at least one admin' });
   }
   const rate = Math.max(0, Number(hourly_rate) || 0);
-  db.prepare('UPDATE users SET role = ?, role_id = ?, hourly_rate = ? WHERE id = ?')
-    .run(newRole, newRoleId, rate, target.id);
+  db.prepare('UPDATE users SET role = ?, position_id = ?, hourly_rate = ? WHERE id = ?')
+    .run(newRole, newPositionId, rate, target.id);
   let pin;
   if (req.body?.new_pin) {
     pin = newPin();
@@ -242,11 +242,13 @@ app.patch('/api/shifts/:id', requireAuth, requireAdmin, (req, res) => {
 
   const before = db.prepare('SELECT user_id FROM shift_assignees WHERE shift_id = ?').all(shift.id).map((r) => r.user_id);
   let added = [];
+  let removed = [];
   if (Array.isArray(assignee_ids)) {
     db.prepare('DELETE FROM shift_assignees WHERE shift_id = ?').run(shift.id);
     const addAssignee = db.prepare('INSERT OR IGNORE INTO shift_assignees (shift_id, user_id) VALUES (?, ?)');
     for (const uid of assignee_ids) addAssignee.run(shift.id, uid);
     added = assignee_ids.filter((id) => !before.includes(id));
+    removed = before.filter((id) => !assignee_ids.includes(id));
   }
 
   const updated = shiftWithAssignees(db.prepare(SHIFT_QUERY + ' WHERE s.id = ?').get(shift.id));
@@ -260,6 +262,11 @@ app.patch('/api/shifts/:id', requireAuth, requireAdmin, (req, res) => {
   notify(kept.filter((id) => id !== req.user.id), {
     title: `Job updated: ${updated.title}`,
     body: `${fmtShiftTime(updated.starts_at)}${updated.venue_name ? ' @ ' + updated.venue_name : ''}`,
+    url: '/#/schedule',
+  });
+  notify(removed.filter((id) => id !== req.user.id), {
+    title: `You were taken off: ${updated.title}`,
+    body: fmtShiftTime(updated.starts_at),
     url: '/#/schedule',
   });
   res.json({ shift: updated });
@@ -844,7 +851,7 @@ app.post('/api/kiosk/arm', (req, res) => {
 app.post('/api/kiosk/status', requireAuth, requireAdmin, (req, res) => {
   const pin = String(req.body?.pin || '');
   if (!/^\d{5}$/.test(pin)) return res.status(400).json({ error: 'Enter a 5-digit PIN' });
-  const user = db.prepare('SELECT id, name FROM users WHERE pin = ?').get(pin);
+  const user = db.prepare('SELECT id, name, role FROM users WHERE pin = ?').get(pin);
   if (!user) return res.status(404).json({ error: 'PIN not recognized' });
   const entry = db.prepare(TIME_ENTRY_QUERY + ' WHERE t.user_id = ? AND t.clock_out IS NULL').get(user.id) || null;
   const now = Date.now();
@@ -897,37 +904,65 @@ app.get('/api/roles', requireAuth, (req, res) => {
 });
 
 app.post('/api/roles', requireAuth, requireAdmin, (req, res) => {
-  const { name, is_admin = false } = req.body || {};
-  if (!name?.trim()) return res.status(400).json({ error: 'Role name is required' });
-  const info = db.prepare('INSERT INTO roles (name, is_admin) VALUES (?, ?)').run(name.trim(), is_admin ? 1 : 0);
+  const { name } = req.body || {};
+  if (!name?.trim()) return res.status(400).json({ error: 'Job name is required' });
+  const info = db.prepare('INSERT INTO roles (name) VALUES (?)').run(name.trim());
   events.broadcast('roles', {});
   res.json({ role: db.prepare('SELECT * FROM roles WHERE id = ?').get(Number(info.lastInsertRowid)) });
 });
 
 app.patch('/api/roles/:id', requireAuth, requireAdmin, (req, res) => {
-  const role = db.prepare('SELECT * FROM roles WHERE id = ?').get(Number(req.params.id));
-  if (!role) return res.status(404).json({ error: 'Role not found' });
-  const { name = role.name, is_admin = role.is_admin } = req.body || {};
-  if (!name?.trim()) return res.status(400).json({ error: 'Role name is required' });
-  const adminFlag = is_admin ? 1 : 0;
-  if (role.is_admin && !adminFlag) {
-    // Removing admin permission demotes everyone holding this position —
-    // make sure at least one admin remains.
-    const remaining = db.prepare(
-      `SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND (role_id IS NULL OR role_id != ?)`
-    ).get(role.id).n;
-    if (!remaining) return res.status(400).json({ error: 'This would leave no admins' });
-  }
-  db.prepare('UPDATE roles SET name = ?, is_admin = ? WHERE id = ?').run(name.trim(), adminFlag, role.id);
-  db.prepare('UPDATE users SET role = ? WHERE role_id = ?').run(adminFlag ? 'admin' : 'member', role.id);
+  const { name } = req.body || {};
+  if (!name?.trim()) return res.status(400).json({ error: 'Job name is required' });
+  db.prepare('UPDATE roles SET name = ? WHERE id = ?').run(name.trim(), Number(req.params.id));
   events.broadcast('roles', {});
   res.json({ ok: true });
 });
 
 app.delete('/api/roles/:id', requireAuth, requireAdmin, (req, res) => {
   db.prepare('UPDATE roles SET archived = 1 WHERE id = ?').run(Number(req.params.id));
-  db.prepare('UPDATE users SET role_id = NULL WHERE role_id = ?').run(Number(req.params.id));
   events.broadcast('roles', {});
+  res.json({ ok: true });
+});
+
+/* -------------------------------- positions --------------------------------- */
+/* Team positions are separate from clock-out jobs; a position can grant admin. */
+
+app.get('/api/positions', requireAuth, (req, res) => {
+  res.json({ positions: db.prepare('SELECT * FROM positions WHERE archived = 0 ORDER BY name').all() });
+});
+
+app.post('/api/positions', requireAuth, requireAdmin, (req, res) => {
+  const { name, is_admin = false } = req.body || {};
+  if (!name?.trim()) return res.status(400).json({ error: 'Position name is required' });
+  const info = db.prepare('INSERT INTO positions (name, is_admin) VALUES (?, ?)').run(name.trim(), is_admin ? 1 : 0);
+  events.broadcast('positions', {});
+  res.json({ position: db.prepare('SELECT * FROM positions WHERE id = ?').get(Number(info.lastInsertRowid)) });
+});
+
+app.patch('/api/positions/:id', requireAuth, requireAdmin, (req, res) => {
+  const position = db.prepare('SELECT * FROM positions WHERE id = ?').get(Number(req.params.id));
+  if (!position) return res.status(404).json({ error: 'Position not found' });
+  const { name = position.name, is_admin = position.is_admin } = req.body || {};
+  if (!name?.trim()) return res.status(400).json({ error: 'Position name is required' });
+  const adminFlag = is_admin ? 1 : 0;
+  if (position.is_admin && !adminFlag) {
+    // Removing admin permission demotes every holder — keep at least one admin.
+    const remaining = db.prepare(
+      `SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND (position_id IS NULL OR position_id != ?)`
+    ).get(position.id).n;
+    if (!remaining) return res.status(400).json({ error: 'This would leave no admins' });
+  }
+  db.prepare('UPDATE positions SET name = ?, is_admin = ? WHERE id = ?').run(name.trim(), adminFlag, position.id);
+  db.prepare('UPDATE users SET role = ? WHERE position_id = ?').run(adminFlag ? 'admin' : 'member', position.id);
+  events.broadcast('positions', {});
+  res.json({ ok: true });
+});
+
+app.delete('/api/positions/:id', requireAuth, requireAdmin, (req, res) => {
+  db.prepare('UPDATE positions SET archived = 1 WHERE id = ?').run(Number(req.params.id));
+  db.prepare('UPDATE users SET position_id = NULL WHERE position_id = ?').run(Number(req.params.id));
+  events.broadcast('positions', {});
   res.json({ ok: true });
 });
 

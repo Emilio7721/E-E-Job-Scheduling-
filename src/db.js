@@ -193,6 +193,16 @@ db.exec(`
   );
 `);
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS positions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,
+    is_admin   INTEGER NOT NULL DEFAULT 0,
+    archived   INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+`);
+
 // Lightweight migrations for databases created before a column existed.
 function ensureColumn(table, column, ddl) {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
@@ -202,6 +212,7 @@ ensureColumn('users', 'hourly_rate', 'hourly_rate REAL NOT NULL DEFAULT 0');
 ensureColumn('users', 'pin', 'pin TEXT');
 ensureColumn('users', 'phone', 'phone TEXT');
 ensureColumn('users', 'role_id', 'role_id INTEGER');
+ensureColumn('users', 'position_id', 'position_id INTEGER');
 ensureColumn('roles', 'is_admin', 'is_admin INTEGER NOT NULL DEFAULT 0');
 ensureColumn('shifts', 'role_id', 'role_id INTEGER');
 ensureColumn('time_entries', 'venue_id', 'venue_id INTEGER');
