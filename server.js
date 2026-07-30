@@ -97,7 +97,12 @@ app.get('/api/users', requireAuth, (req, res) => {
   const cols = req.user.role === 'admin'
     ? 'id, name, email, phone, role, position_id, color, hourly_rate, pin'
     : 'id, name, email, phone, role, position_id, color';
-  res.json({ users: db.prepare(`SELECT ${cols} FROM users ORDER BY name`).all() });
+  const users = db.prepare(`SELECT ${cols} FROM users ORDER BY name`).all();
+  if (req.user.role === 'admin') {
+    const countSubs = db.prepare('SELECT COUNT(*) AS n FROM push_subs WHERE user_id = ?');
+    for (const u of users) u.devices = countSubs.get(u.id).n;
+  }
+  res.json({ users });
 });
 
 app.patch('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
@@ -130,6 +135,22 @@ app.patch('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
     db.prepare('UPDATE users SET pin = ? WHERE id = ?').run(pin, target.id);
   }
   res.json({ ok: true, pin });
+});
+
+app.delete('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
+  const target = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.id));
+  if (!target) return res.status(404).json({ error: 'User not found' });
+  if (target.id === req.user.id) return res.status(400).json({ error: 'You cannot remove yourself' });
+  if (target.role === 'admin') {
+    const admins = db.prepare(`SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND id != ?`).get(target.id).n;
+    if (!admins) return res.status(400).json({ error: 'There must be at least one admin' });
+  }
+  // Time entries and hour requests cascade with the user; the timesheet history
+  // for a removed person goes with them.
+  db.prepare('DELETE FROM users WHERE id = ?').run(target.id);
+  events.broadcast('users', {});
+  events.broadcast('shifts', {});
+  res.json({ ok: true });
 });
 
 /* --------------------------------- venues --------------------------------- */
@@ -254,16 +275,27 @@ app.patch('/api/shifts/:id', requireAuth, requireAdmin, (req, res) => {
   const updated = shiftWithAssignees(db.prepare(SHIFT_QUERY + ' WHERE s.id = ?').get(shift.id));
   events.broadcast('shifts', {});
   const kept = Array.isArray(assignee_ids) ? assignee_ids.filter((id) => before.includes(id)) : before;
+
+  // People already on the job only hear about it when something really changed.
+  const changes = [];
+  if (shift.title !== updated.title) changes.push('title');
+  if (shift.starts_at !== updated.starts_at || shift.ends_at !== updated.ends_at) changes.push('time');
+  if (shift.venue_id !== updated.venue_id) changes.push('venue');
+  if (shift.role_id !== updated.role_id) changes.push('job');
+  if (shift.notes !== updated.notes) changes.push('notes');
+
   notify(added.filter((id) => id !== req.user.id), {
     title: `New job: ${updated.title}`,
     body: `${fmtShiftTime(updated.starts_at)}${updated.venue_name ? ' @ ' + updated.venue_name : ''}`,
     url: '/#/schedule',
   });
-  notify(kept.filter((id) => id !== req.user.id), {
-    title: `Job updated: ${updated.title}`,
-    body: `${fmtShiftTime(updated.starts_at)}${updated.venue_name ? ' @ ' + updated.venue_name : ''}`,
-    url: '/#/schedule',
-  });
+  if (changes.length) {
+    notify(kept.filter((id) => id !== req.user.id), {
+      title: `Job updated (${changes.join(', ')}): ${updated.title}`,
+      body: `${fmtShiftTime(updated.starts_at)}${updated.venue_name ? ' @ ' + updated.venue_name : ''}`,
+      url: '/#/schedule',
+    });
+  }
   notify(removed.filter((id) => id !== req.user.id), {
     title: `You were taken off: ${updated.title}`,
     body: fmtShiftTime(updated.starts_at),
@@ -438,6 +470,16 @@ app.post('/api/notifications/read', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
+app.delete('/api/notifications/:id', requireAuth, (req, res) => {
+  db.prepare('DELETE FROM notifications WHERE id = ? AND user_id = ?').run(Number(req.params.id), req.user.id);
+  res.json({ ok: true });
+});
+
+app.delete('/api/notifications', requireAuth, (req, res) => {
+  db.prepare('DELETE FROM notifications WHERE user_id = ?').run(req.user.id);
+  res.json({ ok: true });
+});
+
 /* ---------------------------------- push ----------------------------------- */
 
 app.post('/api/push/subscribe', requireAuth, (req, res) => {
@@ -454,6 +496,19 @@ app.post('/api/push/unsubscribe', requireAuth, (req, res) => {
   const { endpoint } = req.body || {};
   if (endpoint) db.prepare('DELETE FROM push_subs WHERE endpoint = ? AND user_id = ?').run(endpoint, req.user.id);
   res.json({ ok: true });
+});
+
+app.post('/api/push/test/:userId', requireAuth, requireAdmin, (req, res) => {
+  const target = db.prepare('SELECT id, name FROM users WHERE id = ?').get(Number(req.params.userId));
+  if (!target) return res.status(404).json({ error: 'User not found' });
+  const devices = db.prepare('SELECT COUNT(*) AS n FROM push_subs WHERE user_id = ?').get(target.id).n;
+  if (!devices) return res.status(400).json({ error: `${target.name} has no device signed up for notifications yet` });
+  notify([target.id], {
+    title: 'Test notification',
+    body: `Sent by ${req.user.name} — notifications are working on this device 🎉`,
+    url: '/#/notifications',
+  });
+  res.json({ ok: true, devices });
 });
 
 app.post('/api/push/test', requireAuth, (req, res) => {
