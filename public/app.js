@@ -666,8 +666,7 @@ function renderSchedule() {
   document.querySelectorAll('[data-shift]').forEach((el) => {
     el.onclick = (e) => {
       if (e.target.closest('[data-respond]')) return;
-      const shift = state.shifts.find((s) => s.id === Number(el.dataset.shift));
-      if (isAdmin) openShiftModal(shift); else openShiftDetail(shift);
+      openShiftDetail(state.shifts.find((s) => s.id === Number(el.dataset.shift)));
     };
   });
   document.querySelectorAll('[data-respond]').forEach((b) => {
@@ -706,13 +705,76 @@ function shiftCardHTML(s) {
 }
 
 function openShiftDetail(s) {
-  openModal(`
-    <h3>${esc(s.title)}</h3>
-    <p class="sub">${fmtDay(s.starts_at)} · ${fmtTime(s.starts_at)} – ${fmtTime(s.ends_at)}</p>
-    ${s.venue_name ? `<p class="sub" style="margin-top:8px">📍 ${esc(s.venue_name)}${s.venue_address ? `<br>${esc(s.venue_address)}` : ''}</p>` : ''}
-    ${s.notes ? `<p style="margin-top:12px;white-space:pre-wrap">${esc(s.notes)}</p>` : ''}
-    <div class="actions"><button class="btn secondary" onclick="document.querySelector('.modal-backdrop').remove()">Close</button></div>
+  const isAdmin = state.me.role === 'admin';
+  const mine = s.assignees.find((a) => a.id === state.me.id);
+  const hours = ((new Date(s.ends_at) - new Date(s.starts_at)) / 3600000).toFixed(1).replace(/\.0$/, '');
+  const statusLabel = { accepted: '✓ Accepted', declined: '✗ Declined', pending: '• Awaiting reply' };
+
+  const modal = openModal(`
+    <div class="detail-title" style="border-left:5px solid ${esc(s.venue_color || 'var(--brand)')}">
+      <h3>${esc(s.title)}</h3>
+      <div class="detail-when">${fmtDay(s.starts_at)}</div>
+    </div>
+
+    <div class="detail-rows">
+      <div class="detail-row">
+        <span class="detail-ico">🕐</span>
+        <span><b>${fmtTime(s.starts_at)} – ${fmtTime(s.ends_at)}</b><div class="sub">${hours} hour${hours === '1' ? '' : 's'}</div></span>
+      </div>
+      ${s.venue_name ? `
+      <div class="detail-row">
+        <span class="detail-ico">📍</span>
+        <span><b>${esc(s.venue_name)}</b>${s.venue_address ? `<div class="sub">${esc(s.venue_address)}</div>` : ''}</span>
+        ${s.venue_address ? `<button class="btn small secondary" data-map-detail="${encodeURIComponent(s.venue_address)}">Map</button>` : ''}
+      </div>` : ''}
+      ${s.role_name ? `
+      <div class="detail-row">
+        <span class="detail-ico">🧑‍🍳</span>
+        <span><b>${esc(s.role_name)}</b><div class="sub">Job</div></span>
+      </div>` : ''}
+      ${s.notes ? `
+      <div class="detail-row">
+        <span class="detail-ico">📝</span>
+        <span style="white-space:pre-wrap">${esc(s.notes)}</span>
+      </div>` : ''}
+    </div>
+
+    <div class="section-title" style="margin-top:16px">Team on this job (${s.assignees.length})</div>
+    ${s.assignees.length ? `<div class="detail-people">
+      ${s.assignees.map((a) => `
+        <div class="row detail-person">
+          <span class="avatar lg" style="background:${esc(a.color)}">${esc(initials(a.name))}</span>
+          <span class="grow">
+            <div style="font-weight:700">${esc(a.name)}${a.id === state.me.id ? ' <span class="sub">(you)</span>' : ''}</div>
+            <div class="sub ${a.status}">${statusLabel[a.status] || ''}</div>
+          </span>
+        </div>`).join('')}
+    </div>` : '<p class="sub">Nobody assigned yet.</p>'}
+
+    ${mine && mine.status === 'pending' ? `
+      <div class="actions">
+        <button class="btn danger" data-detail-respond="declined">Decline</button>
+        <button class="btn" data-detail-respond="accepted">Accept</button>
+      </div>` : ''}
+    <div class="actions">
+      ${isAdmin ? '<button class="btn secondary" id="detail-edit">Edit job</button>' : ''}
+      <button class="btn ${isAdmin ? 'secondary' : ''}" id="detail-close">Close</button>
+    </div>
   `);
+
+  modal.querySelector('#detail-close').onclick = closeModal;
+  const mapBtn = modal.querySelector('[data-map-detail]');
+  if (mapBtn) mapBtn.onclick = () => window.open(`https://maps.google.com/?q=${mapBtn.dataset.mapDetail}`, '_blank');
+  const editBtn = modal.querySelector('#detail-edit');
+  if (editBtn) editBtn.onclick = () => { closeModal(); openShiftModal(s); };
+  modal.querySelectorAll('[data-detail-respond]').forEach((b) => {
+    b.onclick = async () => {
+      await api(`/api/shifts/${s.id}/respond`, { method: 'POST', body: { status: b.dataset.detailRespond } });
+      closeModal();
+      toast(b.dataset.detailRespond === 'accepted' ? 'Job accepted ✅' : 'Job declined');
+      loadShifts().then(render);
+    };
+  });
 }
 
 function openShiftModal(shift = null) {
@@ -979,16 +1041,14 @@ function renderTeam() {
   const isAdmin = state.me.role === 'admin';
   shell('Team', `
     ${state.users.map((u) => `
-      <div class="card row">
+      <div class="card row team-row">
         <span class="avatar lg" style="background:${esc(u.color)}">${esc(initials(u.name))}</span>
         <span class="grow">
           <div style="font-weight:700">${esc(u.name)} ${u.id === state.me.id ? '<span class="sub">(you)</span>' : ''}</div>
-          <div class="sub">${esc(contactOf(u))}${u.position_id ? ` · 🎖️ ${esc(state.positions.find((r) => r.id === u.position_id)?.name || '')}` : ''}</div>
+          <div class="sub">${esc(contactOf(u))}${isAdmin && u.hourly_rate ? ` · $${Number(u.hourly_rate).toFixed(2)}/h` : ''}</div>
         </span>
-        <span class="role-tag">${u.role}</span>
-        ${isAdmin && u.hourly_rate ? `<span class="sub">$${Number(u.hourly_rate).toFixed(2)}/h</span>` : ''}
+        <span class="role-tag">${esc(state.positions.find((r) => r.id === u.position_id)?.name || (u.role === 'admin' ? 'Admin' : 'Member'))}</span>
         ${isAdmin ? `<button class="icon-btn" data-edit-user="${u.id}" title="Edit">✏️</button>` : ''}
-        ${isAdmin && u.id !== state.me.id ? `<button class="icon-btn" data-remove-user="${u.id}" title="Remove from team">🗑️</button>` : ''}
       </div>`).join('')}
     <div class="card">
       <div style="font-weight:700;margin-bottom:6px">Invite your team</div>
@@ -998,18 +1058,16 @@ function renderTeam() {
   document.querySelectorAll('[data-edit-user]').forEach((b) => {
     b.onclick = () => openUserModal(state.users.find((u) => u.id === Number(b.dataset.editUser)));
   });
-  document.querySelectorAll('[data-remove-user]').forEach((b) => {
-    b.onclick = async () => {
-      const user = state.users.find((u) => u.id === Number(b.dataset.removeUser));
-      if (!confirm(`Remove ${user.name} from the team?\n\nThey lose access immediately and their timesheet history is deleted. Export payroll first if you still need their hours.`)) return;
-      try {
-        await api(`/api/users/${user.id}`, { method: 'DELETE' });
-        state.users = (await api('/api/users')).users;
-        toast(`${user.name} removed`);
-        render();
-      } catch (err) { toast(err.message); }
-    };
-  });
+}
+
+async function removeTeamMember(user) {
+  if (!confirm(`Remove ${user.name} from the team?\n\nThey lose access immediately and their timesheet history is deleted. Export payroll first if you still need their hours.`)) return false;
+  try {
+    await api(`/api/users/${user.id}`, { method: 'DELETE' });
+    state.users = (await api('/api/users')).users;
+    toast(`${user.name} removed`);
+    return true;
+  } catch (err) { toast(err.message); return false; }
 }
 
 function openUserModal(user) {
@@ -1021,9 +1079,9 @@ function openUserModal(user) {
       <label>Position</label>
       <select name="position_id" id="position-select">
         <option value="">No position</option>
-        ${state.positions.map((r) => `<option value="${r.id}" ${user.position_id === r.id ? 'selected' : ''}>${esc(r.name)}${r.is_admin ? ' — ⭐ admin' : ''}</option>`).join('')}
+        ${state.positions.map((r) => `<option value="${r.id}" ${user.position_id === r.id ? 'selected' : ''}>${esc(r.name)}${r.is_admin ? ' (admin)' : ''}</option>`).join('')}
       </select>
-      <p class="hint">Access follows the position: those marked ⭐ make the person an admin. Manage them in More → Positions.<br>Currently: <b>${user.role === 'admin' ? 'Admin' : 'Member'}</b>${isSelf ? ' (you)' : ''}</p>
+      <p class="hint">Access follows the position: those marked (admin) make the person an admin. Manage them in More → Positions.<br>Currently: <b>${user.role === 'admin' ? 'Admin' : 'Member'}</b>${isSelf ? ' (you)' : ''}</p>
       <div class="card row" style="box-shadow:none;border:1px solid var(--line);margin:12px 0 0">
         <span class="grow">
           <div style="font-weight:700">Phone notifications</div>
@@ -1038,9 +1096,16 @@ function openUserModal(user) {
         <span class="pin-value" id="pin-view">${esc(user.pin || '—')}</span>
         <button class="btn small secondary" type="button" id="regen-pin">Generate new PIN</button>
       </div>
-      <div class="actions"><button type="submit" class="btn">Save</button></div>
+      <div class="actions">
+        ${isSelf ? '' : '<button type="button" class="btn danger" id="remove-user">Remove</button>'}
+        <button type="submit" class="btn">Save</button>
+      </div>
     </form>
   `);
+  const removeBtn = modal.querySelector('#remove-user');
+  if (removeBtn) removeBtn.onclick = async () => {
+    if (await removeTeamMember(user)) { closeModal(); render(); }
+  };
   modal.querySelector('#regen-pin').onclick = async () => {
     if (!confirm(`Give ${user.name} a new PIN? The old one stops working immediately.`)) return;
     const { pin } = await api(`/api/users/${user.id}`, { method: 'PATCH', body: { new_pin: true } });
@@ -1871,18 +1936,17 @@ async function renderPositions() {
   const { positions } = await api('/api/positions');
   state.positions = positions;
   shell('Positions', `
-    <p class="hint" style="margin-bottom:12px">Team positions you assign in <b>Team</b>. A position with <b>⭐ admin permission</b> automatically makes everyone holding it an admin.</p>
+    <p class="hint" style="margin-bottom:12px">Team positions you assign in <b>Team</b>. A position with <b>admin permission</b> automatically makes everyone holding it an admin.</p>
     ${positions.length ? positions.map((r) => `
       <div class="card row">
-        <span class="venue-icon" style="background:var(--brand-soft);color:var(--text)">🎖️</span>
         <span class="grow">
           <div style="font-weight:700">${esc(r.name)}</div>
-          <div class="sub">${r.is_admin ? '⭐ Grants admin access' : 'Member access'}</div>
+          <div class="sub">${r.is_admin ? 'Grants admin access' : 'Member access'}</div>
         </span>
         <button class="btn small ${r.is_admin ? '' : 'secondary'}" data-adm-pos="${r.id}">${r.is_admin ? 'Admin ✓' : 'Member'}</button>
         <button class="icon-btn" data-edit-pos="${r.id}">✏️</button>
         <button class="icon-btn" data-del-pos="${r.id}">🗑️</button>
-      </div>`).join('') : '<div class="empty"><div class="big">🎖️</div>No positions yet — tap ＋ to add e.g. Operations Manager, Shift Lead…</div>'}
+      </div>`).join('') : '<div class="empty"><div class="big">👥</div>No positions yet — tap ＋ to add e.g. Operations Manager, Shift Lead…</div>'}
   `, { back: () => { location.hash = '#/more'; }, fab: true });
 
   document.getElementById('fab').onclick = async () => {
@@ -2173,7 +2237,7 @@ function renderMore() {
       { href: '#/timesheets', icon: '🧾', label: 'Timesheets', sub: 'Hours, approval & payroll CSV' },
       { href: '#/kiosk', icon: '🔢', label: 'Kiosk Mode', sub: 'Lock this device into a PIN punch clock' },
       { href: '#/roles', icon: '🧑‍🍳', label: 'Jobs', sub: 'Server, Bar Back, Set Up… (clock-outs & scheduling)' },
-      { href: '#/positions', icon: '🎖️', label: 'Positions', sub: 'Team positions & admin permissions' },
+      { href: '#/positions', icon: '👥', label: 'Positions', sub: 'Team positions & admin permissions' },
     ] : []),
     { href: '#/venues', icon: '📍', label: 'Venues', sub: 'Work locations' },
     { href: '#/team', icon: '👥', label: 'Team', sub: 'People & roles' },

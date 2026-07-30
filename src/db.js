@@ -215,6 +215,7 @@ ensureColumn('users', 'role_id', 'role_id INTEGER');
 ensureColumn('users', 'position_id', 'position_id INTEGER');
 ensureColumn('roles', 'is_admin', 'is_admin INTEGER NOT NULL DEFAULT 0');
 ensureColumn('shifts', 'role_id', 'role_id INTEGER');
+ensureColumn('shifts', 'reminded_at', 'reminded_at TEXT');
 ensureColumn('time_entries', 'venue_id', 'venue_id INTEGER');
 ensureColumn('time_entries', 'role_id', 'role_id INTEGER');
 ensureColumn('time_entries', 'mileage', 'mileage REAL NOT NULL DEFAULT 0');
