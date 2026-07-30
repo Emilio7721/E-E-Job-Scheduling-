@@ -1,0 +1,26 @@
+{
+  "name": "ee-job-scheduling",
+  "version": "1.0.0",
+  "description": "E&E workforce app: job scheduling, venues, team chat, push notifications",
+  "main": "server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "http://local_proxy@127.0.0.1:41729/git/Emilio7721/E-E-Job-Scheduling-"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "express": "^5.2.1",
+    "web-push": "^3.6.7"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}
