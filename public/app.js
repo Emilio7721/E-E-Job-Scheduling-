@@ -191,6 +191,26 @@ function pushSupported() {
   return 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
 }
 
+function isStandalone() {
+  return matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+}
+
+function isIOS() {
+  return /iPhone|iPad|iPod/.test(navigator.userAgent);
+}
+
+function isMobile() {
+  return isIOS() || /Android/.test(navigator.userAgent);
+}
+
+// Android Chrome fires this when the app is installable; stashing it lets us
+// show a real one-tap "Install now" button inside the tutorial.
+let installPromptEvent = null;
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  installPromptEvent = e;
+});
+
 function urlBase64ToUint8Array(base64) {
   const padding = '='.repeat((4 - (base64.length % 4)) % 4);
   const raw = atob((base64 + padding).replace(/-/g, '+').replace(/_/g, '/'));
@@ -232,6 +252,109 @@ async function pushEnabled() {
   if (Notification.permission !== 'granted') return false;
   const reg = await navigator.serviceWorker.ready;
   return !!(await reg.pushManager.getSubscription());
+}
+
+/* ------------------------------- onboarding -------------------------------- */
+
+function tutorialSteps(steps) {
+  return `<div class="tut-steps">${steps.map((s, i) => `
+    <div class="tut-step"><span class="tut-num">${i + 1}</span><span>${s}</span></div>`).join('')}
+  </div>`;
+}
+
+function showInstallModal(onClose) {
+  const modal = openModal(`
+    <img src="/brand/logo.png" alt="E&amp;E Management" style="display:block;max-width:170px;margin:0 auto 8px">
+    <h3 style="text-align:center">Get the app on your phone</h3>
+    <p class="sub" style="text-align:center">Add E&amp;E to your home screen for the full app experience — including notifications when the app is closed.</p>
+    <div class="tut-tabs">
+      <button class="pill" data-plat="ios" style="flex:1">🍎 iPhone</button>
+      <button class="pill" data-plat="android" style="flex:1">🤖 Android</button>
+    </div>
+    <div id="tut-body"></div>
+    <div class="actions"><button class="btn secondary" id="tut-close">Got it</button></div>
+  `);
+
+  let plat = isIOS() ? 'ios' : 'android';
+  const bodies = {
+    ios: tutorialSteps([
+      'Open this website in <b>Safari</b>.',
+      'Tap the <b>Share</b> button <span class="tut-icon">⬆️</span> (the square with an arrow, at the bottom).',
+      'Scroll down and tap <b>“Add to Home Screen”</b>, then <b>Add</b>.',
+      'Open <b>E&amp;E</b> from your home screen and turn on notifications when asked.',
+    ]) + `<p class="hint">iPhones only allow notifications for apps installed on the home screen — that's why this step matters.</p>`,
+    android: (installPromptEvent
+      ? `<button class="btn" id="tut-install-now" style="margin-top:14px">⬇️ Install now</button>
+         <p class="hint" style="text-align:center">One tap — Chrome installs it straight to your home screen.</p>`
+      : tutorialSteps([
+          'Open this website in <b>Chrome</b>.',
+          'Tap the <b>⋮ menu</b> (top right corner).',
+          'Tap <b>“Add to Home screen”</b> or <b>“Install app”</b>, then confirm.',
+          'Open <b>E&amp;E</b> from your home screen and turn on notifications when asked.',
+        ])),
+  };
+
+  function draw() {
+    modal.querySelectorAll('[data-plat]').forEach((b) => b.classList.toggle('active', b.dataset.plat === plat));
+    modal.querySelector('#tut-body').innerHTML = bodies[plat];
+    const installBtn = modal.querySelector('#tut-install-now');
+    if (installBtn) installBtn.onclick = async () => {
+      installPromptEvent.prompt();
+      const { outcome } = await installPromptEvent.userChoice;
+      installPromptEvent = null;
+      if (outcome === 'accepted') { closeModal(); toast('Installed! Open E&E from your home screen 🎉'); }
+      else draw();
+    };
+  }
+  draw();
+  modal.querySelectorAll('[data-plat]').forEach((b) => { b.onclick = () => { plat = b.dataset.plat; draw(); }; });
+  modal.querySelector('#tut-close').onclick = () => { closeModal(); if (onClose) onClose(); };
+}
+
+function showNotifPrompt() {
+  const modal = openModal(`
+    <div style="text-align:center;font-size:46px;margin-bottom:4px">🔔</div>
+    <h3 style="text-align:center">Turn on notifications</h3>
+    <p class="sub" style="text-align:center">Get new jobs, schedule changes and team messages on this device — even when the app is closed.</p>
+    <div class="actions">
+      <button class="btn secondary" id="notif-later">Not now</button>
+      <button class="btn" id="notif-enable">Turn on</button>
+    </div>
+  `);
+  modal.querySelector('#notif-later').onclick = () => {
+    localStorage.setItem('ee-notif-dismissed', String(Date.now()));
+    closeModal();
+  };
+  modal.querySelector('#notif-enable').onclick = async () => {
+    closeModal();
+    try { await enablePush(); } catch (err) { toast(err.message); }
+  };
+}
+
+function queueNotifPrompt() {
+  if (!pushSupported()) return;
+  if (Notification.permission !== 'default') return;
+  const dismissed = Number(localStorage.getItem('ee-notif-dismissed') || 0);
+  if (Date.now() - dismissed < 3 * 24 * 3600 * 1000) return; // re-ask after 3 days
+  showNotifPrompt();
+}
+
+async function maybeShowOnboarding() {
+  // Permission already granted (e.g. reinstalled, new session): resubscribe quietly.
+  if (pushSupported() && Notification.permission === 'granted') {
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      if (!(await reg.pushManager.getSubscription())) await enablePush();
+    } catch {}
+    return;
+  }
+  // Browser tab on a phone: teach the home-screen install first.
+  if (!isStandalone() && isMobile() && !localStorage.getItem('ee-install-seen')) {
+    localStorage.setItem('ee-install-seen', '1');
+    showInstallModal(queueNotifPrompt);
+    return;
+  }
+  queueNotifPrompt();
 }
 
 /* --------------------------------- modal ---------------------------------- */
@@ -794,8 +917,7 @@ async function renderNotifications() {
 
 async function renderSettings() {
   const enabled = await pushEnabled();
-  const standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone;
-  const isIOS = /iPhone|iPad/.test(navigator.userAgent);
+  const standalone = isStandalone();
   shell('Settings', `
     <div class="card row">
       <span class="avatar lg" style="background:${esc(state.me.color)}">${esc(initials(state.me.name))}</span>
@@ -830,8 +952,8 @@ async function renderSettings() {
         <div class="sub">Send a test notification</div>
         <button class="btn small secondary" id="push-test">Test</button>
       </div>` : ''}
-      ${isIOS && !standalone ? `<p class="hint">📱 <b>iPhone:</b> notifications require the app to be installed — tap the Share button in Safari, choose <b>“Add to Home Screen”</b>, then open E&amp;E Jobs from your home screen and enable notifications here.</p>` : ''}
-      ${!isIOS && !standalone ? `<p class="hint">💡 Tip: use your browser's <b>“Install app” / “Add to Home Screen”</b> option to get the full app experience.</p>` : ''}
+      ${Notification.permission === 'denied' ? `<p class="hint">⚠️ Notifications are blocked for this app in your device settings. Allow them there, then come back and tap Enable.</p>` : ''}
+      ${!standalone ? `<button class="btn secondary" id="show-install-help" style="margin-top:12px">📲 How to install on your phone</button>` : ''}
     </div>
 
     <div class="section-title">Account</div>
@@ -848,6 +970,8 @@ async function renderSettings() {
   };
   const test = document.getElementById('push-test');
   if (test) test.onclick = () => api('/api/push/test', { method: 'POST' }).then(() => toast('Test sent — check your notifications'));
+  const installHelp = document.getElementById('show-install-help');
+  if (installHelp) installHelp.onclick = () => showInstallModal();
   document.getElementById('logout').onclick = async () => {
     await api('/api/auth/logout', { method: 'POST' });
     state.es?.close();
@@ -1511,6 +1635,7 @@ async function bootstrap() {
   await loadShifts();
   if (!location.hash) location.hash = '#/schedule';
   render();
+  setTimeout(maybeShowOnboarding, 600);
 }
 
 if ('serviceWorker' in navigator) {

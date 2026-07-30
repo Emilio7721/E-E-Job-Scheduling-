@@ -367,6 +367,18 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--muted); 
 }
 .check-label { display: flex; align-items: center; gap: 8px; font-size: 14.5px; color: var(--text); font-weight: 500; margin: 12px 0 4px; }
 
+/* ---------- onboarding tutorial ---------- */
+.tut-tabs { display: flex; gap: 8px; margin-top: 14px; }
+.tut-steps { display: flex; flex-direction: column; gap: 13px; margin-top: 16px; }
+.tut-step { display: flex; gap: 12px; align-items: flex-start; font-size: 14.5px; line-height: 1.45; }
+.tut-num {
+  width: 26px; height: 26px; border-radius: 50%; flex-shrink: 0;
+  background: var(--brand-soft); color: var(--accent);
+  font-weight: 800; font-size: 13px;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.tut-icon { display: inline-block; }
+
 /* ---------- updates ---------- */
 .like-btn {
   margin-top: 10px; padding: 6px 14px; border-radius: 999px;
