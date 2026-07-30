@@ -219,6 +219,10 @@ ensureColumn('shifts', 'reminded_at', 'reminded_at TEXT');
 ensureColumn('time_entries', 'venue_id', 'venue_id INTEGER');
 ensureColumn('time_entries', 'role_id', 'role_id INTEGER');
 ensureColumn('time_entries', 'mileage', 'mileage REAL NOT NULL DEFAULT 0');
+ensureColumn('forms', 'require_signature', 'require_signature INTEGER NOT NULL DEFAULT 1');
+ensureColumn('form_submissions', 'signature', 'signature TEXT');
+ensureColumn('form_submissions', 'signed_name', 'signed_name TEXT');
+ensureColumn('form_submissions', 'signed_at', 'signed_at TEXT');
 
 // Every user gets a unique 5-digit clock-in PIN.
 function newPin() {
