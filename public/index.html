@@ -5,7 +5,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>E&E Job Scheduling</title>
   <meta name="description" content="Job scheduling, venues and team chat for E&E">
-  <meta name="theme-color" content="#4f46e5">
+  <meta name="theme-color" content="#ffffff" id="meta-theme">
+  <script>
+    // Apply the saved theme before styles load to avoid a flash of the wrong mode.
+    (function () {
+      var t = localStorage.getItem('ee-theme');
+      if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+      var dark = t === 'dark' || (t !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches);
+      document.currentScript.previousElementSibling.content = dark ? '#101114' : '#ffffff';
+    })();
+  </script>
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/icons/icon-192.png">
   <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
