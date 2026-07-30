@@ -258,8 +258,10 @@ app.patch('/api/shifts/:id', requireAuth, requireAdmin, (req, res) => {
   if (!title?.trim()) return res.status(400).json({ error: 'Job title is required' });
   if (new Date(ends_at) <= new Date(starts_at)) return res.status(400).json({ error: 'End time must be after start time' });
 
-  db.prepare('UPDATE shifts SET title = ?, venue_id = ?, role_id = ?, starts_at = ?, ends_at = ?, notes = ?, updated_at = datetime(\'now\') WHERE id = ?')
-    .run(title.trim(), venue_id, role_id, starts_at, ends_at, notes.trim(), shift.id);
+  db.prepare(`UPDATE shifts SET title = ?, venue_id = ?, role_id = ?, starts_at = ?, ends_at = ?, notes = ?,
+      reminded_at = CASE WHEN starts_at != ? THEN NULL ELSE reminded_at END,
+      updated_at = datetime('now') WHERE id = ?`)
+    .run(title.trim(), venue_id, role_id, starts_at, ends_at, notes.trim(), starts_at, shift.id);
 
   const before = db.prepare('SELECT user_id FROM shift_assignees WHERE shift_id = ?').all(shift.id).map((r) => r.user_id);
   let added = [];
@@ -519,6 +521,40 @@ app.post('/api/push/test', requireAuth, (req, res) => {
   }).catch(() => {});
   res.json({ ok: true });
 });
+
+/* ------------------------------ shift reminders ----------------------------- */
+
+// Everyone still on a job hears about it an hour before it starts. The sweep
+// runs every minute and stamps reminded_at so a job is only ever announced once
+// (moving the start time clears the stamp and re-arms it).
+const REMINDER_LEAD_MS = 60 * 60 * 1000;
+
+function sendShiftReminders() {
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  const horizon = new Date(now + REMINDER_LEAD_MS).toISOString();
+  const due = db.prepare(
+    SHIFT_QUERY + ' WHERE s.reminded_at IS NULL AND s.starts_at > ? AND s.starts_at <= ?'
+  ).all(nowIso, horizon);
+
+  for (const shift of due) {
+    const assignees = db.prepare(
+      `SELECT user_id FROM shift_assignees WHERE shift_id = ? AND status != 'declined'`
+    ).all(shift.id).map((r) => r.user_id);
+    if (assignees.length) {
+      const mins = Math.max(1, Math.round((new Date(shift.starts_at) - now) / 60000));
+      notify(assignees, {
+        title: `Starts ${mins >= 55 ? 'in 1 hour' : `in ${mins} min`}: ${shift.title}`,
+        body: `${fmtShiftTime(shift.starts_at)}${shift.venue_name ? ' @ ' + shift.venue_name : ''}${shift.role_name ? ' · ' + shift.role_name : ''}`,
+        url: '/#/schedule',
+      });
+    }
+    db.prepare('UPDATE shifts SET reminded_at = ? WHERE id = ?').run(nowIso, shift.id);
+  }
+}
+
+setInterval(sendShiftReminders, 60 * 1000);
+sendShiftReminders();
 
 /* --------------------------------- realtime -------------------------------- */
 
