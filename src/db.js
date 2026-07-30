@@ -200,6 +200,7 @@ function ensureColumn(table, column, ddl) {
 }
 ensureColumn('users', 'hourly_rate', 'hourly_rate REAL NOT NULL DEFAULT 0');
 ensureColumn('users', 'pin', 'pin TEXT');
+ensureColumn('users', 'phone', 'phone TEXT');
 
 // Every user gets a unique 5-digit clock-in PIN.
 function newPin() {

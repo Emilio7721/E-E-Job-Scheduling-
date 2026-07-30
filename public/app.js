@@ -342,6 +342,7 @@ function queueNotifPrompt() {
 }
 
 async function maybeShowOnboarding() {
+  if (kioskArmed()) return; // a kiosk device gets no personal onboarding
   // Permission already granted (e.g. reinstalled, new session): resubscribe quietly.
   if (pushSupported() && Notification.permission === 'granted') {
     try {
@@ -377,41 +378,84 @@ function closeModal() {
 
 /* ------------------------------- auth views ------------------------------- */
 
+function kioskArmed() {
+  return localStorage.getItem('ee-kiosk') === '1';
+}
+
+function fmtPhone(p) {
+  if (!p) return '';
+  return p.length === 10 ? `(${p.slice(0, 3)}) ${p.slice(3, 6)}-${p.slice(6)}` : p;
+}
+
+// Preferred contact line: phone, else a real email (hides synthetic @ee.local ones).
+function contactOf(u) {
+  if (u.phone) return fmtPhone(u.phone);
+  return u.email && !u.email.endsWith('@ee.local') ? u.email : '';
+}
+
 function renderAuth() {
-  const login = state.authMode === 'login';
+  if (kioskArmed()) return renderKioskUnlock();
+  const signup = state.authMode === 'signup';
   $app.innerHTML = `
     <div class="auth-wrap">
       <div class="auth-card">
         <img class="auth-brand" src="/brand/logo.png" alt="E&amp;E Management — Event Services and More">
-        <p class="auth-sub">${login ? 'Sign in to see your schedule and chat with your team.' : 'Create your account. The first account becomes the admin.'}</p>
-        <form id="auth-form">
-          ${login ? '' : `<label>Full name</label><input name="name" required autocomplete="name" placeholder="Jane Doe">`}
-          <label>Email</label><input name="email" type="email" required autocomplete="email" placeholder="you@company.com">
-          <label>Password</label><input name="password" type="password" required minlength="6" autocomplete="${login ? 'current-password' : 'new-password'}" placeholder="••••••••">
+        ${signup ? `
+        <p class="auth-sub">Enter your name and phone number — you'll get a PIN to sign in and clock in.</p>
+        <form id="signup-form">
+          <label>Full name</label><input name="name" required autocomplete="name" placeholder="Jane Doe">
+          <label>Phone number</label><input name="phone" required autocomplete="tel" inputmode="tel" placeholder="(555) 123-4567">
           <div class="auth-error" id="auth-error"></div>
-          <button class="btn" type="submit">${login ? 'Sign in' : 'Create account'}</button>
+          <button class="btn" type="submit">Get my PIN</button>
         </form>
-        <div class="auth-switch">
-          ${login ? "Don't have an account?" : 'Already have an account?'}
-          <button id="auth-switch">${login ? 'Sign up' : 'Sign in'}</button>
-        </div>
+        <div class="auth-switch">Already have a PIN? <button id="auth-switch">Sign in</button></div>
+        ` : `
+        <p class="auth-sub">Enter your PIN to sign in</p>
+        ${pinPadHTML()}
+        <div class="auth-switch">New here? <button id="auth-switch">Sign up to get a PIN</button></div>
+        `}
       </div>
     </div>`;
-  document.getElementById('auth-switch').onclick = () => { state.authMode = login ? 'register' : 'login'; renderAuth(); };
-  document.getElementById('auth-form').onsubmit = async (e) => {
-    e.preventDefault();
-    const fd = new FormData(e.target);
-    try {
-      const { user } = await api(`/api/auth/${login ? 'login' : 'register'}`, {
-        method: 'POST',
-        body: Object.fromEntries(fd.entries()),
-      });
+  document.getElementById('auth-switch').onclick = () => {
+    state.authMode = signup ? 'signin' : 'signup';
+    renderAuth();
+  };
+  if (signup) {
+    document.getElementById('signup-form').onsubmit = async (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      try {
+        const { user, pin } = await api('/api/auth/register', {
+          method: 'POST',
+          body: { name: fd.get('name'), phone: fd.get('phone') },
+        });
+        state.me = user;
+        showPinReveal(pin, user.role === 'admin');
+      } catch (err) {
+        document.getElementById('auth-error').textContent = err.message;
+      }
+    };
+  } else {
+    bindPinPad(document.querySelector('.auth-card'), async (pin) => {
+      const { user } = await api('/api/auth/login', { method: 'POST', body: { pin } });
       state.me = user;
       await bootstrap();
-    } catch (err) {
-      document.getElementById('auth-error').textContent = err.message;
-    }
-  };
+    });
+  }
+}
+
+function showPinReveal(pin, isAdmin) {
+  $app.innerHTML = `
+    <div class="auth-wrap">
+      <div class="auth-card" style="text-align:center">
+        <img class="auth-brand" src="/brand/logo.png" alt="E&amp;E Management">
+        <h3 style="margin-top:4px">Welcome${isAdmin ? ', admin' : ''}! Here's your PIN</h3>
+        <div class="pin-reveal">${esc(pin)}</div>
+        <p class="auth-sub">This is how you sign in and clock in${isAdmin ? '' : ' at the kiosk'}.<br>Memorize it — it's always available in Settings.</p>
+        <button class="btn" id="pin-done">I saved my PIN — continue</button>
+      </div>
+    </div>`;
+  document.getElementById('pin-done').onclick = () => bootstrap();
 }
 
 /* -------------------------------- app shell ------------------------------- */
@@ -902,7 +946,7 @@ function renderTeam() {
         <span class="avatar lg" style="background:${esc(u.color)}">${esc(initials(u.name))}</span>
         <span class="grow">
           <div style="font-weight:700">${esc(u.name)} ${u.id === state.me.id ? '<span class="sub">(you)</span>' : ''}</div>
-          <div class="sub">${esc(u.email)}</div>
+          <div class="sub">${esc(contactOf(u))}</div>
         </span>
         <span class="role-tag">${u.role}</span>
         ${isAdmin && u.hourly_rate ? `<span class="sub">$${Number(u.hourly_rate).toFixed(2)}/h</span>` : ''}
@@ -922,7 +966,7 @@ function openUserModal(user) {
   const isSelf = user.id === state.me.id;
   const modal = openModal(`
     <h3>${esc(user.name)}</h3>
-    <p class="sub">${esc(user.email)}</p>
+    <p class="sub">${esc(contactOf(user))}</p>
     <form id="user-form">
       <label>Role</label>
       <select name="role" ${isSelf ? 'disabled' : ''}>
@@ -996,7 +1040,7 @@ async function renderSettings() {
       <span class="avatar lg" style="background:${esc(state.me.color)}">${esc(initials(state.me.name))}</span>
       <span class="grow">
         <div style="font-weight:700">${esc(state.me.name)}</div>
-        <div class="sub">${esc(state.me.email)}</div>
+        <div class="sub">${esc(contactOf(state.me))}</div>
       </span>
       <span class="role-tag">${state.me.role}</span>
     </div>
@@ -1005,7 +1049,7 @@ async function renderSettings() {
     <div class="card row">
       <span class="grow">
         <div style="font-weight:700">My PIN</div>
-        <div class="sub">Needed to clock in and out — keep it private.</div>
+        <div class="sub">You sign in and clock in with it — keep it private.</div>
       </span>
       <span class="pin-value">${esc(state.me.pin || '—')}</span>
     </div>
@@ -1097,16 +1141,20 @@ async function renderClock() {
       <div class="clock-timer" id="clock-timer">${entry ? fmtDur(Date.now() - new Date(entry.clock_in)) : '0h 00m'}</div>
       ${entry?.shift_title ? `<div class="sub" style="text-align:center">Working: ${esc(entry.shift_title)}</div>` : ''}
       ${entry ? `<div class="sub" style="text-align:center">Since ${fmtTime(entry.clock_in)}${entry.in_lat ? ' · 📍 location recorded' : ''}</div>` : ''}
-      ${!entry && shifts.length ? `
+      ${state.me.role === 'admin' ? `
+        ${!entry && shifts.length ? `
         <label>Clock in for job (optional)</label>
         <select id="clock-shift">
           <option value="">General work</option>
           ${shifts.map((s) => `<option value="${s.id}">${esc(s.title)} (${fmtTime(s.starts_at)})</option>`).join('')}
         </select>` : ''}
-      <button class="btn ${entry ? 'danger' : ''}" id="clock-btn" style="margin-top:16px">
-        ${entry ? 'Clock out' : 'Clock in'}
-      </button>
-      <p class="hint" style="text-align:center">Punching in requires your personal PIN (see Settings). Your location is recorded if you allow it.</p>
+        <button class="btn ${entry ? 'danger' : ''}" id="clock-btn" style="margin-top:16px">
+          ${entry ? 'Clock out' : 'Clock in'}
+        </button>
+        <p class="hint" style="text-align:center">Punching requires your PIN. Your location is recorded if you allow it.</p>
+      ` : `
+        <p class="hint" style="text-align:center;margin-top:14px">🔒 Clock in and out <b>at the kiosk</b> with your PIN.<br>Your punches show up here automatically.</p>
+      `}
     </div>
     <button class="btn secondary" id="request-hours-btn">🕐 Request hours for approval</button>
 
@@ -1130,7 +1178,8 @@ async function renderClock() {
       else clearInterval(state.timer);
     }, 30000);
   }
-  document.getElementById('clock-btn').onclick = () => {
+  const clockBtn = document.getElementById('clock-btn');
+  if (clockBtn) clockBtn.onclick = () => {
     const shiftSel = document.getElementById('clock-shift');
     const shiftId = shiftSel?.value ? Number(shiftSel.value) : null;
     openPinPad(entry ? 'Enter your PIN to clock out' : 'Enter your PIN to clock in', async (pin) => {
@@ -1719,8 +1768,45 @@ async function renderRoles() {
 
 /* ---------------------------------- kiosk ----------------------------------- */
 
+// Armed kiosk but no valid session (cookie expired / cleared): admin PIN re-activates.
+function renderKioskUnlock() {
+  $app.innerHTML = `
+    <div class="kiosk-wrap">
+      <img src="/brand/logo.png" alt="E&amp;E Management" style="max-width:200px;margin-bottom:6px">
+      <h2 style="margin-bottom:2px">Kiosk locked</h2>
+      <p class="sub">Enter an admin PIN to reactivate this kiosk</p>
+      ${pinPadHTML()}
+    </div>`;
+  bindPinPad(document.querySelector('.kiosk-wrap'), async (pin) => {
+    await api('/api/kiosk/arm', { method: 'POST', body: { pin } });
+    await bootstrap();
+  });
+}
+
 function renderKiosk() {
-  if (state.me.role !== 'admin') { location.hash = '#/clock'; return; }
+  if (!kioskArmed()) {
+    // Arming screen (reached from More): an admin PIN locks this device into kiosk mode.
+    if (state.me.role !== 'admin') { location.hash = '#/more'; return; }
+    $app.innerHTML = `
+      <div class="kiosk-wrap">
+        <img src="/brand/logo.png" alt="E&amp;E Management" style="max-width:200px;margin-bottom:6px">
+        <h2 style="margin-bottom:2px">Set up Kiosk Mode</h2>
+        <p class="sub" style="max-width:300px">This device will stay locked as a time-clock kiosk — even after closing the app — until an admin PIN is entered again. Team members punch in and out with their own PINs.</p>
+        <p class="sub" style="margin-top:10px"><b>Enter an admin PIN to activate</b></p>
+        ${pinPadHTML()}
+        <button class="btn secondary" id="kiosk-cancel" style="max-width:200px;margin-top:22px">Cancel</button>
+      </div>`;
+    document.getElementById('kiosk-cancel').onclick = () => { location.hash = '#/more'; };
+    bindPinPad(document.querySelector('.kiosk-wrap'), async (pin) => {
+      await api('/api/kiosk/arm', { method: 'POST', body: { pin } });
+      localStorage.setItem('ee-kiosk', '1');
+      toast('Kiosk mode activated 🔒');
+      render();
+    });
+    return;
+  }
+
+  // Armed: full-screen punch pad. Exiting requires an admin PIN again.
   $app.innerHTML = `
     <div class="kiosk-wrap">
       <img src="/brand/logo.png" alt="E&amp;E Management" style="max-width:200px;margin-bottom:6px">
@@ -1728,9 +1814,17 @@ function renderKiosk() {
       <p class="sub">Enter your PIN to clock in or out</p>
       <div id="kiosk-result"></div>
       ${pinPadHTML()}
-      <button class="btn secondary" id="kiosk-exit" style="max-width:200px;margin-top:26px">Exit kiosk</button>
+      <button id="kiosk-exit" class="kiosk-exit">🔒 Admin exit</button>
     </div>`;
-  document.getElementById('kiosk-exit').onclick = () => { location.hash = '#/more'; };
+  document.getElementById('kiosk-exit').onclick = () => {
+    openPinPad('Enter an admin PIN to exit kiosk mode', async (pin) => {
+      await api('/api/kiosk/arm', { method: 'POST', body: { pin } });
+      localStorage.removeItem('ee-kiosk');
+      closeModal();
+      toast('Kiosk mode off');
+      await bootstrap();
+    });
+  };
 
   let resultTimer;
   bindPinPad(document.querySelector('.kiosk-wrap'), async (pin) => {
@@ -1809,7 +1903,7 @@ function renderMore() {
     { href: '#/forms', icon: '📋', label: 'Forms', sub: 'Checklists & reports' },
     ...(isAdmin ? [
       { href: '#/timesheets', icon: '🧾', label: 'Timesheets', sub: 'Hours, approval & payroll CSV' },
-      { href: '#/kiosk', icon: '🔢', label: 'Kiosk Mode', sub: 'Shared device — clock in by PIN' },
+      { href: '#/kiosk', icon: '🔢', label: 'Kiosk Mode', sub: 'Lock this device into a PIN punch clock' },
       { href: '#/roles', icon: '🧑‍🍳', label: 'Sub-Jobs / Roles', sub: 'Server, Bar Back, Set Up…' },
     ] : []),
     { href: '#/venues', icon: '📍', label: 'Venues', sub: 'Work locations' },
@@ -1823,7 +1917,7 @@ function renderMore() {
       <span class="avatar lg" style="background:${esc(state.me.color)}">${esc(initials(state.me.name))}</span>
       <span class="grow">
         <div style="font-weight:700">${esc(state.me.name)}</div>
-        <div class="sub">${esc(state.me.email)}</div>
+        <div class="sub">${esc(contactOf(state.me))}</div>
       </span>
       <span class="role-tag">${state.me.role}</span>
     </div>
@@ -1842,8 +1936,13 @@ function renderMore() {
 /* --------------------------------- render ---------------------------------- */
 
 async function render() {
-  if (!state.me) return renderAuth();
   clearInterval(state.timer);
+  // A device armed as a kiosk shows only the kiosk, whatever the URL says.
+  if (kioskArmed()) {
+    if (!state.me) return renderKioskUnlock();
+    return renderKiosk();
+  }
+  if (!state.me) return renderAuth();
   const { view, arg } = route();
   try {
     if (view === 'schedule') renderSchedule();
