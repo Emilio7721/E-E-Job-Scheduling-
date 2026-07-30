@@ -1,7 +1,7 @@
 /* Service worker: offline shell cache + push notifications. */
 
-const CACHE = 'ee-shell-v2';
-const SHELL = ['/', '/styles.css', '/app.js', '/manifest.webmanifest', '/icons/icon-192.png'];
+const CACHE = 'ee-shell-v3';
+const SHELL = ['/', '/styles.css', '/app.js', '/manifest.webmanifest', '/icons/icon-192.png', '/brand/logo.png'];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)));

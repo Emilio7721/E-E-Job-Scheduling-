@@ -69,6 +69,27 @@ async function api(path, opts = {}) {
   return data;
 }
 
+/* --------------------------------- theme ---------------------------------- */
+
+function themePref() {
+  const t = localStorage.getItem('ee-theme');
+  return t === 'light' || t === 'dark' ? t : 'system';
+}
+
+function applyTheme(pref) {
+  if (pref === 'system') {
+    localStorage.removeItem('ee-theme');
+    delete document.documentElement.dataset.theme;
+  } else {
+    localStorage.setItem('ee-theme', pref);
+    document.documentElement.dataset.theme = pref;
+  }
+  const dark = pref === 'dark' || (pref !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches);
+  document.getElementById('meta-theme')?.setAttribute('content', dark ? '#101114' : '#ffffff');
+}
+
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => applyTheme(themePref()));
+
 let toastTimer;
 function toast(msg) {
   document.querySelector('.toast')?.remove();
@@ -236,7 +257,7 @@ function renderAuth() {
   $app.innerHTML = `
     <div class="auth-wrap">
       <div class="auth-card">
-        <div class="auth-logo"><img src="/icons/icon-192.png" alt=""><h1>E&amp;E Job Scheduling</h1></div>
+        <img class="auth-brand" src="/brand/logo.png" alt="E&amp;E Management — Event Services and More">
         <p class="auth-sub">${login ? 'Sign in to see your schedule and chat with your team.' : 'Create your account. The first account becomes the admin.'}</p>
         <form id="auth-form">
           ${login ? '' : `<label>Full name</label><input name="name" required autocomplete="name" placeholder="Jane Doe">`}
@@ -381,7 +402,7 @@ function shiftCardHTML(s) {
   const statusIcon = { accepted: '✓ Accepted', declined: '✗ Declined', pending: '• Awaiting reply' };
   return `
     <div class="card shift-card" data-shift="${s.id}">
-      <div class="shift-stripe" style="background:${esc(s.venue_color || '#4f46e5')}"></div>
+      <div class="shift-stripe" style="background:${esc(s.venue_color || '#a8862c')}"></div>
       <div class="shift-body">
         <div class="shift-time">${fmtTime(s.starts_at)} – ${fmtTime(s.ends_at)}</div>
         <div class="shift-title">${esc(s.title)}</div>
@@ -785,6 +806,17 @@ async function renderSettings() {
       <span class="role-tag">${state.me.role}</span>
     </div>
 
+    <div class="section-title">Appearance</div>
+    <div class="card">
+      <div style="display:flex;gap:8px">
+        ${['system', 'light', 'dark'].map((t) => `
+          <button class="pill ${themePref() === t ? 'active' : ''}" data-theme-opt="${t}" style="flex:1">
+            ${{ system: '📱 Auto', light: '☀️ Light', dark: '🌙 Dark' }[t]}
+          </button>`).join('')}
+      </div>
+      <p class="hint">Auto follows your phone's light/dark setting.</p>
+    </div>
+
     <div class="section-title">Phone notifications</div>
     <div class="card">
       <div class="settings-row">
@@ -807,6 +839,9 @@ async function renderSettings() {
       <button class="btn danger" id="logout">Sign out</button>
     </div>
   `);
+  document.querySelectorAll('[data-theme-opt]').forEach((b) => {
+    b.onclick = () => { applyTheme(b.dataset.themeOpt); renderSettings(); };
+  });
   document.getElementById('push-toggle').onclick = async () => {
     try { enabled ? await disablePush() : await enablePush(); } catch (err) { toast(err.message); }
     renderSettings();
@@ -1411,6 +1446,7 @@ function renderMore() {
     { href: '#/settings', icon: '⚙️', label: 'Settings', sub: 'Notifications & account' },
   ];
   shell('More', `
+    <img src="/brand/logo.png" alt="E&amp;E Management" style="display:block;max-width:190px;margin:2px auto 16px">
     <div class="card row" style="margin-bottom:16px">
       <span class="avatar lg" style="background:${esc(state.me.color)}">${esc(initials(state.me.name))}</span>
       <span class="grow">
