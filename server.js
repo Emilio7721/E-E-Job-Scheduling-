@@ -14,6 +14,22 @@ app.use(express.json({ limit: '256kb' }));
 const PORT = process.env.PORT || 3000;
 const COOKIE_OPTS = 'Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000';
 
+// Basic brute-force protection for PIN endpoints: 15 attempts / 5 min / IP.
+const pinAttempts = new Map();
+function tooManyAttempts(req) {
+  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || '?';
+  const now = Date.now();
+  const a = pinAttempts.get(ip) || { n: 0, ts: now };
+  if (now - a.ts > 5 * 60 * 1000) { a.n = 0; a.ts = now; }
+  a.n++;
+  pinAttempts.set(ip, a);
+  return a.n > 15;
+}
+
+function publicUser(u) {
+  return { id: u.id, name: u.name, email: u.email, phone: u.phone, role: u.role, color: u.color };
+}
+
 function setAuthCookie(res, userId) {
   res.setHeader('Set-Cookie', `ee_token=${issueToken(userId)}; ${COOKIE_OPTS}`);
 }
@@ -30,36 +46,39 @@ function notify(userIds, { title, body = '', url = '/' }) {
 /* ---------------------------------- auth ---------------------------------- */
 
 app.post('/api/auth/register', (req, res) => {
-  const { name, email, password } = req.body || {};
-  if (!name?.trim() || !email?.trim() || !password || password.length < 6) {
-    return res.status(400).json({ error: 'Name, email and a password of 6+ characters are required' });
+  const { name, phone } = req.body || {};
+  const digits = String(phone || '').replace(/\D/g, '');
+  if (!name?.trim() || digits.length < 7 || digits.length > 15) {
+    return res.status(400).json({ error: 'Your name and a valid phone number are required' });
   }
-  const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email.trim());
-  if (existing) return res.status(409).json({ error: 'An account with that email already exists' });
+  if (db.prepare('SELECT 1 FROM users WHERE phone = ?').get(digits)) {
+    return res.status(409).json({ error: 'That number is already registered — sign in with your PIN' });
+  }
 
   // First account becomes the admin/owner of the workspace.
   const isFirst = db.prepare('SELECT COUNT(*) AS n FROM users').get().n === 0;
-  const colors = ['#4f46e5', '#0ea5e9', '#059669', '#d97706', '#dc2626', '#7c3aed', '#db2777'];
+  const colors = ['#a8862c', '#0ea5e9', '#059669', '#d97706', '#dc2626', '#7c3aed', '#db2777'];
   const color = colors[Math.floor(Math.random() * colors.length)];
-  const info = db.prepare('INSERT INTO users (name, email, pass_hash, role, color, pin) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(name.trim(), email.trim(), hashPassword(password), isFirst ? 'admin' : 'member', color, newPin());
+  const pin = newPin();
+  const info = db.prepare('INSERT INTO users (name, email, pass_hash, role, color, pin, phone) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(name.trim(), `p${digits}@ee.local`, hashPassword(String(Math.random())), isFirst ? 'admin' : 'member', color, pin, digits);
   const userId = Number(info.lastInsertRowid);
 
   const general = db.prepare(`SELECT id FROM channels WHERE kind = 'group' AND name = 'General'`).get();
   db.prepare('INSERT OR IGNORE INTO channel_members (channel_id, user_id) VALUES (?, ?)').run(general.id, userId);
 
   setAuthCookie(res, userId);
-  res.json({ user: db.prepare('SELECT id, name, email, role, color FROM users WHERE id = ?').get(userId) });
+  res.json({ user: publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(userId)), pin });
 });
 
+// Sign in with a 5-digit PIN.
 app.post('/api/auth/login', (req, res) => {
-  const { email, password } = req.body || {};
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get((email || '').trim());
-  if (!user || !verifyPassword(password || '', user.pass_hash)) {
-    return res.status(401).json({ error: 'Invalid email or password' });
-  }
+  if (tooManyAttempts(req)) return res.status(429).json({ error: 'Too many attempts — wait a few minutes' });
+  const pin = String(req.body?.pin || '');
+  const user = /^\d{5}$/.test(pin) ? db.prepare('SELECT * FROM users WHERE pin = ?').get(pin) : null;
+  if (!user) return res.status(401).json({ error: 'PIN not recognized' });
   setAuthCookie(res, user.id);
-  res.json({ user: { id: user.id, name: user.name, email: user.email, role: user.role, color: user.color } });
+  res.json({ user: publicUser(user) });
 });
 
 app.post('/api/auth/logout', (req, res) => {
@@ -76,8 +95,8 @@ app.get('/api/me', requireAuth, (req, res) => {
 
 app.get('/api/users', requireAuth, (req, res) => {
   const cols = req.user.role === 'admin'
-    ? 'id, name, email, role, color, hourly_rate, pin'
-    : 'id, name, email, role, color';
+    ? 'id, name, email, phone, role, color, hourly_rate, pin'
+    : 'id, name, email, phone, role, color';
   res.json({ users: db.prepare(`SELECT ${cols} FROM users ORDER BY name`).all() });
 });
 
@@ -463,6 +482,7 @@ function checkPin(req, res) {
 }
 
 app.post('/api/time/clock-in', requireAuth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Please clock in at the kiosk' });
   if (!checkPin(req, res)) return;
   const open = db.prepare('SELECT id FROM time_entries WHERE user_id = ? AND clock_out IS NULL').get(req.user.id);
   if (open) return res.status(400).json({ error: 'You are already clocked in' });
@@ -475,6 +495,7 @@ app.post('/api/time/clock-in', requireAuth, (req, res) => {
 });
 
 app.post('/api/time/clock-out', requireAuth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Please clock out at the kiosk' });
   if (!checkPin(req, res)) return;
   const open = db.prepare('SELECT * FROM time_entries WHERE user_id = ? AND clock_out IS NULL').get(req.user.id);
   if (!open) return res.status(400).json({ error: 'You are not clocked in' });
@@ -780,7 +801,20 @@ app.get('/api/forms/:id/submissions', requireAuth, (req, res) => {
 
 /* ---------------------------------- kiosk ----------------------------------- */
 
-// A shared device (logged in as an admin) where workers punch in/out by PIN.
+// Arm (or verify to disarm) kiosk mode: only an admin PIN unlocks it.
+// On success the device's session becomes that admin's, so punches authorize.
+app.post('/api/kiosk/arm', (req, res) => {
+  if (tooManyAttempts(req)) return res.status(429).json({ error: 'Too many attempts — wait a few minutes' });
+  const pin = String(req.body?.pin || '');
+  const user = /^\d{5}$/.test(pin)
+    ? db.prepare(`SELECT * FROM users WHERE pin = ? AND role = 'admin'`).get(pin)
+    : null;
+  if (!user) return res.status(403).json({ error: 'Admin PIN required' });
+  setAuthCookie(res, user.id);
+  res.json({ ok: true, name: user.name });
+});
+
+// A shared device (armed by an admin) where workers punch in/out by PIN.
 app.post('/api/kiosk/punch', requireAuth, requireAdmin, (req, res) => {
   const pin = String(req.body?.pin || '');
   if (!/^\d{5}$/.test(pin)) return res.status(400).json({ error: 'Enter a 5-digit PIN' });

@@ -102,6 +102,17 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--muted); 
   padding: 30px 26px; width: 100%; max-width: 420px;
 }
 .auth-brand { display: block; width: 100%; max-width: 270px; margin: 0 auto 10px; }
+.auth-card { --bg: #1f222b; } /* PIN pad keys inside the dark card */
+.auth-card .pin-pad button { background: #1f222b; }
+.pin-reveal {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 46px; font-weight: 800; letter-spacing: .28em;
+  color: var(--accent); margin: 14px 0 6px; padding-left: .28em;
+}
+.kiosk-exit {
+  margin-top: 28px; font-size: 13px; font-weight: 600; color: var(--muted);
+  padding: 8px 16px; border-radius: 999px; background: var(--bg);
+}
 .auth-sub { color: var(--muted); font-size: 14px; margin-bottom: 10px; text-align: center; }
 .auth-error { color: #f87171; font-size: 14px; margin-top: 12px; min-height: 18px; }
 .auth-switch { text-align: center; margin-top: 18px; font-size: 14px; color: var(--muted); }

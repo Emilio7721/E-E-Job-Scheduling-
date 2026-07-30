@@ -14,7 +14,9 @@ A Connecteam-style workforce app for E&E: **job scheduling**, **venues**, **team
 - **📋 Forms & checklists** — admins build forms (text, paragraph, checkbox, dropdown, number, date fields, required flags); employees fill them in from their phone and admins review all submissions.
 - **📢 Updates feed** — company announcements posted by admins, pushed to every phone, with likes.
 - **🔔 Notifications on your phone** — real web push notifications (banner + lock screen) for job assignments, schedule changes, cancellations, chat messages, tasks, time-off decisions, new forms, and announcements — even when the app is closed. Plus an in-app notification feed.
-- **👥 Team** — everyone who signs up appears in the team list; admins manage roles and hourly rates. The **first account created becomes the admin**.
+- **🔑 PIN sign-in** — no passwords: new team members sign up with their **name and phone number** and get a unique **5-digit PIN** used to sign in and clock in. The **first account created becomes the admin**.
+- **🔢 Kiosk mode** — an admin PIN locks any device into a full-screen punch clock (it stays locked across restarts until an admin PIN is entered again). Members clock in/out **only at the kiosk**, in person; admins can also punch from their own phone.
+- **👥 Team** — everyone who signs up appears in the team list; admins manage roles, hourly rates, and PINs.
 - **📱 Installable app** — add it to your home screen and it runs full-screen with its own icon, like a native app.
 
 ## Quick start
@@ -28,10 +30,11 @@ No database server or configuration needed — it uses SQLite (built into Node 2
 
 **Requires Node.js 22 or newer.**
 
-1. Open the app and **create the first account — it becomes the admin.**
+1. Open the app and **sign up first (name + phone) — the first account becomes the admin** and receives its PIN.
 2. Add your venues (Venues tab → ＋).
 3. Create jobs (Schedule tab → ＋), assign team members — they get notified instantly.
-4. Share the app's URL with your team; they sign up and appear in Team, Chat, and the scheduler.
+4. Share the app's URL with your team; they sign up with name + number, get a PIN, and appear in Team, Chat, and the scheduler.
+5. On a venue tablet/phone: More → Kiosk Mode → enter an admin PIN to lock it into the punch clock.
 
 ## Getting notifications on phones
 
@@ -54,7 +57,7 @@ Use the **Test** button in Settings to confirm the device receives notifications
 
 - **Backend:** Node.js + Express, SQLite (`node:sqlite`), Server-Sent Events for realtime, `web-push` (VAPID) for phone notifications.
 - **Frontend:** dependency-free vanilla JS single-page app, mobile-first, PWA (service worker + manifest, offline shell caching).
-- **Auth:** HMAC-signed session cookies, scrypt password hashing. Admin/member roles.
+- **Auth:** PIN-based sign-in with per-IP rate limiting, HMAC-signed session cookies. Admin/member roles; members can only punch at an admin-armed kiosk.
 
 ## Project layout
 
