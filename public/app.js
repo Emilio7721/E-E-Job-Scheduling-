@@ -133,7 +133,7 @@ function connectEvents() {
   es.addEventListener('channels', () => refreshChannels());
   for (const [event, views] of Object.entries({
     time: ['clock', 'timesheets'], timeoff: ['timeoff'], tasks: ['tasks'], forms: ['forms'], posts: ['updates'],
-    hours: ['hours'], roles: ['roles'], positions: ['positions', 'team'],
+    hours: ['hours'], roles: ['roles'], positions: ['positions', 'team'], users: ['team'],
   })) {
     es.addEventListener(event, () => { if (views.includes(route().view)) render(); });
   }
@@ -344,11 +344,19 @@ function queueNotifPrompt() {
 
 async function maybeShowOnboarding() {
   if (kioskArmed()) return; // a kiosk device gets no personal onboarding
-  // Permission already granted (e.g. reinstalled, new session): resubscribe quietly.
+  // Permission already granted: re-register this device on every launch. A push
+  // endpoint is unique per device, so if anyone else signed in here the endpoint
+  // now points at their account — re-posting it rebinds it to whoever is signed
+  // in, which is why assignments could silently stop arriving.
   if (pushSupported() && Notification.permission === 'granted') {
     try {
       const reg = await navigator.serviceWorker.ready;
-      if (!(await reg.pushManager.getSubscription())) await enablePush();
+      const sub = (await reg.pushManager.getSubscription())
+        || await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(state.vapidPublicKey),
+        });
+      await api('/api/push/subscribe', { method: 'POST', body: sub.toJSON() });
     } catch {}
     return;
   }
@@ -510,6 +518,51 @@ function shell(title, contentHTML, { back = null, fab = null } = {}) {
   const signoutBtn = document.getElementById('signout-btn');
   if (signoutBtn) signoutBtn.onclick = signOut;
   updateBadges();
+}
+
+/* ---------------------------- people picker -------------------------------- */
+
+// Search box + filtered, multi-select list of people. Returns markup; pair it
+// with bindPeoplePicker() to keep `selected` in sync as the admin types.
+function peoplePickerHTML(people, selected, { id = 'picker', placeholder = 'Search team members…' } = {}) {
+  return `
+    <input class="picker-search" id="${id}-search" type="search" autocomplete="off" placeholder="${esc(placeholder)}">
+    <div class="assignee-list" id="${id}-list">
+      ${people.map((u) => `
+        <button type="button" class="opt ${selected.has(u.id) ? 'on' : ''}" data-user="${u.id}" data-name="${esc(u.name.toLowerCase())}">
+          <span class="avatar" style="background:${esc(u.color)}">${esc(initials(u.name))}</span>
+          <span class="grow">${esc(u.name)}</span>
+          <span class="check">✓</span>
+        </button>`).join('')}
+    </div>
+    <div class="picker-empty" id="${id}-empty" hidden>No one matches that search.</div>`;
+}
+
+function bindPeoplePicker(root, selected, { id = 'picker' } = {}) {
+  const search = root.querySelector(`#${id}-search`);
+  const empty = root.querySelector(`#${id}-empty`);
+  const options = [...root.querySelectorAll(`#${id}-list [data-user]`)];
+
+  const filter = () => {
+    const q = search.value.trim().toLowerCase();
+    let shown = 0;
+    for (const opt of options) {
+      const match = !q || opt.dataset.name.includes(q);
+      opt.hidden = !match;
+      if (match) shown++;
+    }
+    empty.hidden = shown > 0;
+  };
+  search.oninput = filter;
+
+  for (const opt of options) {
+    opt.onclick = () => {
+      const uid = Number(opt.dataset.user);
+      selected.has(uid) ? selected.delete(uid) : selected.add(uid);
+      opt.classList.toggle('on');
+    };
+  }
+  return filter;
 }
 
 /* -------------------------------- PIN pad ---------------------------------- */
@@ -686,13 +739,7 @@ function openShiftModal(shift = null) {
       <label>Ends</label><input name="ends_at" type="datetime-local" required value="${endVal}">
       <label>Notes</label><textarea name="notes" rows="2" placeholder="Instructions, dress code, contact…">${esc(shift?.notes || '')}</textarea>
       <label>Assign team members</label>
-      <div class="assignee-list">
-        ${state.users.map((u) => `
-          <button type="button" class="opt ${selected.has(u.id) ? 'on' : ''}" data-user="${u.id}">
-            <span class="avatar" style="background:${esc(u.color)}">${esc(initials(u.name))}</span>
-            ${esc(u.name)}<span class="check">✓</span>
-          </button>`).join('')}
-      </div>
+      ${peoplePickerHTML(state.users, selected, { id: 'shift-picker' })}
       <div class="actions">
         ${shift ? `<button type="button" class="btn danger" id="delete-shift">Delete</button>` : ''}
         <button type="submit" class="btn">${shift ? 'Save changes' : 'Create job'}</button>
@@ -700,13 +747,7 @@ function openShiftModal(shift = null) {
     </form>
   `);
 
-  modal.querySelectorAll('[data-user]').forEach((b) => {
-    b.onclick = () => {
-      const id = Number(b.dataset.user);
-      selected.has(id) ? selected.delete(id) : selected.add(id);
-      b.classList.toggle('on');
-    };
-  });
+  bindPeoplePicker(modal, selected, { id: 'shift-picker' });
   const del = modal.querySelector('#delete-shift');
   if (del) del.onclick = async () => {
     if (!confirm('Delete this job? Assigned team members will be notified.')) return;
@@ -791,23 +832,11 @@ function openChannelModal() {
     <form id="channel-form">
       <label>Channel name</label><input name="name" required placeholder="e.g. Bartenders">
       <label>Members</label>
-      <div class="assignee-list">
-        ${state.users.filter((u) => u.id !== state.me.id).map((u) => `
-          <button type="button" class="opt" data-user="${u.id}">
-            <span class="avatar" style="background:${esc(u.color)}">${esc(initials(u.name))}</span>
-            ${esc(u.name)}<span class="check">✓</span>
-          </button>`).join('')}
-      </div>
+      ${peoplePickerHTML(state.users.filter((u) => u.id !== state.me.id), selected, { id: 'chan-picker' })}
       <div class="actions"><button type="submit" class="btn">Create channel</button></div>
     </form>
   `);
-  modal.querySelectorAll('[data-user]').forEach((b) => {
-    b.onclick = () => {
-      const id = Number(b.dataset.user);
-      selected.has(id) ? selected.delete(id) : selected.add(id);
-      b.classList.toggle('on');
-    };
-  });
+  bindPeoplePicker(modal, selected, { id: 'chan-picker' });
   modal.querySelector('#channel-form').onsubmit = async (e) => {
     e.preventDefault();
     const name = new FormData(e.target).get('name');
@@ -959,6 +988,7 @@ function renderTeam() {
         <span class="role-tag">${u.role}</span>
         ${isAdmin && u.hourly_rate ? `<span class="sub">$${Number(u.hourly_rate).toFixed(2)}/h</span>` : ''}
         ${isAdmin ? `<button class="icon-btn" data-edit-user="${u.id}" title="Edit">✏️</button>` : ''}
+        ${isAdmin && u.id !== state.me.id ? `<button class="icon-btn" data-remove-user="${u.id}" title="Remove from team">🗑️</button>` : ''}
       </div>`).join('')}
     <div class="card">
       <div style="font-weight:700;margin-bottom:6px">Invite your team</div>
@@ -967,6 +997,18 @@ function renderTeam() {
   `);
   document.querySelectorAll('[data-edit-user]').forEach((b) => {
     b.onclick = () => openUserModal(state.users.find((u) => u.id === Number(b.dataset.editUser)));
+  });
+  document.querySelectorAll('[data-remove-user]').forEach((b) => {
+    b.onclick = async () => {
+      const user = state.users.find((u) => u.id === Number(b.dataset.removeUser));
+      if (!confirm(`Remove ${user.name} from the team?\n\nThey lose access immediately and their timesheet history is deleted. Export payroll first if you still need their hours.`)) return;
+      try {
+        await api(`/api/users/${user.id}`, { method: 'DELETE' });
+        state.users = (await api('/api/users')).users;
+        toast(`${user.name} removed`);
+        render();
+      } catch (err) { toast(err.message); }
+    };
   });
 }
 
@@ -981,13 +1023,14 @@ function openUserModal(user) {
         <option value="">No position</option>
         ${state.positions.map((r) => `<option value="${r.id}" ${user.position_id === r.id ? 'selected' : ''}>${esc(r.name)}${r.is_admin ? ' — ⭐ admin' : ''}</option>`).join('')}
       </select>
-      <p class="hint">Positions marked ⭐ grant admin access automatically. Manage them in More → Positions.</p>
-      <label>Account access</label>
-      <select name="role" id="access-select" ${isSelf ? 'disabled' : ''}>
-        <option value="member" ${user.role === 'member' ? 'selected' : ''}>Member</option>
-        <option value="admin" ${user.role === 'admin' ? 'selected' : ''}>Admin — manages jobs, venues, forms, payroll</option>
-      </select>
-      ${isSelf ? '<p class="hint">You cannot change your own access.</p>' : ''}
+      <p class="hint">Access follows the position: those marked ⭐ make the person an admin. Manage them in More → Positions.<br>Currently: <b>${user.role === 'admin' ? 'Admin' : 'Member'}</b>${isSelf ? ' (you)' : ''}</p>
+      <div class="card row" style="box-shadow:none;border:1px solid var(--line);margin:12px 0 0">
+        <span class="grow">
+          <div style="font-weight:700">Phone notifications</div>
+          <div class="sub">${user.devices ? `✅ ${user.devices} device${user.devices === 1 ? '' : 's'} registered` : '⚠️ No device registered — they need to open the app and turn notifications on'}</div>
+        </span>
+        ${user.devices && !isSelf ? '<button type="button" class="btn small secondary" id="push-test-user">Test</button>' : ''}
+      </div>
       <label>Hourly rate ($) — used for payroll export</label>
       <input name="hourly_rate" type="number" min="0" step="0.01" value="${Number(user.hourly_rate || 0).toFixed(2)}">
       <label>Clock-in PIN</label>
@@ -1005,16 +1048,14 @@ function openUserModal(user) {
     state.users = (await api('/api/users')).users;
     toast('New PIN generated');
   };
-  // Picking a position locks the access select to what the position grants.
   const posSel = modal.querySelector('#position-select');
-  const accSel = modal.querySelector('#access-select');
-  const syncAccess = () => {
-    const pos = state.positions.find((r) => r.id === Number(posSel.value));
-    if (pos) { accSel.value = pos.is_admin ? 'admin' : 'member'; accSel.disabled = true; }
-    else if (!isSelf) accSel.disabled = false;
+  const pushTest = modal.querySelector('#push-test-user');
+  if (pushTest) pushTest.onclick = async () => {
+    try {
+      await api(`/api/push/test/${user.id}`, { method: 'POST' });
+      toast(`Test sent to ${user.name}`);
+    } catch (err) { toast(err.message); }
   };
-  posSel.onchange = syncAccess;
-  syncAccess();
 
   modal.querySelector('#user-form').onsubmit = async (e) => {
     e.preventDefault();
@@ -1023,7 +1064,6 @@ function openUserModal(user) {
       await api(`/api/users/${user.id}`, {
         method: 'PATCH',
         body: {
-          role: isSelf || accSel.disabled ? user.role : fd.get('role'),
           position_id: posSel.value ? Number(posSel.value) : null,
           hourly_rate: Number(fd.get('hourly_rate')) || 0,
         },
@@ -1040,17 +1080,41 @@ async function renderNotifications() {
   const { notifications } = await api('/api/notifications');
   state.notifications = notifications;
   shell('Notifications', `
-    ${notifications.length ? notifications.map((n) => `
-      <div class="card notif ${n.read ? '' : 'unread'}" data-notif-url="${esc(n.url)}">
-        <div class="title">${esc(n.title)}</div>
-        ${n.body ? `<div class="body">${esc(n.body)}</div>` : ''}
-        <div class="when">${fmtWhen(n.created_at)}</div>
-      </div>`).join('') : `
+    ${notifications.length ? `
+      <div style="display:flex;justify-content:flex-end;margin-bottom:8px">
+        <button class="btn small secondary" id="clear-notifs">Clear all</button>
+      </div>
+      ${notifications.map((n) => `
+      <div class="card notif ${n.read ? '' : 'unread'}">
+        <div class="row">
+          <span class="grow" data-notif-url="${esc(n.url)}">
+            <div class="title">${esc(n.title)}</div>
+            ${n.body ? `<div class="body">${esc(n.body)}</div>` : ''}
+            <div class="when">${fmtWhen(n.created_at)}</div>
+          </span>
+          <button class="icon-btn" data-del-notif="${n.id}" title="Remove">✕</button>
+        </div>
+      </div>`).join('')}` : `
       <div class="empty"><div class="big">🔔</div>Nothing here yet.<br>Job assignments and updates will show up here.</div>`}
   `, { back: () => history.back() });
   document.querySelectorAll('[data-notif-url]').forEach((el) => {
     el.onclick = () => { location.href = el.dataset.notifUrl; };
   });
+  document.querySelectorAll('[data-del-notif]').forEach((b) => {
+    b.onclick = async (e) => {
+      e.stopPropagation();
+      await api(`/api/notifications/${b.dataset.delNotif}`, { method: 'DELETE' });
+      state.notifications = state.notifications.filter((n) => n.id !== Number(b.dataset.delNotif));
+      render();
+    };
+  });
+  const clearBtn = document.getElementById('clear-notifs');
+  if (clearBtn) clearBtn.onclick = async () => {
+    if (!confirm('Clear all notifications?')) return;
+    await api('/api/notifications', { method: 'DELETE' });
+    state.notifications = [];
+    render();
+  };
   if (notifications.some((n) => !n.read)) {
     api('/api/notifications/read', { method: 'POST' }).then(() => {
       state.notifications = state.notifications.map((n) => ({ ...n, read: 1 }));
@@ -1485,26 +1549,14 @@ function openTaskModal(task = null) {
       <label>Details (optional)</label><textarea name="notes" rows="2">${esc(task?.notes || '')}</textarea>
       <label>Due date (optional)</label><input name="due_at" type="date" value="${task?.due_at ? task.due_at.slice(0, 10) : ''}">
       <label>Assign to</label>
-      <div class="assignee-list">
-        ${state.users.map((u) => `
-          <button type="button" class="opt ${selected.has(u.id) ? 'on' : ''}" data-user="${u.id}">
-            <span class="avatar" style="background:${esc(u.color)}">${esc(initials(u.name))}</span>
-            ${esc(u.name)}<span class="check">✓</span>
-          </button>`).join('')}
-      </div>
+      ${peoplePickerHTML(state.users, selected, { id: 'task-picker' })}
       <div class="actions">
         ${task ? '<button type="button" class="btn danger" id="task-delete">Delete</button>' : ''}
         <button type="submit" class="btn">${task ? 'Save' : 'Create task'}</button>
       </div>
     </form>
   `);
-  modal.querySelectorAll('[data-user]').forEach((b) => {
-    b.onclick = () => {
-      const id = Number(b.dataset.user);
-      selected.has(id) ? selected.delete(id) : selected.add(id);
-      b.classList.toggle('on');
-    };
-  });
+  bindPeoplePicker(modal, selected, { id: 'task-picker' });
   const del = modal.querySelector('#task-delete');
   if (del) del.onclick = async () => {
     if (!confirm('Delete this task?')) return;
