@@ -1,6 +1,6 @@
 const express = require('express');
 const path = require('node:path');
-const { db } = require('./src/db');
+const { db, newPin } = require('./src/db');
 const {
   hashPassword, verifyPassword, issueToken, verifyToken, tokenFromReq,
   requireAuth, requireAdmin,
@@ -41,8 +41,8 @@ app.post('/api/auth/register', (req, res) => {
   const isFirst = db.prepare('SELECT COUNT(*) AS n FROM users').get().n === 0;
   const colors = ['#4f46e5', '#0ea5e9', '#059669', '#d97706', '#dc2626', '#7c3aed', '#db2777'];
   const color = colors[Math.floor(Math.random() * colors.length)];
-  const info = db.prepare('INSERT INTO users (name, email, pass_hash, role, color) VALUES (?, ?, ?, ?, ?)')
-    .run(name.trim(), email.trim(), hashPassword(password), isFirst ? 'admin' : 'member', color);
+  const info = db.prepare('INSERT INTO users (name, email, pass_hash, role, color, pin) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(name.trim(), email.trim(), hashPassword(password), isFirst ? 'admin' : 'member', color, newPin());
   const userId = Number(info.lastInsertRowid);
 
   const general = db.prepare(`SELECT id FROM channels WHERE kind = 'group' AND name = 'General'`).get();
@@ -68,14 +68,15 @@ app.post('/api/auth/logout', (req, res) => {
 });
 
 app.get('/api/me', requireAuth, (req, res) => {
-  res.json({ user: req.user, vapidPublicKey: push.publicKey });
+  const { pin } = db.prepare('SELECT pin FROM users WHERE id = ?').get(req.user.id);
+  res.json({ user: { ...req.user, pin }, vapidPublicKey: push.publicKey });
 });
 
 /* ---------------------------------- team ---------------------------------- */
 
 app.get('/api/users', requireAuth, (req, res) => {
   const cols = req.user.role === 'admin'
-    ? 'id, name, email, role, color, hourly_rate'
+    ? 'id, name, email, role, color, hourly_rate, pin'
     : 'id, name, email, role, color';
   res.json({ users: db.prepare(`SELECT ${cols} FROM users ORDER BY name`).all() });
 });
@@ -90,7 +91,12 @@ app.patch('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
   }
   const rate = Math.max(0, Number(hourly_rate) || 0);
   db.prepare('UPDATE users SET role = ?, hourly_rate = ? WHERE id = ?').run(role, rate, target.id);
-  res.json({ ok: true });
+  let pin;
+  if (req.body?.new_pin) {
+    pin = newPin();
+    db.prepare('UPDATE users SET pin = ? WHERE id = ?').run(pin, target.id);
+  }
+  res.json({ ok: true, pin });
 });
 
 /* --------------------------------- venues --------------------------------- */
@@ -447,7 +453,17 @@ app.get('/api/time/status', requireAuth, (req, res) => {
   res.json({ entry: entry || null });
 });
 
+function checkPin(req, res) {
+  const { pin } = db.prepare('SELECT pin FROM users WHERE id = ?').get(req.user.id);
+  if (String(req.body?.pin || '') !== pin) {
+    res.status(403).json({ error: 'Incorrect PIN' });
+    return false;
+  }
+  return true;
+}
+
 app.post('/api/time/clock-in', requireAuth, (req, res) => {
+  if (!checkPin(req, res)) return;
   const open = db.prepare('SELECT id FROM time_entries WHERE user_id = ? AND clock_out IS NULL').get(req.user.id);
   if (open) return res.status(400).json({ error: 'You are already clocked in' });
   const { lat = null, lng = null, shift_id = null, note = '' } = req.body || {};
@@ -459,6 +475,7 @@ app.post('/api/time/clock-in', requireAuth, (req, res) => {
 });
 
 app.post('/api/time/clock-out', requireAuth, (req, res) => {
+  if (!checkPin(req, res)) return;
   const open = db.prepare('SELECT * FROM time_entries WHERE user_id = ? AND clock_out IS NULL').get(req.user.id);
   if (!open) return res.status(400).json({ error: 'You are not clocked in' });
   const { lat = null, lng = null } = req.body || {};
@@ -759,6 +776,132 @@ app.get('/api/forms/:id/submissions', requireAuth, (req, res) => {
   sql += ' ORDER BY s.id DESC LIMIT 200';
   const submissions = db.prepare(sql).all(...params).map((s) => ({ ...s, answers: JSON.parse(s.answers) }));
   res.json({ form: { ...form, fields: JSON.parse(form.fields) }, submissions });
+});
+
+/* ---------------------------------- kiosk ----------------------------------- */
+
+// A shared device (logged in as an admin) where workers punch in/out by PIN.
+app.post('/api/kiosk/punch', requireAuth, requireAdmin, (req, res) => {
+  const pin = String(req.body?.pin || '');
+  if (!/^\d{5}$/.test(pin)) return res.status(400).json({ error: 'Enter a 5-digit PIN' });
+  const user = db.prepare('SELECT id, name FROM users WHERE pin = ?').get(pin);
+  if (!user) return res.status(404).json({ error: 'PIN not recognized' });
+  const { lat = null, lng = null } = req.body || {};
+
+  const open = db.prepare('SELECT * FROM time_entries WHERE user_id = ? AND clock_out IS NULL').get(user.id);
+  const now = new Date().toISOString();
+  let action;
+  if (open) {
+    db.prepare('UPDATE time_entries SET clock_out = ?, out_lat = ?, out_lng = ? WHERE id = ?')
+      .run(now, lat, lng, open.id);
+    action = 'out';
+  } else {
+    db.prepare(`INSERT INTO time_entries (user_id, clock_in, in_lat, in_lng, note) VALUES (?, ?, ?, ?, 'kiosk')`)
+      .run(user.id, now, lat, lng);
+    action = 'in';
+  }
+  events.broadcast('time', {});
+  res.json({ name: user.name, action, at: now });
+});
+
+/* ---------------------------------- roles ----------------------------------- */
+
+app.get('/api/roles', requireAuth, (req, res) => {
+  res.json({ roles: db.prepare('SELECT * FROM roles WHERE archived = 0 ORDER BY name').all() });
+});
+
+app.post('/api/roles', requireAuth, requireAdmin, (req, res) => {
+  const { name } = req.body || {};
+  if (!name?.trim()) return res.status(400).json({ error: 'Role name is required' });
+  const info = db.prepare('INSERT INTO roles (name) VALUES (?)').run(name.trim());
+  events.broadcast('roles', {});
+  res.json({ role: db.prepare('SELECT * FROM roles WHERE id = ?').get(Number(info.lastInsertRowid)) });
+});
+
+app.patch('/api/roles/:id', requireAuth, requireAdmin, (req, res) => {
+  const { name } = req.body || {};
+  if (!name?.trim()) return res.status(400).json({ error: 'Role name is required' });
+  db.prepare('UPDATE roles SET name = ? WHERE id = ?').run(name.trim(), Number(req.params.id));
+  events.broadcast('roles', {});
+  res.json({ ok: true });
+});
+
+app.delete('/api/roles/:id', requireAuth, requireAdmin, (req, res) => {
+  db.prepare('UPDATE roles SET archived = 1 WHERE id = ?').run(Number(req.params.id));
+  events.broadcast('roles', {});
+  res.json({ ok: true });
+});
+
+/* ------------------------------ hours requests ------------------------------ */
+
+const HOUR_REQ_QUERY = `
+  SELECT h.*, u.name AS user_name, u.color AS user_color,
+         v.name AS venue_name, r.name AS role_name
+  FROM hour_requests h
+  JOIN users u ON u.id = h.user_id
+  LEFT JOIN venues v ON v.id = h.venue_id
+  LEFT JOIN roles r ON r.id = h.role_id
+`;
+
+app.get('/api/hour-requests', requireAuth, (req, res) => {
+  const requests = req.user.role === 'admin'
+    ? db.prepare(HOUR_REQ_QUERY + ' ORDER BY h.id DESC LIMIT 200').all()
+    : db.prepare(HOUR_REQ_QUERY + ' WHERE h.user_id = ? ORDER BY h.id DESC LIMIT 200').all(req.user.id);
+  res.json({ requests });
+});
+
+app.post('/api/hour-requests', requireAuth, (req, res) => {
+  const { venue_id = null, role_id = null, starts_at, ends_at, note = '' } = req.body || {};
+  if (!starts_at || !ends_at || new Date(ends_at) <= new Date(starts_at)) {
+    return res.status(400).json({ error: 'Valid start and end times are required' });
+  }
+  const info = db.prepare(
+    'INSERT INTO hour_requests (user_id, venue_id, role_id, starts_at, ends_at, note) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(req.user.id, venue_id || null, role_id || null, starts_at, ends_at, String(note).slice(0, 500));
+  events.broadcast('hours', {});
+  const request = db.prepare(HOUR_REQ_QUERY + ' WHERE h.id = ?').get(Number(info.lastInsertRowid));
+  const hours = ((new Date(ends_at) - new Date(starts_at)) / 3600000).toFixed(1);
+  const admins = db.prepare(`SELECT id FROM users WHERE role = 'admin'`).all().map((r) => r.id);
+  notify(admins.filter((id) => id !== req.user.id), {
+    title: `Hours request from ${req.user.name}`,
+    body: `${hours}h · ${fmtShiftTime(starts_at)}${request.venue_name ? ' @ ' + request.venue_name : ''}${request.role_name ? ' · ' + request.role_name : ''}`,
+    url: '/#/hours',
+  });
+  res.json({ request });
+});
+
+app.post('/api/hour-requests/:id/decide', requireAuth, requireAdmin, (req, res) => {
+  const { status } = req.body || {};
+  if (!['approved', 'denied'].includes(status)) return res.status(400).json({ error: 'Invalid decision' });
+  const request = db.prepare(HOUR_REQ_QUERY + ' WHERE h.id = ?').get(Number(req.params.id));
+  if (!request) return res.status(404).json({ error: 'Request not found' });
+  if (request.status !== 'pending') return res.status(400).json({ error: 'Request already decided' });
+  db.prepare('UPDATE hour_requests SET status = ?, decided_by = ? WHERE id = ?').run(status, req.user.id, request.id);
+
+  // Approval writes the hours straight into the timesheet, pre-approved.
+  if (status === 'approved') {
+    const label = [request.role_name, request.venue_name].filter(Boolean).join(' @ ');
+    db.prepare('INSERT INTO time_entries (user_id, clock_in, clock_out, note, approved) VALUES (?, ?, ?, ?, 1)')
+      .run(request.user_id, request.starts_at, request.ends_at, label || 'requested hours');
+    events.broadcast('time', {});
+  }
+  events.broadcast('hours', {});
+  notify([request.user_id].filter((id) => id !== req.user.id), {
+    title: `Hours ${status}`,
+    body: `${fmtShiftTime(request.starts_at)}${request.venue_name ? ' @ ' + request.venue_name : ''}`,
+    url: '/#/hours',
+  });
+  res.json({ ok: true });
+});
+
+app.delete('/api/hour-requests/:id', requireAuth, (req, res) => {
+  const request = db.prepare('SELECT * FROM hour_requests WHERE id = ?').get(Number(req.params.id));
+  if (!request) return res.status(404).json({ error: 'Request not found' });
+  if (request.user_id !== req.user.id && req.user.role !== 'admin') return res.status(403).json({ error: 'Not allowed' });
+  if (request.status !== 'pending') return res.status(400).json({ error: 'Only pending requests can be withdrawn' });
+  db.prepare('DELETE FROM hour_requests WHERE id = ?').run(request.id);
+  events.broadcast('hours', {});
+  res.json({ ok: true });
 });
 
 /* ------------------------------- updates feed ------------------------------- */
