@@ -59,7 +59,7 @@ function tokenFromReq(req) {
 function requireAuth(req, res, next) {
   const userId = verifyToken(tokenFromReq(req));
   if (!userId) return res.status(401).json({ error: 'Not signed in' });
-  const user = db.prepare('SELECT id, name, email, phone, role, color FROM users WHERE id = ?').get(userId);
+  const user = db.prepare('SELECT id, name, email, phone, role, role_id, color FROM users WHERE id = ?').get(userId);
   if (!user) return res.status(401).json({ error: 'Not signed in' });
   req.user = user;
   next();

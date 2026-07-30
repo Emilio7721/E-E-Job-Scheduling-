@@ -635,6 +635,7 @@ function shiftCardHTML(s) {
         <div class="shift-time">${fmtTime(s.starts_at)} – ${fmtTime(s.ends_at)}</div>
         <div class="shift-title">${esc(s.title)}</div>
         ${s.venue_name ? `<div class="shift-venue">📍 ${esc(s.venue_name)}${s.venue_address ? ` · ${esc(s.venue_address)}` : ''}</div>` : ''}
+        ${s.role_name ? `<div class="shift-venue">🧑‍🍳 ${esc(s.role_name)}</div>` : ''}
         ${s.notes ? `<div class="shift-notes">${esc(s.notes)}</div>` : ''}
         ${s.assignees.length ? `<div class="shift-people">
           ${s.assignees.map((a) => `<span class="chip ${a.status}">
@@ -675,6 +676,11 @@ function openShiftModal(shift = null) {
         <option value="">No venue</option>
         ${state.venues.map((v) => `<option value="${v.id}" ${shift?.venue_id === v.id ? 'selected' : ''}>${esc(v.name)}</option>`).join('')}
       </select>
+      <label>Sub-job / role (optional)</label>
+      <select name="role_id">
+        <option value="">No role</option>
+        ${state.roles.map((r) => `<option value="${r.id}" ${shift?.role_id === r.id ? 'selected' : ''}>${esc(r.name)}</option>`).join('')}
+      </select>
       <label>Starts</label><input name="starts_at" type="datetime-local" required value="${startVal}">
       <label>Ends</label><input name="ends_at" type="datetime-local" required value="${endVal}">
       <label>Notes</label><textarea name="notes" rows="2" placeholder="Instructions, dress code, contact…">${esc(shift?.notes || '')}</textarea>
@@ -713,6 +719,7 @@ function openShiftModal(shift = null) {
     const body = {
       title: fd.get('title'),
       venue_id: fd.get('venue_id') ? Number(fd.get('venue_id')) : null,
+      role_id: fd.get('role_id') ? Number(fd.get('role_id')) : null,
       starts_at: new Date(fd.get('starts_at')).toISOString(),
       ends_at: new Date(fd.get('ends_at')).toISOString(),
       notes: fd.get('notes') || '',
@@ -946,7 +953,7 @@ function renderTeam() {
         <span class="avatar lg" style="background:${esc(u.color)}">${esc(initials(u.name))}</span>
         <span class="grow">
           <div style="font-weight:700">${esc(u.name)} ${u.id === state.me.id ? '<span class="sub">(you)</span>' : ''}</div>
-          <div class="sub">${esc(contactOf(u))}</div>
+          <div class="sub">${esc(contactOf(u))}${u.role_id ? ` · 🧑‍🍳 ${esc(state.roles.find((r) => r.id === u.role_id)?.name || '')}` : ''}</div>
         </span>
         <span class="role-tag">${u.role}</span>
         ${isAdmin && u.hourly_rate ? `<span class="sub">$${Number(u.hourly_rate).toFixed(2)}/h</span>` : ''}
@@ -968,12 +975,18 @@ function openUserModal(user) {
     <h3>${esc(user.name)}</h3>
     <p class="sub">${esc(contactOf(user))}</p>
     <form id="user-form">
-      <label>Role</label>
-      <select name="role" ${isSelf ? 'disabled' : ''}>
+      <label>Sub-job / position</label>
+      <select name="role_id" id="position-select">
+        <option value="">No position</option>
+        ${state.roles.map((r) => `<option value="${r.id}" ${user.role_id === r.id ? 'selected' : ''}>${esc(r.name)}${r.is_admin ? ' — ⭐ admin' : ''}</option>`).join('')}
+      </select>
+      <p class="hint">Positions marked ⭐ grant admin access automatically. Manage positions in Sub-Jobs / Roles.</p>
+      <label>Account access</label>
+      <select name="role" id="access-select" ${isSelf ? 'disabled' : ''}>
         <option value="member" ${user.role === 'member' ? 'selected' : ''}>Member</option>
         <option value="admin" ${user.role === 'admin' ? 'selected' : ''}>Admin — manages jobs, venues, forms, payroll</option>
       </select>
-      ${isSelf ? '<p class="hint">You cannot change your own role.</p>' : ''}
+      ${isSelf ? '<p class="hint">You cannot change your own access.</p>' : ''}
       <label>Hourly rate ($) — used for payroll export</label>
       <input name="hourly_rate" type="number" min="0" step="0.01" value="${Number(user.hourly_rate || 0).toFixed(2)}">
       <label>Clock-in PIN</label>
@@ -991,13 +1004,28 @@ function openUserModal(user) {
     state.users = (await api('/api/users')).users;
     toast('New PIN generated');
   };
+  // Picking a position locks the access select to what the position grants.
+  const posSel = modal.querySelector('#position-select');
+  const accSel = modal.querySelector('#access-select');
+  const syncAccess = () => {
+    const pos = state.roles.find((r) => r.id === Number(posSel.value));
+    if (pos) { accSel.value = pos.is_admin ? 'admin' : 'member'; accSel.disabled = true; }
+    else if (!isSelf) accSel.disabled = false;
+  };
+  posSel.onchange = syncAccess;
+  syncAccess();
+
   modal.querySelector('#user-form').onsubmit = async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
     try {
       await api(`/api/users/${user.id}`, {
         method: 'PATCH',
-        body: { role: isSelf ? user.role : fd.get('role'), hourly_rate: Number(fd.get('hourly_rate')) || 0 },
+        body: {
+          role: isSelf || accSel.disabled ? user.role : fd.get('role'),
+          role_id: posSel.value ? Number(posSel.value) : null,
+          hourly_rate: Number(fd.get('hourly_rate')) || 0,
+        },
       });
       state.users = (await api('/api/users')).users;
       closeModal(); render();
@@ -1163,7 +1191,7 @@ async function renderClock() {
       <div class="card row">
         <span class="grow">
           <div style="font-weight:700">${fmtDay(e.clock_in)}</div>
-          <div class="sub">${fmtTime(e.clock_in)} – ${e.clock_out ? fmtTime(e.clock_out) : 'now'}${e.shift_title ? ` · ${esc(e.shift_title)}` : ''}</div>
+          <div class="sub">${fmtTime(e.clock_in)} – ${e.clock_out ? fmtTime(e.clock_out) : 'now'}${e.shift_title ? ` · ${esc(e.shift_title)}` : ''}${e.role_name ? ` · ${esc(e.role_name)}` : ''}${e.venue_name ? ` · 📍 ${esc(e.venue_name)}` : ''}${e.mileage ? ` · 🚗 ${e.mileage} mi` : ''}</div>
         </span>
         <span style="font-weight:700">${fmtDur((e.clock_out ? new Date(e.clock_out) : new Date()) - new Date(e.clock_in))}</span>
         ${e.approved ? '<span title="Approved">✅</span>' : ''}
@@ -1182,13 +1210,30 @@ async function renderClock() {
   if (clockBtn) clockBtn.onclick = () => {
     const shiftSel = document.getElementById('clock-shift');
     const shiftId = shiftSel?.value ? Number(shiftSel.value) : null;
+    const shift = shifts.find((s) => s.id === shiftId) || shifts[0] || null;
     openPinPad(entry ? 'Enter your PIN to clock out' : 'Enter your PIN to clock in', async (pin) => {
-      const loc = await getLocation();
-      if (entry) await api('/api/time/clock-out', { method: 'POST', body: { ...loc, pin } });
-      else await api('/api/time/clock-in', { method: 'POST', body: { ...loc, pin, shift_id: shiftId } });
+      if (!entry) {
+        const loc = await getLocation();
+        await api('/api/time/clock-in', {
+          method: 'POST',
+          body: { ...loc, pin, shift_id: shiftId, venue_id: shift?.venue_id || null, role_id: shift?.role_id || null },
+        });
+        closeModal();
+        toast('Clocked in ✅');
+        render();
+        return;
+      }
       closeModal();
-      toast(entry ? 'Clocked out 👋' : 'Clocked in ✅');
-      render();
+      openClockoutForm({
+        title: 'Clock out',
+        entry, shift,
+        onSubmit: async (fields) => {
+          const loc = await getLocation();
+          await api('/api/time/clock-out', { method: 'POST', body: { ...loc, pin, ...fields } });
+          toast('Clocked out 👋');
+          render();
+        },
+      });
     });
   };
   document.getElementById('request-hours-btn').onclick = () => openHourRequestModal();
@@ -1238,7 +1283,7 @@ async function renderTimesheets() {
         ${u.entries.map((e) => `
           <div class="row ts-entry" data-entry="${e.id}">
             <span class="grow sub">${fmtDay(e.clock_in)} · ${fmtTime(e.clock_in)} – ${e.clock_out ? fmtTime(e.clock_out) : 'open'}
-              ${e.shift_title ? `· ${esc(e.shift_title)}` : ''}
+              ${e.shift_title ? `· ${esc(e.shift_title)}` : ''}${e.role_name ? ` · ${esc(e.role_name)}` : ''}${e.venue_name ? ` · 📍${esc(e.venue_name)}` : ''}${e.mileage ? ` · 🚗 ${e.mileage} mi` : ''}
               ${e.in_lat ? `<a href="https://maps.google.com/?q=${e.in_lat},${e.in_lng}" target="_blank" onclick="event.stopPropagation()">📍</a>` : ''}
             </span>
             <span style="font-weight:600;font-size:13px">${fmtDur((e.clock_out ? new Date(e.clock_out) : new Date()) - new Date(e.clock_in))}</span>
@@ -1732,11 +1777,15 @@ async function renderRoles() {
   const { roles } = await api('/api/roles');
   state.roles = roles;
   shell('Sub-Jobs / Roles', `
-    <p class="hint" style="margin-bottom:12px">Roles your team works — used when requesting hours (e.g. Server, Bar Back, Set Up).</p>
+    <p class="hint" style="margin-bottom:12px">Roles your team works (Server, Bar Back, Set Up…). Assign them in Team — a role with <b>admin permission</b> automatically makes its holders admins.</p>
     ${roles.length ? roles.map((r) => `
       <div class="card row">
         <span class="venue-icon" style="background:var(--brand-soft);color:var(--text)">🧑‍🍳</span>
-        <span class="grow" style="font-weight:700">${esc(r.name)}</span>
+        <span class="grow">
+          <div style="font-weight:700">${esc(r.name)}</div>
+          <div class="sub">${r.is_admin ? '⭐ Has admin permission' : 'Member permission'}</div>
+        </span>
+        <button class="btn small ${r.is_admin ? '' : 'secondary'}" data-adm-role="${r.id}">${r.is_admin ? 'Admin ✓' : 'Member'}</button>
         <button class="icon-btn" data-edit-role="${r.id}">✏️</button>
         <button class="icon-btn" data-del-role="${r.id}">🗑️</button>
       </div>`).join('') : '<div class="empty"><div class="big">🧑‍🍳</div>No roles yet — tap ＋ to add Server, Bar Back, Set Up…</div>'}
@@ -1745,9 +1794,25 @@ async function renderRoles() {
   document.getElementById('fab').onclick = async () => {
     const name = prompt('New role name (e.g. Server, Bar Back):');
     if (!name?.trim()) return;
-    await api('/api/roles', { method: 'POST', body: { name } });
+    const is_admin = confirm('Should this role have ADMIN permission?\n\nAdmins can manage jobs, venues, payroll, and approvals.\n\nOK = admin role · Cancel = regular member role');
+    await api('/api/roles', { method: 'POST', body: { name, is_admin } });
     render();
   };
+  document.querySelectorAll('[data-adm-role]').forEach((b) => {
+    b.onclick = async () => {
+      const role = roles.find((r) => r.id === Number(b.dataset.admRole));
+      const grant = !role.is_admin;
+      if (!confirm(grant
+        ? `Give ADMIN permission to the "${role.name}" role? Everyone assigned to it becomes an admin.`
+        : `Remove admin permission from "${role.name}"? Everyone assigned to it becomes a regular member.`)) return;
+      try {
+        await api(`/api/roles/${role.id}`, { method: 'PATCH', body: { is_admin: grant } });
+        toast(grant ? 'Role now grants admin access' : 'Role is member-level now');
+      } catch (err) { toast(err.message); }
+      state.users = (await api('/api/users')).users;
+      render();
+    };
+  });
   document.querySelectorAll('[data-edit-role]').forEach((b) => {
     b.onclick = async () => {
       const role = roles.find((r) => r.id === Number(b.dataset.editRole));
@@ -1759,7 +1824,7 @@ async function renderRoles() {
   });
   document.querySelectorAll('[data-del-role]').forEach((b) => {
     b.onclick = async () => {
-      if (!confirm('Delete this role? Past requests keep their label.')) return;
+      if (!confirm('Delete this role? People assigned to it keep their current access level.')) return;
       await api(`/api/roles/${b.dataset.delRole}`, { method: 'DELETE' });
       render();
     };
@@ -1783,6 +1848,82 @@ function renderKioskUnlock() {
   });
 }
 
+function kioskVenue() {
+  try { return JSON.parse(localStorage.getItem('ee-kiosk-venue') || 'null'); } catch { return null; }
+}
+
+// After the admin PIN is accepted: which hall/venue is this kiosk at?
+function pickKioskVenue(onDone) {
+  const modal = openModal(`
+    <h3>Which venue is this kiosk for?</h3>
+    <p class="sub">It's shown on the kiosk and used as the default venue for punches.</p>
+    <div class="assignee-list" style="margin-top:10px">
+      ${state.venues.map((v) => `
+        <button type="button" class="opt" data-kv="${v.id}" data-name="${esc(v.name)}">
+          <span class="venue-icon" style="background:${esc(v.color)};width:30px;height:30px;font-size:14px">📍</span>
+          ${esc(v.name)}
+        </button>`).join('')}
+      <button type="button" class="opt" data-kv="" data-name="">
+        <span class="venue-icon" style="background:var(--brand-soft);color:var(--text);width:30px;height:30px;font-size:14px">—</span>
+        No specific venue
+      </button>
+    </div>
+  `);
+  modal.querySelectorAll('[data-kv]').forEach((b) => {
+    b.onclick = () => {
+      if (b.dataset.kv) localStorage.setItem('ee-kiosk-venue', JSON.stringify({ id: Number(b.dataset.kv), name: b.dataset.name }));
+      else localStorage.removeItem('ee-kiosk-venue');
+      closeModal();
+      onDone();
+    };
+  });
+}
+
+// The clock-out summary popup: time tally, venue, sub-job, mileage, note.
+function openClockoutForm({ title, entry, shift, onSubmit }) {
+  const defVenue = kioskVenue()?.id || entry.venue_id || shift?.venue_id || '';
+  const defRole = entry.role_id || shift?.role_id || '';
+  const elapsed = fmtDur(Date.now() - new Date(entry.clock_in));
+  const modal = openModal(`
+    <h3>${esc(title)}</h3>
+    <div class="clockout-tally">⏱️ ${elapsed} <span class="sub">since ${fmtTime(entry.clock_in)}</span></div>
+    <form id="clockout-form">
+      <label>Venue</label>
+      <select name="venue_id">
+        <option value="">No venue</option>
+        ${state.venues.map((v) => `<option value="${v.id}" ${defVenue === v.id ? 'selected' : ''}>${esc(v.name)}</option>`).join('')}
+      </select>
+      <label>Sub-job / role</label>
+      <select name="role_id">
+        <option value="">No role</option>
+        ${state.roles.map((r) => `<option value="${r.id}" ${defRole === r.id ? 'selected' : ''}>${esc(r.name)}</option>`).join('')}
+      </select>
+      <label>Mileage (miles, optional)</label>
+      <input name="mileage" type="number" min="0" step="0.1" inputmode="decimal" placeholder="0">
+      <label>Note (optional)</label>
+      <textarea name="note" rows="2" placeholder="Anything to report from this shift…"></textarea>
+      <div class="actions">
+        <button type="button" class="btn secondary" id="clockout-cancel">Cancel</button>
+        <button type="submit" class="btn">Confirm clock out</button>
+      </div>
+    </form>
+  `);
+  modal.querySelector('#clockout-cancel').onclick = closeModal;
+  modal.querySelector('#clockout-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await onSubmit({
+        venue_id: fd.get('venue_id') ? Number(fd.get('venue_id')) : null,
+        role_id: fd.get('role_id') ? Number(fd.get('role_id')) : null,
+        mileage: fd.get('mileage') ? Number(fd.get('mileage')) : null,
+        note: fd.get('note') || '',
+      });
+      closeModal();
+    } catch (err) { toast(err.message); }
+  };
+}
+
 function renderKiosk() {
   if (!kioskArmed()) {
     // Arming screen (reached from More): an admin PIN locks this device into kiosk mode.
@@ -1799,14 +1940,17 @@ function renderKiosk() {
     document.getElementById('kiosk-cancel').onclick = () => { location.hash = '#/more'; };
     bindPinPad(document.querySelector('.kiosk-wrap'), async (pin) => {
       await api('/api/kiosk/arm', { method: 'POST', body: { pin } });
-      localStorage.setItem('ee-kiosk', '1');
-      toast('Kiosk mode activated 🔒');
-      render();
+      pickKioskVenue(() => {
+        localStorage.setItem('ee-kiosk', '1');
+        toast('Kiosk mode activated 🔒');
+        render();
+      });
     });
     return;
   }
 
   // Armed: full-screen punch pad. Exiting requires an admin PIN again.
+  const kv = kioskVenue();
   $app.innerHTML = `
     <div class="kiosk-wrap">
       <img src="/brand/logo.png" alt="E&amp;E Management" style="max-width:200px;margin-bottom:6px">
@@ -1814,28 +1958,54 @@ function renderKiosk() {
       <p class="sub">Enter your PIN to clock in or out</p>
       <div id="kiosk-result"></div>
       ${pinPadHTML()}
+      ${kv?.name ? `<div class="kiosk-venue">📍 ${esc(kv.name)}</div>` : ''}
       <button id="kiosk-exit" class="kiosk-exit">🔒 Admin exit</button>
     </div>`;
   document.getElementById('kiosk-exit').onclick = () => {
     openPinPad('Enter an admin PIN to exit kiosk mode', async (pin) => {
       await api('/api/kiosk/arm', { method: 'POST', body: { pin } });
       localStorage.removeItem('ee-kiosk');
+      localStorage.removeItem('ee-kiosk-venue');
       closeModal();
       toast('Kiosk mode off');
+      location.hash = '#/more';
       await bootstrap();
     });
   };
 
   let resultTimer;
-  bindPinPad(document.querySelector('.kiosk-wrap'), async (pin) => {
-    const loc = await getLocation();
-    const { name, action, at } = await api('/api/kiosk/punch', { method: 'POST', body: { ...loc, pin } });
+  const showBanner = (name, action, at) => {
     const box = document.getElementById('kiosk-result');
+    if (!box) return;
     box.innerHTML = `<div class="kiosk-banner ${action}">
       ${action === 'in' ? '✅' : '👋'} <b>${esc(name)}</b> clocked <b>${action.toUpperCase()}</b> at ${fmtTime(at)}
     </div>`;
     clearTimeout(resultTimer);
     resultTimer = setTimeout(() => { box.innerHTML = ''; }, 4000);
+  };
+
+  bindPinPad(document.querySelector('.kiosk-wrap'), async (pin) => {
+    const { user, entry, shift } = await api('/api/kiosk/status', { method: 'POST', body: { pin } });
+    if (!entry) {
+      // Clock in right away, tagged with the kiosk venue and any scheduled sub-job.
+      const loc = await getLocation();
+      const { name, action, at } = await api('/api/kiosk/punch', {
+        method: 'POST',
+        body: { ...loc, pin, venue_id: kv?.id || shift?.venue_id || null, role_id: shift?.role_id || null, shift_id: shift?.id || null },
+      });
+      showBanner(name, action, at);
+    } else {
+      // Clock out goes through the summary popup.
+      openClockoutForm({
+        title: `Clock out — ${user.name}`,
+        entry, shift,
+        onSubmit: async (fields) => {
+          const loc = await getLocation();
+          const { name, action, at } = await api('/api/kiosk/punch', { method: 'POST', body: { ...loc, pin, ...fields } });
+          showBanner(name, action, at);
+        },
+      });
+    }
   });
 }
 
