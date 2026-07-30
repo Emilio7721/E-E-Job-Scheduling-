@@ -8,6 +8,7 @@ const state = {
   vapidPublicKey: null,
   users: [],
   venues: [],
+  roles: [],
   channels: [],
   notifications: [],
   authMode: 'login',
@@ -131,6 +132,7 @@ function connectEvents() {
   es.addEventListener('channels', () => refreshChannels());
   for (const [event, views] of Object.entries({
     time: ['clock', 'timesheets'], timeoff: ['timeoff'], tasks: ['tasks'], forms: ['forms'], posts: ['updates'],
+    hours: ['hours'], roles: ['roles'],
   })) {
     es.addEventListener(event, () => { if (views.includes(route().view)) render(); });
   }
@@ -423,7 +425,16 @@ const TABS = [
 ];
 
 // Views that live under the "More" hub still highlight the More tab.
-const MORE_VIEWS = ['more', 'venues', 'team', 'tasks', 'timeoff', 'forms', 'timesheets', 'settings', 'notifications'];
+const MORE_VIEWS = ['more', 'venues', 'team', 'tasks', 'timeoff', 'forms', 'timesheets', 'settings', 'notifications', 'hours', 'roles'];
+
+async function signOut() {
+  if (!confirm('Sign out of E&E?')) return;
+  await api('/api/auth/logout', { method: 'POST' });
+  state.es?.close();
+  state.me = null;
+  location.hash = '';
+  renderAuth();
+}
 
 function shell(title, contentHTML, { back = null, fab = null } = {}) {
   let { view } = route();
@@ -434,6 +445,7 @@ function shell(title, contentHTML, { back = null, fab = null } = {}) {
       ${back ? `<button class="icon-btn" id="back-btn">←</button>` : ''}
       <h2>${esc(title)}</h2>
       <button class="icon-btn" id="notif-btn">🔔</button>
+      <button class="icon-btn" id="signout-btn" title="Sign out">⏻</button>
     </header>` : ''}
     <div class="main" id="main">${contentHTML}</div>
     ${fab ? `<button class="fab" id="fab">＋</button>` : ''}
@@ -450,7 +462,56 @@ function shell(title, contentHTML, { back = null, fab = null } = {}) {
   if (backBtn) backBtn.onclick = back;
   const notifBtn = document.getElementById('notif-btn');
   if (notifBtn) notifBtn.onclick = () => { location.hash = '#/notifications'; };
+  const signoutBtn = document.getElementById('signout-btn');
+  if (signoutBtn) signoutBtn.onclick = signOut;
   updateBadges();
+}
+
+/* -------------------------------- PIN pad ---------------------------------- */
+
+function pinPadHTML() {
+  return `
+    <div class="pin-dots">${'<span></span>'.repeat(5)}</div>
+    <div class="pin-err"></div>
+    <div class="pin-pad">
+      ${[1, 2, 3, 4, 5, 6, 7, 8, 9, '', 0, '⌫'].map((k) => (
+        k === '' ? '<span></span>' : `<button type="button" data-key="${k}">${k}</button>`
+      )).join('')}
+    </div>`;
+}
+
+// Wires a rendered pinPadHTML() inside `root`; calls onComplete(pin) at 5 digits.
+// onComplete may throw — the message is shown and the pad resets.
+function bindPinPad(root, onComplete) {
+  let pin = '';
+  let busy = false;
+  const dots = root.querySelectorAll('.pin-dots span');
+  const err = root.querySelector('.pin-err');
+  const draw = () => dots.forEach((d, i) => d.classList.toggle('on', i < pin.length));
+  root.querySelectorAll('[data-key]').forEach((b) => {
+    b.onclick = async () => {
+      if (busy) return;
+      err.textContent = '';
+      if (b.dataset.key === '⌫') pin = pin.slice(0, -1);
+      else if (pin.length < 5) pin += b.dataset.key;
+      draw();
+      if (pin.length === 5) {
+        busy = true;
+        try { await onComplete(pin); }
+        catch (e) { err.textContent = e.message; }
+        pin = ''; draw(); busy = false;
+      }
+    };
+  });
+}
+
+function openPinPad(title, onComplete) {
+  const modal = openModal(`
+    <h3 style="text-align:center">${esc(title)}</h3>
+    <p class="sub" style="text-align:center">Your 5-digit PIN is shown in Settings.</p>
+    ${pinPadHTML()}
+  `);
+  bindPinPad(modal, onComplete);
 }
 
 /* -------------------------------- schedule -------------------------------- */
@@ -871,9 +932,21 @@ function openUserModal(user) {
       ${isSelf ? '<p class="hint">You cannot change your own role.</p>' : ''}
       <label>Hourly rate ($) — used for payroll export</label>
       <input name="hourly_rate" type="number" min="0" step="0.01" value="${Number(user.hourly_rate || 0).toFixed(2)}">
+      <label>Clock-in PIN</label>
+      <div class="row">
+        <span class="pin-value" id="pin-view">${esc(user.pin || '—')}</span>
+        <button class="btn small secondary" type="button" id="regen-pin">Generate new PIN</button>
+      </div>
       <div class="actions"><button type="submit" class="btn">Save</button></div>
     </form>
   `);
+  modal.querySelector('#regen-pin').onclick = async () => {
+    if (!confirm(`Give ${user.name} a new PIN? The old one stops working immediately.`)) return;
+    const { pin } = await api(`/api/users/${user.id}`, { method: 'PATCH', body: { new_pin: true } });
+    modal.querySelector('#pin-view').textContent = pin;
+    state.users = (await api('/api/users')).users;
+    toast('New PIN generated');
+  };
   modal.querySelector('#user-form').onsubmit = async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
@@ -928,6 +1001,15 @@ async function renderSettings() {
       <span class="role-tag">${state.me.role}</span>
     </div>
 
+    <div class="section-title">Clock-in PIN</div>
+    <div class="card row">
+      <span class="grow">
+        <div style="font-weight:700">My PIN</div>
+        <div class="sub">Needed to clock in and out — keep it private.</div>
+      </span>
+      <span class="pin-value">${esc(state.me.pin || '—')}</span>
+    </div>
+
     <div class="section-title">Appearance</div>
     <div class="card">
       <div style="display:flex;gap:8px">
@@ -972,12 +1054,7 @@ async function renderSettings() {
   if (test) test.onclick = () => api('/api/push/test', { method: 'POST' }).then(() => toast('Test sent — check your notifications'));
   const installHelp = document.getElementById('show-install-help');
   if (installHelp) installHelp.onclick = () => showInstallModal();
-  document.getElementById('logout').onclick = async () => {
-    await api('/api/auth/logout', { method: 'POST' });
-    state.es?.close();
-    state.me = null;
-    renderAuth();
-  };
+  document.getElementById('logout').onclick = signOut;
 }
 
 /* -------------------------------- time clock -------------------------------- */
@@ -1029,8 +1106,9 @@ async function renderClock() {
       <button class="btn ${entry ? 'danger' : ''}" id="clock-btn" style="margin-top:16px">
         ${entry ? 'Clock out' : 'Clock in'}
       </button>
-      <p class="hint" style="text-align:center">Your location is recorded at punch time if you allow it.</p>
+      <p class="hint" style="text-align:center">Punching in requires your personal PIN (see Settings). Your location is recorded if you allow it.</p>
     </div>
+    <button class="btn secondary" id="request-hours-btn">🕐 Request hours for approval</button>
 
     <div class="section-title">This week · ${fmtDur(weekMs)} total</div>
     ${weekAgoEntries.length ? weekAgoEntries.map((e) => `
@@ -1052,21 +1130,19 @@ async function renderClock() {
       else clearInterval(state.timer);
     }, 30000);
   }
-  document.getElementById('clock-btn').onclick = async (e) => {
-    e.target.disabled = true;
-    const loc = await getLocation();
-    try {
-      if (entry) {
-        await api('/api/time/clock-out', { method: 'POST', body: loc });
-        toast('Clocked out 👋');
-      } else {
-        const shiftSel = document.getElementById('clock-shift');
-        await api('/api/time/clock-in', { method: 'POST', body: { ...loc, shift_id: shiftSel?.value ? Number(shiftSel.value) : null } });
-        toast('Clocked in ✅');
-      }
-    } catch (err) { toast(err.message); }
-    render();
+  document.getElementById('clock-btn').onclick = () => {
+    const shiftSel = document.getElementById('clock-shift');
+    const shiftId = shiftSel?.value ? Number(shiftSel.value) : null;
+    openPinPad(entry ? 'Enter your PIN to clock out' : 'Enter your PIN to clock in', async (pin) => {
+      const loc = await getLocation();
+      if (entry) await api('/api/time/clock-out', { method: 'POST', body: { ...loc, pin } });
+      else await api('/api/time/clock-in', { method: 'POST', body: { ...loc, pin, shift_id: shiftId } });
+      closeModal();
+      toast(entry ? 'Clocked out 👋' : 'Clocked in ✅');
+      render();
+    });
   };
+  document.getElementById('request-hours-btn').onclick = () => openHourRequestModal();
   const ts = document.getElementById('goto-timesheets');
   if (ts) ts.onclick = () => { location.hash = '#/timesheets'; };
 }
@@ -1502,6 +1578,173 @@ function openFormBuilder() {
   };
 }
 
+/* ------------------------------ hours requests ------------------------------ */
+
+function openHourRequestModal() {
+  const today = dateKey(new Date());
+  const modal = openModal(`
+    <h3>Request hours</h3>
+    <p class="sub">For time you worked but didn't clock — sent to a manager for approval.</p>
+    <form id="hours-form">
+      <label>Venue / job</label>
+      <select name="venue_id">
+        <option value="">No venue</option>
+        ${state.venues.map((v) => `<option value="${v.id}">${esc(v.name)}</option>`).join('')}
+      </select>
+      <label>Sub-job / role</label>
+      <select name="role_id">
+        <option value="">No role</option>
+        ${state.roles.map((r) => `<option value="${r.id}">${esc(r.name)}</option>`).join('')}
+      </select>
+      <label>Date</label><input name="date" type="date" required value="${today}">
+      <div style="display:flex;gap:10px">
+        <span style="flex:1"><label>Starts</label><input name="start" type="time" required value="09:00"></span>
+        <span style="flex:1"><label>Ends</label><input name="end" type="time" required value="17:00"></span>
+      </div>
+      <label>Note (optional)</label><textarea name="note" rows="2" placeholder="Attach a note to your request…"></textarea>
+      <p class="hint">All requests are sent for a manager's approval.</p>
+      <div class="actions"><button type="submit" class="btn">Send for approval</button></div>
+    </form>
+  `);
+  modal.querySelector('#hours-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const starts = new Date(`${fd.get('date')}T${fd.get('start')}`);
+    let ends = new Date(`${fd.get('date')}T${fd.get('end')}`);
+    if (ends <= starts) ends = new Date(ends.getTime() + 24 * 3600000); // overnight shift
+    try {
+      await api('/api/hour-requests', {
+        method: 'POST',
+        body: {
+          venue_id: fd.get('venue_id') ? Number(fd.get('venue_id')) : null,
+          role_id: fd.get('role_id') ? Number(fd.get('role_id')) : null,
+          starts_at: starts.toISOString(),
+          ends_at: ends.toISOString(),
+          note: fd.get('note') || '',
+        },
+      });
+      closeModal(); toast('Sent for approval ✅');
+      if (route().view === 'hours') render();
+    } catch (err) { toast(err.message); }
+  };
+}
+
+async function renderHours() {
+  const { requests } = await api('/api/hour-requests');
+  const isAdmin = state.me.role === 'admin';
+  const pending = requests.filter((r) => r.status === 'pending');
+  const rest = requests.filter((r) => r.status !== 'pending');
+
+  const reqCard = (r) => {
+    const hours = ((new Date(r.ends_at) - new Date(r.starts_at)) / 3600000).toFixed(1);
+    return `
+    <div class="card row">
+      <span style="font-size:24px">🕐</span>
+      <span class="grow">
+        <div style="font-weight:700">${isAdmin ? esc(r.user_name) + ' · ' : ''}${hours}h</div>
+        <div class="sub">${fmtDay(r.starts_at)} · ${fmtTime(r.starts_at)} – ${fmtTime(r.ends_at)}</div>
+        ${r.venue_name || r.role_name ? `<div class="sub">${[r.role_name, r.venue_name].filter(Boolean).map(esc).join(' @ ')}</div>` : ''}
+        ${r.note ? `<div class="sub">${esc(r.note)}</div>` : ''}
+      </span>
+      ${r.status === 'pending' && isAdmin ? `
+        <button class="btn small" data-decide-hours="approved" data-id="${r.id}">✓</button>
+        <button class="btn small danger" data-decide-hours="denied" data-id="${r.id}">✗</button>` : `
+        <span class="status-tag ${r.status}">${r.status}</span>`}
+      ${r.status === 'pending' && !isAdmin && r.user_id === state.me.id ? `<button class="icon-btn" data-cancel-hours="${r.id}" title="Withdraw">🗑️</button>` : ''}
+    </div>`;
+  };
+
+  shell('Hours Requests', `
+    ${pending.length ? `<div class="section-title">Pending${isAdmin ? ' approval' : ''}</div>${pending.map(reqCard).join('')}` : ''}
+    <div class="section-title">History</div>
+    ${rest.length ? rest.map(reqCard).join('') : '<div class="empty"><div class="big">🕐</div>No hours requests yet.<br>Approved requests land straight in the timesheet.</div>'}
+  `, { back: () => { location.hash = '#/more'; }, fab: true });
+
+  document.getElementById('fab').onclick = () => openHourRequestModal();
+  document.querySelectorAll('[data-decide-hours]').forEach((b) => {
+    b.onclick = async () => {
+      await api(`/api/hour-requests/${b.dataset.id}/decide`, { method: 'POST', body: { status: b.dataset.decideHours } });
+      toast(b.dataset.decideHours === 'approved' ? 'Approved — added to the timesheet' : 'Request denied');
+      render();
+    };
+  });
+  document.querySelectorAll('[data-cancel-hours]').forEach((b) => {
+    b.onclick = async () => {
+      await api(`/api/hour-requests/${b.dataset.cancelHours}`, { method: 'DELETE' });
+      render();
+    };
+  });
+}
+
+/* ---------------------------------- roles ----------------------------------- */
+
+async function renderRoles() {
+  if (state.me.role !== 'admin') { location.hash = '#/more'; return; }
+  const { roles } = await api('/api/roles');
+  state.roles = roles;
+  shell('Sub-Jobs / Roles', `
+    <p class="hint" style="margin-bottom:12px">Roles your team works — used when requesting hours (e.g. Server, Bar Back, Set Up).</p>
+    ${roles.length ? roles.map((r) => `
+      <div class="card row">
+        <span class="venue-icon" style="background:var(--brand-soft);color:var(--text)">🧑‍🍳</span>
+        <span class="grow" style="font-weight:700">${esc(r.name)}</span>
+        <button class="icon-btn" data-edit-role="${r.id}">✏️</button>
+        <button class="icon-btn" data-del-role="${r.id}">🗑️</button>
+      </div>`).join('') : '<div class="empty"><div class="big">🧑‍🍳</div>No roles yet — tap ＋ to add Server, Bar Back, Set Up…</div>'}
+  `, { back: () => { location.hash = '#/more'; }, fab: true });
+
+  document.getElementById('fab').onclick = async () => {
+    const name = prompt('New role name (e.g. Server, Bar Back):');
+    if (!name?.trim()) return;
+    await api('/api/roles', { method: 'POST', body: { name } });
+    render();
+  };
+  document.querySelectorAll('[data-edit-role]').forEach((b) => {
+    b.onclick = async () => {
+      const role = roles.find((r) => r.id === Number(b.dataset.editRole));
+      const name = prompt('Rename role:', role.name);
+      if (!name?.trim() || name === role.name) return;
+      await api(`/api/roles/${role.id}`, { method: 'PATCH', body: { name } });
+      render();
+    };
+  });
+  document.querySelectorAll('[data-del-role]').forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm('Delete this role? Past requests keep their label.')) return;
+      await api(`/api/roles/${b.dataset.delRole}`, { method: 'DELETE' });
+      render();
+    };
+  });
+}
+
+/* ---------------------------------- kiosk ----------------------------------- */
+
+function renderKiosk() {
+  if (state.me.role !== 'admin') { location.hash = '#/clock'; return; }
+  $app.innerHTML = `
+    <div class="kiosk-wrap">
+      <img src="/brand/logo.png" alt="E&amp;E Management" style="max-width:200px;margin-bottom:6px">
+      <h2 style="margin-bottom:2px">Time Clock Kiosk</h2>
+      <p class="sub">Enter your PIN to clock in or out</p>
+      <div id="kiosk-result"></div>
+      ${pinPadHTML()}
+      <button class="btn secondary" id="kiosk-exit" style="max-width:200px;margin-top:26px">Exit kiosk</button>
+    </div>`;
+  document.getElementById('kiosk-exit').onclick = () => { location.hash = '#/more'; };
+
+  let resultTimer;
+  bindPinPad(document.querySelector('.kiosk-wrap'), async (pin) => {
+    const loc = await getLocation();
+    const { name, action, at } = await api('/api/kiosk/punch', { method: 'POST', body: { ...loc, pin } });
+    const box = document.getElementById('kiosk-result');
+    box.innerHTML = `<div class="kiosk-banner ${action}">
+      ${action === 'in' ? '✅' : '👋'} <b>${esc(name)}</b> clocked <b>${action.toUpperCase()}</b> at ${fmtTime(at)}
+    </div>`;
+    clearTimeout(resultTimer);
+    resultTimer = setTimeout(() => { box.innerHTML = ''; }, 4000);
+  });
+}
+
 /* ------------------------------- updates feed ------------------------------- */
 
 async function renderUpdates() {
@@ -1560,10 +1803,15 @@ async function renderUpdates() {
 function renderMore() {
   const isAdmin = state.me.role === 'admin';
   const items = [
+    { href: '#/hours', icon: '🕐', label: 'Hours Requests', sub: 'Submit worked hours for approval' },
     { href: '#/tasks', icon: '✅', label: 'Tasks', sub: 'To-dos for the team' },
     { href: '#/timeoff', icon: '🏖️', label: 'Time Off', sub: 'Requests & approvals' },
     { href: '#/forms', icon: '📋', label: 'Forms', sub: 'Checklists & reports' },
-    ...(isAdmin ? [{ href: '#/timesheets', icon: '🧾', label: 'Timesheets', sub: 'Hours, approval & payroll CSV' }] : []),
+    ...(isAdmin ? [
+      { href: '#/timesheets', icon: '🧾', label: 'Timesheets', sub: 'Hours, approval & payroll CSV' },
+      { href: '#/kiosk', icon: '🔢', label: 'Kiosk Mode', sub: 'Shared device — clock in by PIN' },
+      { href: '#/roles', icon: '🧑‍🍳', label: 'Sub-Jobs / Roles', sub: 'Server, Bar Back, Set Up…' },
+    ] : []),
     { href: '#/venues', icon: '📍', label: 'Venues', sub: 'Work locations' },
     { href: '#/team', icon: '👥', label: 'Team', sub: 'People & roles' },
     { href: '#/notifications', icon: '🔔', label: 'Notifications', sub: 'Your activity feed' },
@@ -1602,6 +1850,9 @@ async function render() {
     else if (view === 'chat' && arg) await renderChat(arg);
     else if (view === 'chat') await renderChatList();
     else if (view === 'clock') await renderClock();
+    else if (view === 'kiosk') renderKiosk();
+    else if (view === 'hours') await renderHours();
+    else if (view === 'roles') await renderRoles();
     else if (view === 'timesheets') await renderTimesheets();
     else if (view === 'timeoff') await renderTimeoff();
     else if (view === 'tasks') await renderTasks();
@@ -1622,13 +1873,14 @@ async function render() {
 /* -------------------------------- bootstrap -------------------------------- */
 
 async function bootstrap() {
-  const [me, users, venues, channels, notifs] = await Promise.all([
-    api('/api/me'), api('/api/users'), api('/api/venues'), api('/api/channels'), api('/api/notifications'),
+  const [me, users, venues, roles, channels, notifs] = await Promise.all([
+    api('/api/me'), api('/api/users'), api('/api/venues'), api('/api/roles'), api('/api/channels'), api('/api/notifications'),
   ]);
   state.me = me.user;
   state.vapidPublicKey = me.vapidPublicKey;
   state.users = users.users;
   state.venues = venues.venues;
+  state.roles = roles.roles;
   state.channels = channels.channels;
   state.notifications = notifs.notifications;
   connectEvents();

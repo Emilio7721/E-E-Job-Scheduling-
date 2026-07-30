@@ -367,6 +367,41 @@ label { display: block; font-size: 13px; font-weight: 600; color: var(--muted); 
 }
 .check-label { display: flex; align-items: center; gap: 8px; font-size: 14.5px; color: var(--text); font-weight: 500; margin: 12px 0 4px; }
 
+/* ---------- PIN pad & kiosk ---------- */
+.pin-dots { display: flex; gap: 13px; justify-content: center; margin: 18px 0 4px; }
+.pin-dots span {
+  width: 14px; height: 14px; border-radius: 50%;
+  border: 2px solid var(--muted); transition: background .1s;
+}
+.pin-dots span.on { background: var(--accent); border-color: var(--accent); }
+.pin-err { text-align: center; color: var(--red); min-height: 20px; font-size: 13.5px; font-weight: 600; }
+.pin-pad {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;
+  max-width: 270px; margin: 6px auto 0; width: 100%;
+}
+.pin-pad button {
+  height: 62px; border-radius: 16px; background: var(--bg);
+  font-size: 24px; font-weight: 700; box-shadow: var(--shadow);
+}
+.pin-pad button:active { background: var(--brand-soft); }
+.modal .pin-pad button { background: var(--bg); }
+.pin-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 22px; font-weight: 800; letter-spacing: .18em; color: var(--accent);
+}
+.kiosk-wrap {
+  flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  padding: 24px 20px; text-align: center; overflow-y: auto;
+}
+.kiosk-wrap .pin-pad { max-width: 300px; }
+.kiosk-wrap .pin-pad button { height: 68px; background: var(--card); }
+#kiosk-result { min-height: 54px; display: flex; align-items: center; margin-top: 6px; }
+.kiosk-banner {
+  padding: 12px 20px; border-radius: 12px; font-size: 15.5px;
+  background: var(--green-soft); color: var(--green); animation: toast-in .2s ease;
+}
+.kiosk-banner.out { background: var(--amber-soft); color: var(--amber); }
+
 /* ---------- onboarding tutorial ---------- */
 .tut-tabs { display: flex; gap: 8px; margin-top: 14px; }
 .tut-steps { display: flex; flex-direction: column; gap: 13px; margin-top: 16px; }

@@ -171,12 +171,46 @@ db.exec(`
   );
 `);
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS roles (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,
+    archived   INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS hour_requests (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    venue_id   INTEGER REFERENCES venues(id) ON DELETE SET NULL,
+    role_id    INTEGER REFERENCES roles(id) ON DELETE SET NULL,
+    starts_at  TEXT NOT NULL,
+    ends_at    TEXT NOT NULL,
+    note       TEXT NOT NULL DEFAULT '',
+    status     TEXT NOT NULL DEFAULT 'pending', -- pending | approved | denied
+    decided_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+`);
+
 // Lightweight migrations for databases created before a column existed.
 function ensureColumn(table, column, ddl) {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
   if (!cols.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
 }
 ensureColumn('users', 'hourly_rate', 'hourly_rate REAL NOT NULL DEFAULT 0');
+ensureColumn('users', 'pin', 'pin TEXT');
+
+// Every user gets a unique 5-digit clock-in PIN.
+function newPin() {
+  for (;;) {
+    const pin = String(Math.floor(10000 + Math.random() * 90000));
+    if (!db.prepare('SELECT 1 FROM users WHERE pin = ?').get(pin)) return pin;
+  }
+}
+for (const u of db.prepare(`SELECT id FROM users WHERE pin IS NULL OR pin = ''`).all()) {
+  db.prepare('UPDATE users SET pin = ? WHERE id = ?').run(newPin(), u.id);
+}
 
 // Ensure the company-wide "General" channel exists.
 const general = db.prepare(`SELECT id FROM channels WHERE kind = 'group' AND name = 'General'`).get();
@@ -184,4 +218,4 @@ if (!general) {
   db.prepare(`INSERT INTO channels (name, kind) VALUES ('General', 'group')`).run();
 }
 
-module.exports = { db, DATA_DIR };
+module.exports = { db, DATA_DIR, newPin };
