@@ -1,5 +1,6 @@
 const express = require('express');
 const path = require('node:path');
+const PDFDocument = require('pdfkit');
 const { db, newPin } = require('./src/db');
 const {
   hashPassword, verifyPassword, issueToken, verifyToken, tokenFromReq,
@@ -9,7 +10,7 @@ const push = require('./src/push');
 const events = require('./src/events');
 
 const app = express();
-app.use(express.json({ limit: '256kb' }));
+app.use(express.json({ limit: '2mb' })); // signature PNGs ride along with form submissions
 
 const PORT = process.env.PORT || 3000;
 const COOKIE_OPTS = 'Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000';
@@ -95,7 +96,7 @@ app.get('/api/me', requireAuth, (req, res) => {
 
 app.get('/api/users', requireAuth, (req, res) => {
   const cols = req.user.role === 'admin'
-    ? 'id, name, email, phone, role, position_id, color, hourly_rate, pin'
+    ? 'id, name, email, phone, role, position_id, color, pin'
     : 'id, name, email, phone, role, position_id, color';
   const users = db.prepare(`SELECT ${cols} FROM users ORDER BY name`).all();
   if (req.user.role === 'admin') {
@@ -108,7 +109,7 @@ app.get('/api/users', requireAuth, (req, res) => {
 app.patch('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
   const target = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.id));
   if (!target) return res.status(404).json({ error: 'User not found' });
-  const { role = target.role, hourly_rate = target.hourly_rate, position_id } = req.body || {};
+  const { role = target.role, position_id } = req.body || {};
   if (!['admin', 'member'].includes(role)) return res.status(400).json({ error: 'Invalid role' });
 
   // A position with admin permission makes the person an admin.
@@ -126,9 +127,8 @@ app.patch('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
     const admins = db.prepare(`SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND id != ?`).get(target.id).n;
     if (!admins) return res.status(400).json({ error: 'There must be at least one admin' });
   }
-  const rate = Math.max(0, Number(hourly_rate) || 0);
-  db.prepare('UPDATE users SET role = ?, position_id = ?, hourly_rate = ? WHERE id = ?')
-    .run(newRole, newPositionId, rate, target.id);
+  db.prepare('UPDATE users SET role = ?, position_id = ? WHERE id = ?')
+    .run(newRole, newPositionId, target.id);
   let pin;
   if (req.body?.new_pin) {
     pin = newPin();
@@ -575,7 +575,7 @@ app.get('/api/events', (req, res) => {
 /* -------------------------------- time clock -------------------------------- */
 
 const TIME_ENTRY_QUERY = `
-  SELECT t.*, u.name AS user_name, u.color AS user_color, u.hourly_rate,
+  SELECT t.*, u.name AS user_name, u.color AS user_color,
          s.title AS shift_title, v.name AS venue_name, r.name AS role_name
   FROM time_entries t
   JOIN users u ON u.id = t.user_id
@@ -639,9 +639,7 @@ app.get('/api/time/entries', requireAuth, (req, res) => {
   if (from) { sql += ' AND t.clock_in >= ?'; params.push(from); }
   if (to) { sql += ' AND t.clock_in < ?'; params.push(to); }
   sql += ' ORDER BY t.clock_in DESC LIMIT 500';
-  const entries = db.prepare(sql).all(...params);
-  if (req.user.role !== 'admin') for (const e of entries) delete e.hourly_rate;
-  res.json({ entries });
+  res.json({ entries: db.prepare(sql).all(...params) });
 });
 
 app.patch('/api/time/entries/:id', requireAuth, requireAdmin, (req, res) => {
@@ -670,165 +668,22 @@ app.get('/api/time/export', requireAuth, requireAdmin, (req, res) => {
     TIME_ENTRY_QUERY + ' WHERE t.clock_in >= ? AND t.clock_in < ? AND t.clock_out IS NOT NULL ORDER BY u.name, t.clock_in'
   ).all(from, to);
   const csvEsc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
-  const rows = [['Employee', 'Phone', 'Clock in', 'Clock out', 'Hours', 'Hourly rate', 'Pay', 'Job', 'Venue', 'Role', 'Mileage', 'Approved']];
+  const rows = [['Employee', 'Phone', 'Clock in', 'Clock out', 'Hours', 'Job', 'Venue', 'Role', 'Mileage', 'Approved']];
   const totals = new Map();
   for (const e of entries) {
     const hours = (new Date(e.clock_out) - new Date(e.clock_in)) / 3600000;
-    const pay = hours * (e.hourly_rate || 0);
-    const phone = db.prepare('SELECT phone, email FROM users WHERE id = ?').get(e.user_id);
-    rows.push([e.user_name, phone?.phone || phone?.email || '', e.clock_in, e.clock_out, hours.toFixed(2), (e.hourly_rate || 0).toFixed(2), pay.toFixed(2), e.shift_title || '', e.venue_name || '', e.role_name || '', (e.mileage || 0).toFixed(1), e.approved ? 'yes' : 'no']);
-    const t = totals.get(e.user_name) || { hours: 0, pay: 0 };
-    t.hours += hours; t.pay += pay;
+    const contact = db.prepare('SELECT phone, email FROM users WHERE id = ?').get(e.user_id);
+    rows.push([e.user_name, contact?.phone || contact?.email || '', e.clock_in, e.clock_out, hours.toFixed(2), e.shift_title || '', e.venue_name || '', e.role_name || '', (e.mileage || 0).toFixed(1), e.approved ? 'yes' : 'no']);
+    const t = totals.get(e.user_name) || { hours: 0, mileage: 0 };
+    t.hours += hours; t.mileage += (e.mileage || 0);
     totals.set(e.user_name, t);
   }
   rows.push([]);
-  rows.push(['TOTALS']);
-  for (const [name, t] of totals) rows.push([name, '', '', '', t.hours.toFixed(2), '', t.pay.toFixed(2)]);
+  rows.push(['TOTALS', '', '', '', 'Hours', '', '', '', 'Mileage']);
+  for (const [name, t] of totals) rows.push([name, '', '', '', t.hours.toFixed(2), '', '', '', t.mileage.toFixed(1)]);
   res.setHeader('Content-Type', 'text/csv');
   res.setHeader('Content-Disposition', `attachment; filename="timesheet-${from.slice(0, 10)}-to-${to.slice(0, 10)}.csv"`);
   res.send(rows.map((r) => r.map(csvEsc).join(',')).join('\n'));
-});
-
-/* --------------------------------- time off --------------------------------- */
-
-const TIMEOFF_QUERY = `
-  SELECT r.*, u.name AS user_name, u.color AS user_color
-  FROM timeoff_requests r JOIN users u ON u.id = r.user_id
-`;
-
-app.get('/api/timeoff', requireAuth, (req, res) => {
-  const requests = req.user.role === 'admin'
-    ? db.prepare(TIMEOFF_QUERY + ' ORDER BY r.id DESC LIMIT 200').all()
-    : db.prepare(TIMEOFF_QUERY + ' WHERE r.user_id = ? ORDER BY r.id DESC LIMIT 200').all(req.user.id);
-  res.json({ requests });
-});
-
-app.post('/api/timeoff', requireAuth, (req, res) => {
-  const { start_date, end_date, kind = 'vacation', note = '' } = req.body || {};
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(start_date || '') || !/^\d{4}-\d{2}-\d{2}$/.test(end_date || '') || end_date < start_date) {
-    return res.status(400).json({ error: 'Valid start and end dates are required' });
-  }
-  if (!['vacation', 'sick', 'personal', 'other'].includes(kind)) return res.status(400).json({ error: 'Invalid type' });
-  const info = db.prepare('INSERT INTO timeoff_requests (user_id, start_date, end_date, kind, note) VALUES (?, ?, ?, ?, ?)')
-    .run(req.user.id, start_date, end_date, kind, String(note).slice(0, 500));
-  events.broadcast('timeoff', {});
-  const admins = db.prepare(`SELECT id FROM users WHERE role = 'admin'`).all().map((r) => r.id);
-  notify(admins.filter((id) => id !== req.user.id), {
-    title: `Time-off request from ${req.user.name}`,
-    body: `${kind} · ${start_date} → ${end_date}`,
-    url: '/#/timeoff',
-  });
-  res.json({ request: db.prepare(TIMEOFF_QUERY + ' WHERE r.id = ?').get(Number(info.lastInsertRowid)) });
-});
-
-app.post('/api/timeoff/:id/decide', requireAuth, requireAdmin, (req, res) => {
-  const { status } = req.body || {};
-  if (!['approved', 'denied'].includes(status)) return res.status(400).json({ error: 'Invalid decision' });
-  const request = db.prepare('SELECT * FROM timeoff_requests WHERE id = ?').get(Number(req.params.id));
-  if (!request) return res.status(404).json({ error: 'Request not found' });
-  db.prepare('UPDATE timeoff_requests SET status = ?, decided_by = ? WHERE id = ?').run(status, req.user.id, request.id);
-  events.broadcast('timeoff', {});
-  notify([request.user_id].filter((id) => id !== req.user.id), {
-    title: `Time off ${status}`,
-    body: `${request.kind} · ${request.start_date} → ${request.end_date}`,
-    url: '/#/timeoff',
-  });
-  res.json({ ok: true });
-});
-
-app.delete('/api/timeoff/:id', requireAuth, (req, res) => {
-  const request = db.prepare('SELECT * FROM timeoff_requests WHERE id = ?').get(Number(req.params.id));
-  if (!request) return res.status(404).json({ error: 'Request not found' });
-  if (request.user_id !== req.user.id && req.user.role !== 'admin') return res.status(403).json({ error: 'Not allowed' });
-  db.prepare('DELETE FROM timeoff_requests WHERE id = ?').run(request.id);
-  events.broadcast('timeoff', {});
-  res.json({ ok: true });
-});
-
-/* ---------------------------------- tasks ----------------------------------- */
-
-function taskWithAssignees(task) {
-  const assignees = db.prepare(`
-    SELECT u.id, u.name, u.color, a.done_at
-    FROM task_assignees a JOIN users u ON u.id = a.user_id
-    WHERE a.task_id = ? ORDER BY u.name
-  `).all(task.id);
-  return { ...task, assignees };
-}
-
-app.get('/api/tasks', requireAuth, (req, res) => {
-  const tasks = (req.user.role === 'admin'
-    ? db.prepare('SELECT * FROM tasks ORDER BY due_at IS NULL, due_at, id DESC LIMIT 300').all()
-    : db.prepare(`
-        SELECT t.* FROM tasks t JOIN task_assignees a ON a.task_id = t.id
-        WHERE a.user_id = ? ORDER BY t.due_at IS NULL, t.due_at, t.id DESC LIMIT 300
-      `).all(req.user.id)
-  ).map(taskWithAssignees);
-  res.json({ tasks });
-});
-
-app.post('/api/tasks', requireAuth, requireAdmin, (req, res) => {
-  const { title, notes = '', due_at = null, assignee_ids = [] } = req.body || {};
-  if (!title?.trim()) return res.status(400).json({ error: 'Task title is required' });
-  const info = db.prepare('INSERT INTO tasks (title, notes, due_at, created_by) VALUES (?, ?, ?, ?)')
-    .run(title.trim(), String(notes).trim(), due_at, req.user.id);
-  const taskId = Number(info.lastInsertRowid);
-  const add = db.prepare('INSERT OR IGNORE INTO task_assignees (task_id, user_id) VALUES (?, ?)');
-  for (const uid of assignee_ids) add.run(taskId, uid);
-  events.broadcast('tasks', {});
-  notify(assignee_ids.filter((id) => id !== req.user.id), {
-    title: `New task: ${title.trim()}`,
-    body: due_at ? `Due ${new Date(due_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: process.env.APP_TZ || 'America/New_York' })}` : '',
-    url: '/#/tasks',
-  });
-  res.json({ task: taskWithAssignees(db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId)) });
-});
-
-app.patch('/api/tasks/:id', requireAuth, requireAdmin, (req, res) => {
-  const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(Number(req.params.id));
-  if (!task) return res.status(404).json({ error: 'Task not found' });
-  const { title = task.title, notes = task.notes, due_at = task.due_at, assignee_ids } = req.body || {};
-  if (!title?.trim()) return res.status(400).json({ error: 'Task title is required' });
-  db.prepare('UPDATE tasks SET title = ?, notes = ?, due_at = ? WHERE id = ?')
-    .run(title.trim(), String(notes).trim(), due_at, task.id);
-  if (Array.isArray(assignee_ids)) {
-    const before = db.prepare('SELECT user_id FROM task_assignees WHERE task_id = ?').all(task.id).map((r) => r.user_id);
-    db.prepare('DELETE FROM task_assignees WHERE task_id = ?').run(task.id);
-    const add = db.prepare('INSERT OR IGNORE INTO task_assignees (task_id, user_id) VALUES (?, ?)');
-    for (const uid of assignee_ids) add.run(task.id, uid);
-    notify(assignee_ids.filter((id) => !before.includes(id) && id !== req.user.id), {
-      title: `New task: ${title.trim()}`,
-      url: '/#/tasks',
-    });
-  }
-  events.broadcast('tasks', {});
-  res.json({ ok: true });
-});
-
-app.delete('/api/tasks/:id', requireAuth, requireAdmin, (req, res) => {
-  db.prepare('DELETE FROM tasks WHERE id = ?').run(Number(req.params.id));
-  events.broadcast('tasks', {});
-  res.json({ ok: true });
-});
-
-app.post('/api/tasks/:id/toggle', requireAuth, (req, res) => {
-  const taskId = Number(req.params.id);
-  const row = db.prepare('SELECT * FROM task_assignees WHERE task_id = ? AND user_id = ?').get(taskId, req.user.id);
-  if (!row) return res.status(404).json({ error: 'You are not assigned to this task' });
-  const done = !row.done_at;
-  db.prepare('UPDATE task_assignees SET done_at = ? WHERE task_id = ? AND user_id = ?')
-    .run(done ? new Date().toISOString() : null, taskId, req.user.id);
-  events.broadcast('tasks', {});
-  if (done) {
-    const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId);
-    const admins = db.prepare(`SELECT id FROM users WHERE role = 'admin'`).all().map((r) => r.id);
-    notify(admins.filter((id) => id !== req.user.id), {
-      title: `${req.user.name} completed a task`,
-      body: task.title,
-      url: '/#/tasks',
-    });
-  }
-  res.json({ ok: true });
 });
 
 /* ---------------------------------- forms ----------------------------------- */
@@ -853,28 +708,32 @@ function sanitizeFields(fields) {
 }
 
 app.get('/api/forms', requireAuth, (req, res) => {
+  const headcount = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
   const forms = db.prepare('SELECT * FROM forms WHERE archived = 0 ORDER BY id DESC').all()
     .map((f) => ({
       ...f,
       fields: JSON.parse(f.fields),
       my_submissions: db.prepare('SELECT COUNT(*) AS n FROM form_submissions WHERE form_id = ? AND user_id = ?').get(f.id, req.user.id).n,
-      total_submissions: req.user.role === 'admin'
-        ? db.prepare('SELECT COUNT(*) AS n FROM form_submissions WHERE form_id = ?').get(f.id).n
-        : undefined,
+      signed_count: db.prepare('SELECT COUNT(DISTINCT user_id) AS n FROM form_submissions WHERE form_id = ?').get(f.id).n,
+      headcount,
     }));
   res.json({ forms });
 });
 
 app.post('/api/forms', requireAuth, requireAdmin, (req, res) => {
-  const { title, description = '', fields } = req.body || {};
+  const { title, description = '', fields, require_signature = true } = req.body || {};
   if (!title?.trim()) return res.status(400).json({ error: 'Form title is required' });
   const clean = sanitizeFields(fields);
   if (!clean) return res.status(400).json({ error: 'The form needs at least one valid field' });
-  const info = db.prepare('INSERT INTO forms (title, description, fields, created_by) VALUES (?, ?, ?, ?)')
-    .run(title.trim(), String(description).trim(), JSON.stringify(clean), req.user.id);
+  const info = db.prepare('INSERT INTO forms (title, description, fields, require_signature, created_by) VALUES (?, ?, ?, ?, ?)')
+    .run(title.trim(), String(description).trim(), JSON.stringify(clean), require_signature ? 1 : 0, req.user.id);
   events.broadcast('forms', {});
   const members = db.prepare('SELECT id FROM users WHERE id != ?').all(req.user.id).map((r) => r.id);
-  notify(members, { title: `New form: ${title.trim()}`, body: 'Tap to fill it in', url: '/#/forms' });
+  notify(members, {
+    title: `New form to sign: ${title.trim()}`,
+    body: require_signature ? 'Tap to review and sign' : 'Tap to fill it in',
+    url: '/#/forms',
+  });
   res.json({ form: db.prepare('SELECT * FROM forms WHERE id = ?').get(Number(info.lastInsertRowid)) });
 });
 
@@ -897,15 +756,50 @@ app.post('/api/forms/:id/submit', requireAuth, (req, res) => {
     }
     clean[f.id] = f.type === 'checkbox' ? !!v : String(v ?? '').slice(0, 2000);
   }
-  db.prepare('INSERT INTO form_submissions (form_id, user_id, answers) VALUES (?, ?, ?)')
-    .run(form.id, req.user.id, JSON.stringify(clean));
+
+  // Signature: a typed legal name plus a drawn PNG, both stored with the
+  // submission so the downloaded document stands on its own.
+  let { signature = null, signed_name = '' } = req.body || {};
+  signed_name = String(signed_name).trim().slice(0, 120);
+  if (form.require_signature) {
+    if (!signed_name) return res.status(400).json({ error: 'Type your full name to sign' });
+    if (typeof signature !== 'string' || !signature.startsWith('data:image/png;base64,')) {
+      return res.status(400).json({ error: 'Draw your signature to sign' });
+    }
+    if (signature.length > 400000) return res.status(400).json({ error: 'Signature image is too large' });
+  } else {
+    signature = null;
+  }
+
+  db.prepare(
+    'INSERT INTO form_submissions (form_id, user_id, answers, signature, signed_name, signed_at) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(form.id, req.user.id, JSON.stringify(clean), signature, signed_name || null,
+    form.require_signature ? new Date().toISOString() : null);
+
   events.broadcast('forms', {});
   const admins = db.prepare(`SELECT id FROM users WHERE role = 'admin'`).all().map((r) => r.id);
   notify(admins.filter((id) => id !== req.user.id), {
-    title: `${req.user.name} submitted "${form.title}"`,
+    title: `${req.user.name} ${form.require_signature ? 'signed' : 'submitted'} "${form.title}"`,
+    body: 'Tap to review or download it',
     url: '/#/forms',
   });
   res.json({ ok: true });
+});
+
+// Who has completed a form and who still owes it.
+app.get('/api/forms/:id/status', requireAuth, requireAdmin, (req, res) => {
+  const form = db.prepare('SELECT * FROM forms WHERE id = ?').get(Number(req.params.id));
+  if (!form) return res.status(404).json({ error: 'Form not found' });
+  const people = db.prepare(`
+    SELECT u.id, u.name, u.color,
+           s.id AS submission_id, s.signed_at, s.created_at
+    FROM users u
+    LEFT JOIN form_submissions s
+      ON s.user_id = u.id
+     AND s.id = (SELECT MAX(id) FROM form_submissions WHERE form_id = ? AND user_id = u.id)
+    ORDER BY u.name
+  `).all(form.id);
+  res.json({ form: { ...form, fields: JSON.parse(form.fields) }, people });
 });
 
 app.get('/api/forms/:id/submissions', requireAuth, (req, res) => {
@@ -1127,6 +1021,77 @@ app.delete('/api/hour-requests/:id', requireAuth, (req, res) => {
   db.prepare('DELETE FROM hour_requests WHERE id = ?').run(request.id);
   events.broadcast('hours', {});
   res.json({ ok: true });
+});
+
+// Download a completed form as a signed PDF document.
+app.get('/api/forms/:id/submissions/:sid/pdf', requireAuth, (req, res) => {
+  const form = db.prepare('SELECT * FROM forms WHERE id = ?').get(Number(req.params.id));
+  if (!form) return res.status(404).json({ error: 'Form not found' });
+  const sub = db.prepare(`
+    SELECT s.*, u.name AS user_name, u.phone, u.email
+    FROM form_submissions s LEFT JOIN users u ON u.id = s.user_id
+    WHERE s.id = ? AND s.form_id = ?
+  `).get(Number(req.params.sid), form.id);
+  if (!sub) return res.status(404).json({ error: 'Submission not found' });
+  // Members may download their own copy; admins may download anyone's.
+  if (req.user.role !== 'admin' && sub.user_id !== req.user.id) {
+    return res.status(403).json({ error: 'Not allowed' });
+  }
+
+  const fields = JSON.parse(form.fields);
+  const answers = JSON.parse(sub.answers);
+  const when = (iso) => new Date(iso.endsWith('Z') || iso.includes('+') ? iso : iso + 'Z')
+    .toLocaleString('en-US', { dateStyle: 'long', timeStyle: 'short', timeZone: process.env.APP_TZ || 'America/New_York' });
+
+  const safe = (form.title + '-' + (sub.user_name || 'employee')).replace(/[^a-z0-9]+/gi, '-').toLowerCase();
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="${safe}.pdf"`);
+
+  const doc = new PDFDocument({ size: 'LETTER', margin: 54 });
+  doc.pipe(res);
+
+  doc.fontSize(20).font('Helvetica-Bold').text('E&E Management');
+  doc.fontSize(9).font('Helvetica').fillColor('#666').text('Event Services and More');
+  doc.moveDown(1.2).fillColor('#000');
+  doc.fontSize(16).font('Helvetica-Bold').text(form.title);
+  if (form.description) doc.moveDown(0.2).fontSize(10).font('Helvetica').fillColor('#444').text(form.description);
+  doc.fillColor('#000').moveDown(0.8);
+  doc.moveTo(54, doc.y).lineTo(558, doc.y).strokeColor('#ccc').stroke().moveDown(0.8);
+
+  doc.fontSize(10).font('Helvetica-Bold').text('Completed by: ', { continued: true })
+    .font('Helvetica').text(sub.user_name || 'Removed user');
+  doc.font('Helvetica-Bold').text('Submitted: ', { continued: true })
+    .font('Helvetica').text(when(sub.created_at));
+  doc.moveDown(1);
+
+  for (const f of fields) {
+    const raw = answers[f.id];
+    const value = f.type === 'checkbox' ? (raw ? 'Yes' : 'No') : (String(raw ?? '').trim() || '—');
+    doc.fontSize(10).font('Helvetica-Bold').fillColor('#333').text(f.label);
+    doc.font('Helvetica').fillColor('#000').text(value, { indent: 12 });
+    doc.moveDown(0.6);
+  }
+
+  if (sub.signed_at) {
+    doc.moveDown(0.6);
+    doc.moveTo(54, doc.y).lineTo(558, doc.y).strokeColor('#ccc').stroke().moveDown(0.8);
+    doc.fontSize(11).font('Helvetica-Bold').fillColor('#000').text('Signature');
+    doc.moveDown(0.4);
+    if (sub.signature) {
+      try {
+        const png = Buffer.from(sub.signature.split(',')[1], 'base64');
+        doc.image(png, { fit: [230, 80] });
+      } catch { /* a corrupt image should not block the rest of the document */ }
+    }
+    const y = doc.y + 4;
+    doc.moveTo(54, y).lineTo(284, y).strokeColor('#333').stroke();
+    doc.moveDown(0.6).fontSize(10).font('Helvetica').fillColor('#000').text(sub.signed_name || sub.user_name || '');
+    doc.fontSize(8).fillColor('#666')
+      .text(`Signed electronically on ${when(sub.signed_at)}`)
+      .text(`Signer: ${sub.user_name || ''}${sub.phone ? ' · ' + sub.phone : ''} · Document ID ${form.id}-${sub.id}`);
+  }
+
+  doc.end();
 });
 
 /* ------------------------------- updates feed ------------------------------- */

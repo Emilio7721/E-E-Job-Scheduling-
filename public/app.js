@@ -132,7 +132,7 @@ function connectEvents() {
   es.addEventListener('venues', () => refreshVenues());
   es.addEventListener('channels', () => refreshChannels());
   for (const [event, views] of Object.entries({
-    time: ['clock', 'timesheets'], timeoff: ['timeoff'], tasks: ['tasks'], forms: ['forms'], posts: ['updates'],
+    time: ['clock', 'timesheets'], forms: ['forms'], posts: ['updates'],
     hours: ['hours'], roles: ['roles'], positions: ['positions', 'team'], users: ['team'],
   })) {
     es.addEventListener(event, () => { if (views.includes(route().view)) render(); });
@@ -478,7 +478,7 @@ const TABS = [
 ];
 
 // Views that live under the "More" hub still highlight the More tab.
-const MORE_VIEWS = ['more', 'venues', 'team', 'tasks', 'timeoff', 'forms', 'timesheets', 'settings', 'notifications', 'hours', 'roles', 'positions'];
+const MORE_VIEWS = ['more', 'venues', 'team', 'forms', 'timesheets', 'settings', 'notifications', 'hours', 'roles', 'positions'];
 
 async function signOut() {
   if (!confirm('Sign out of E&E?')) return;
@@ -1045,7 +1045,7 @@ function renderTeam() {
         <span class="avatar lg" style="background:${esc(u.color)}">${esc(initials(u.name))}</span>
         <span class="grow">
           <div style="font-weight:700">${esc(u.name)} ${u.id === state.me.id ? '<span class="sub">(you)</span>' : ''}</div>
-          <div class="sub">${esc(contactOf(u))}${isAdmin && u.hourly_rate ? ` · $${Number(u.hourly_rate).toFixed(2)}/h` : ''}</div>
+          <div class="sub">${esc(contactOf(u))}</div>
         </span>
         <span class="role-tag">${esc(state.positions.find((r) => r.id === u.position_id)?.name || (u.role === 'admin' ? 'Admin' : 'Member'))}</span>
         ${isAdmin ? `<button class="icon-btn" data-edit-user="${u.id}" title="Edit">✏️</button>` : ''}
@@ -1089,8 +1089,6 @@ function openUserModal(user) {
         </span>
         ${user.devices && !isSelf ? '<button type="button" class="btn small secondary" id="push-test-user">Test</button>' : ''}
       </div>
-      <label>Hourly rate ($) — used for payroll export</label>
-      <input name="hourly_rate" type="number" min="0" step="0.01" value="${Number(user.hourly_rate || 0).toFixed(2)}">
       <label>Clock-in PIN</label>
       <div class="row">
         <span class="pin-value" id="pin-view">${esc(user.pin || '—')}</span>
@@ -1124,14 +1122,10 @@ function openUserModal(user) {
 
   modal.querySelector('#user-form').onsubmit = async (e) => {
     e.preventDefault();
-    const fd = new FormData(e.target);
     try {
       await api(`/api/users/${user.id}`, {
         method: 'PATCH',
-        body: {
-          position_id: posSel.value ? Number(posSel.value) : null,
-          hourly_rate: Number(fd.get('hourly_rate')) || 0,
-        },
+        body: { position_id: posSel.value ? Number(posSel.value) : null },
       });
       state.users = (await api('/api/users')).users;
       closeModal(); render();
@@ -1387,8 +1381,9 @@ async function renderTimesheets() {
 
   const byUser = new Map();
   for (const e of entries) {
-    const u = byUser.get(e.user_id) || { name: e.user_name, color: e.user_color, rate: e.hourly_rate || 0, ms: 0, entries: [] };
+    const u = byUser.get(e.user_id) || { name: e.user_name, color: e.user_color, ms: 0, mileage: 0, entries: [] };
     u.ms += (e.clock_out ? new Date(e.clock_out) : new Date()) - new Date(e.clock_in);
+    u.mileage += e.mileage || 0;
     u.entries.push(e);
     byUser.set(e.user_id, u);
   }
@@ -1407,7 +1402,7 @@ async function renderTimesheets() {
           <span class="avatar lg" style="background:${esc(u.color)}">${esc(initials(u.name))}</span>
           <span class="grow">
             <div style="font-weight:700">${esc(u.name)}</div>
-            <div class="sub">${fmtDur(u.ms)} · $${u.rate.toFixed(2)}/h · <b>$${(u.ms / 3600000 * u.rate).toFixed(2)}</b></div>
+            <div class="sub"><b>${fmtDur(u.ms)}</b>${u.mileage ? ` · 🚗 ${u.mileage.toFixed(1)} mi` : ''}</div>
           </span>
         </div>
         ${u.entries.map((e) => `
@@ -1420,8 +1415,8 @@ async function renderTimesheets() {
             <button class="icon-btn" data-approve="${e.id}" data-approved="${e.approved}" title="${e.approved ? 'Approved — tap to unapprove' : 'Tap to approve'}">${e.approved ? '✅' : '⬜'}</button>
           </div>`).join('')}
       </div>`).join('') : '<div class="empty"><div class="big">🧾</div>No time entries this week</div>'}
-    <button class="btn" id="ts-export" style="margin-top:10px">⬇️ Export payroll CSV (${rangeLabel})</button>
-    <p class="hint">Set each person's hourly rate in the Team screen. The CSV includes hours and pay per punch plus per-person totals.</p>
+    <button class="btn" id="ts-export" style="margin-top:10px">⬇️ Export hours CSV (${rangeLabel})</button>
+    <p class="hint">The CSV lists every punch with hours, job, venue and mileage, plus per-person totals.</p>
   `, { back: () => { location.hash = '#/more'; } });
 
   document.getElementById('ts-prev').onclick = () => { state.tsWeekStart.setDate(state.tsWeekStart.getDate() - 7); render(); };
@@ -1479,172 +1474,6 @@ function openTimeEntryModal(entry) {
   };
 }
 
-/* --------------------------------- time off --------------------------------- */
-
-const TIMEOFF_ICONS = { vacation: '🏖️', sick: '🤒', personal: '🏠', other: '📅' };
-
-async function renderTimeoff() {
-  const { requests } = await api('/api/timeoff');
-  const isAdmin = state.me.role === 'admin';
-  const pending = requests.filter((r) => r.status === 'pending');
-  const rest = requests.filter((r) => r.status !== 'pending');
-
-  const reqCard = (r) => `
-    <div class="card row">
-      <span style="font-size:26px">${TIMEOFF_ICONS[r.kind] || '📅'}</span>
-      <span class="grow">
-        <div style="font-weight:700">${isAdmin ? esc(r.user_name) + ' · ' : ''}${r.kind}</div>
-        <div class="sub">${r.start_date === r.end_date ? r.start_date : `${r.start_date} → ${r.end_date}`}</div>
-        ${r.note ? `<div class="sub">${esc(r.note)}</div>` : ''}
-      </span>
-      ${r.status === 'pending' && isAdmin ? `
-        <button class="btn small" data-decide="approved" data-id="${r.id}">✓</button>
-        <button class="btn small danger" data-decide="denied" data-id="${r.id}">✗</button>` : `
-        <span class="status-tag ${r.status}">${r.status}</span>`}
-      ${r.status === 'pending' && !isAdmin && r.user_id === state.me.id ? `<button class="icon-btn" data-cancel="${r.id}" title="Cancel request">🗑️</button>` : ''}
-    </div>`;
-
-  shell('Time Off', `
-    ${pending.length ? `<div class="section-title">Pending${isAdmin ? ' approval' : ''}</div>${pending.map(reqCard).join('')}` : ''}
-    <div class="section-title">History</div>
-    ${rest.length ? rest.map(reqCard).join('') : '<div class="empty"><div class="big">🏖️</div>No time-off requests yet</div>'}
-  `, { back: () => { location.hash = '#/more'; }, fab: true });
-
-  document.getElementById('fab').onclick = () => {
-    const today = dateKey(new Date());
-    const modal = openModal(`
-      <h3>Request time off</h3>
-      <form id="timeoff-form">
-        <label>Type</label>
-        <select name="kind">
-          <option value="vacation">🏖️ Vacation</option>
-          <option value="sick">🤒 Sick</option>
-          <option value="personal">🏠 Personal</option>
-          <option value="other">📅 Other</option>
-        </select>
-        <label>First day</label><input name="start_date" type="date" required value="${today}">
-        <label>Last day</label><input name="end_date" type="date" required value="${today}">
-        <label>Note (optional)</label><textarea name="note" rows="2" placeholder="Anything your manager should know…"></textarea>
-        <div class="actions"><button type="submit" class="btn">Send request</button></div>
-      </form>
-    `);
-    modal.querySelector('#timeoff-form').onsubmit = async (e) => {
-      e.preventDefault();
-      const fd = new FormData(e.target);
-      try {
-        await api('/api/timeoff', { method: 'POST', body: Object.fromEntries(fd.entries()) });
-        closeModal(); toast('Request sent — your manager was notified');
-        render();
-      } catch (err) { toast(err.message); }
-    };
-  };
-  document.querySelectorAll('[data-decide]').forEach((b) => {
-    b.onclick = async () => {
-      await api(`/api/timeoff/${b.dataset.id}/decide`, { method: 'POST', body: { status: b.dataset.decide } });
-      toast(`Request ${b.dataset.decide}`);
-      render();
-    };
-  });
-  document.querySelectorAll('[data-cancel]').forEach((b) => {
-    b.onclick = async () => {
-      await api(`/api/timeoff/${b.dataset.cancel}`, { method: 'DELETE' });
-      render();
-    };
-  });
-}
-
-/* ---------------------------------- tasks ----------------------------------- */
-
-async function renderTasks() {
-  const { tasks } = await api('/api/tasks');
-  const isAdmin = state.me.role === 'admin';
-  const isDone = (t) => t.assignees.length > 0 && t.assignees.every((a) => a.done_at);
-  const open = tasks.filter((t) => !isDone(t));
-  const done = tasks.filter(isDone);
-
-  const taskCard = (t) => {
-    const mine = t.assignees.find((a) => a.id === state.me.id);
-    const overdue = t.due_at && !isDone(t) && new Date(t.due_at) < new Date();
-    return `
-    <div class="card" data-task="${t.id}">
-      <div class="row">
-        ${mine ? `<button class="task-check ${mine.done_at ? 'on' : ''}" data-toggle="${t.id}">${mine.done_at ? '✓' : ''}</button>` : '<span style="width:6px"></span>'}
-        <span class="grow">
-          <div style="font-weight:700;${mine?.done_at ? 'text-decoration:line-through;color:var(--muted)' : ''}">${esc(t.title)}</div>
-          ${t.notes ? `<div class="sub">${esc(t.notes)}</div>` : ''}
-          ${t.due_at ? `<div class="sub" style="${overdue ? 'color:var(--red);font-weight:600' : ''}">Due ${fmtDay(t.due_at)}${overdue ? ' · overdue' : ''}</div>` : ''}
-        </span>
-        ${isAdmin ? `<button class="icon-btn" data-edit-task="${t.id}">✏️</button>` : ''}
-      </div>
-      ${t.assignees.length ? `<div class="shift-people" style="margin-top:8px">
-        ${t.assignees.map((a) => `<span class="chip ${a.done_at ? 'accepted' : 'pending'}">
-          <span class="avatar" style="background:${esc(a.color)}">${esc(initials(a.name))}</span>
-          ${esc(a.name)}<span class="st">${a.done_at ? '✓ Done' : '• Open'}</span></span>`).join('')}
-      </div>` : ''}
-    </div>`;
-  };
-
-  shell('Tasks', `
-    ${open.length ? open.map(taskCard).join('') : '<div class="empty"><div class="big">✅</div>No open tasks</div>'}
-    ${done.length ? `<div class="section-title">Completed</div>${done.map(taskCard).join('')}` : ''}
-  `, { back: () => { location.hash = '#/more'; }, fab: isAdmin });
-
-  if (isAdmin) document.getElementById('fab').onclick = () => openTaskModal();
-  document.querySelectorAll('[data-toggle]').forEach((b) => {
-    b.onclick = async (e) => {
-      e.stopPropagation();
-      await api(`/api/tasks/${b.dataset.toggle}/toggle`, { method: 'POST' });
-      render();
-    };
-  });
-  document.querySelectorAll('[data-edit-task]').forEach((b) => {
-    b.onclick = (e) => {
-      e.stopPropagation();
-      openTaskModal(tasks.find((t) => t.id === Number(b.dataset.editTask)));
-    };
-  });
-}
-
-function openTaskModal(task = null) {
-  const selected = new Set(task ? task.assignees.map((a) => a.id) : []);
-  const modal = openModal(`
-    <h3>${task ? 'Edit task' : 'New task'}</h3>
-    <form id="task-form">
-      <label>Task</label><input name="title" required placeholder="e.g. Restock the bar fridge" value="${esc(task?.title || '')}">
-      <label>Details (optional)</label><textarea name="notes" rows="2">${esc(task?.notes || '')}</textarea>
-      <label>Due date (optional)</label><input name="due_at" type="date" value="${task?.due_at ? task.due_at.slice(0, 10) : ''}">
-      <label>Assign to</label>
-      ${peoplePickerHTML(state.users, selected, { id: 'task-picker' })}
-      <div class="actions">
-        ${task ? '<button type="button" class="btn danger" id="task-delete">Delete</button>' : ''}
-        <button type="submit" class="btn">${task ? 'Save' : 'Create task'}</button>
-      </div>
-    </form>
-  `);
-  bindPeoplePicker(modal, selected, { id: 'task-picker' });
-  const del = modal.querySelector('#task-delete');
-  if (del) del.onclick = async () => {
-    if (!confirm('Delete this task?')) return;
-    await api(`/api/tasks/${task.id}`, { method: 'DELETE' });
-    closeModal(); render();
-  };
-  modal.querySelector('#task-form').onsubmit = async (e) => {
-    e.preventDefault();
-    const fd = new FormData(e.target);
-    const body = {
-      title: fd.get('title'),
-      notes: fd.get('notes') || '',
-      due_at: fd.get('due_at') ? `${fd.get('due_at')}T23:59:00.000Z` : null,
-      assignee_ids: [...selected],
-    };
-    try {
-      await api(task ? `/api/tasks/${task.id}` : '/api/tasks', { method: task ? 'PATCH' : 'POST', body });
-      closeModal(); toast(task ? 'Task updated' : 'Task created — assignees notified');
-      render();
-    } catch (err) { toast(err.message); }
-  };
-}
-
 /* ---------------------------------- forms ----------------------------------- */
 
 async function renderForms() {
@@ -1658,15 +1487,18 @@ async function renderForms() {
           <span class="grow">
             <div style="font-weight:700">${esc(f.title)}</div>
             ${f.description ? `<div class="sub">${esc(f.description)}</div>` : ''}
-            <div class="sub">${f.fields.length} question${f.fields.length === 1 ? '' : 's'}${f.my_submissions ? ` · you submitted ${f.my_submissions}×` : ''}${isAdmin ? ` · ${f.total_submissions} total submissions` : ''}</div>
+            <div class="sub">
+              ${f.fields.length} question${f.fields.length === 1 ? '' : 's'}${f.require_signature ? ' · signature required' : ''}
+              ${isAdmin ? `<br><b>${f.signed_count} of ${f.headcount}</b> completed` : (f.my_submissions ? '<br>✅ You completed this' : '<br>⏳ Awaiting your signature')}
+            </div>
           </span>
         </div>
         <div class="shift-actions">
-          <button class="btn small" data-fill="${f.id}">Fill in</button>
-          <button class="btn small secondary" data-subs="${f.id}">${isAdmin ? 'Submissions' : 'My submissions'}</button>
+          <button class="btn small" data-fill="${f.id}">${f.my_submissions ? 'Sign again' : (f.require_signature ? 'Review & sign' : 'Fill in')}</button>
+          <button class="btn small secondary" data-subs="${f.id}">${isAdmin ? 'Completions' : 'My copies'}</button>
           ${isAdmin ? `<button class="btn small danger" data-del-form="${f.id}">Delete</button>` : ''}
         </div>
-      </div>`).join('') : `<div class="empty"><div class="big">📋</div>No forms yet${isAdmin ? '<br>Tap ＋ to build one (checklists, incident reports, inspections…)' : ''}</div>`}
+      </div>`).join('') : `<div class="empty"><div class="big">📋</div>No forms yet${isAdmin ? '<br>Tap ＋ to build one (waivers, policies, checklists…)' : ''}</div>`}
   `, { back: () => { location.hash = '#/more'; }, fab: isAdmin });
 
   if (isAdmin) document.getElementById('fab').onclick = openFormBuilder;
@@ -1674,7 +1506,7 @@ async function renderForms() {
     b.onclick = () => openFormFill(forms.find((f) => f.id === Number(b.dataset.fill)));
   });
   document.querySelectorAll('[data-subs]').forEach((b) => {
-    b.onclick = () => openSubmissions(Number(b.dataset.subs));
+    b.onclick = () => (state.me.role === 'admin' ? openFormStatus(Number(b.dataset.subs)) : openSubmissions(Number(b.dataset.subs)));
   });
   document.querySelectorAll('[data-del-form]').forEach((b) => {
     b.onclick = async () => {
@@ -1698,9 +1530,25 @@ function openFormFill(form) {
         if (f.type === 'select') return `${label}<select name="f${f.id}" ${req}><option value="">Choose…</option>${(f.options || []).map((o) => `<option>${esc(o)}</option>`).join('')}</select>`;
         return `${label}<input name="f${f.id}" type="${f.type}" ${req}>`;
       }).join('')}
-      <div class="actions"><button type="submit" class="btn">Submit</button></div>
+      ${form.require_signature ? `
+        <div class="sign-block">
+          <div class="sign-head">Signature</div>
+          <label>Type your full legal name</label>
+          <input name="signed_name" required autocomplete="name" placeholder="Jane Doe" value="${esc(state.me.name)}">
+          <label>Draw your signature</label>
+          <div class="sign-pad-wrap">
+            <canvas id="sign-pad" class="sign-pad"></canvas>
+            <button type="button" class="sign-clear" id="sign-clear">Clear</button>
+          </div>
+          <p class="hint">By signing you agree this electronic signature is the legal equivalent of your handwritten signature on this document.</p>
+        </div>` : ''}
+      <div class="actions"><button type="submit" class="btn">${form.require_signature ? 'Sign & submit' : 'Submit'}</button></div>
     </form>
   `);
+
+  let pad = null;
+  if (form.require_signature) pad = initSignaturePad(modal.querySelector('#sign-pad'), modal.querySelector('#sign-clear'));
+
   modal.querySelector('#fill-form').onsubmit = async (e) => {
     e.preventDefault();
     const answers = {};
@@ -1708,17 +1556,114 @@ function openFormFill(form) {
       const el = e.target.elements[`f${f.id}`];
       answers[f.id] = f.type === 'checkbox' ? el.checked : el.value;
     }
+    const body = { answers };
+    if (form.require_signature) {
+      if (pad.isEmpty()) return toast('Please draw your signature');
+      body.signature = pad.toDataURL();
+      body.signed_name = e.target.elements.signed_name.value;
+    }
     try {
-      await api(`/api/forms/${form.id}/submit`, { method: 'POST', body: { answers } });
-      closeModal(); toast('Submitted ✅');
+      await api(`/api/forms/${form.id}/submit`, { method: 'POST', body });
+      closeModal(); toast(form.require_signature ? 'Signed ✅' : 'Submitted ✅');
       render();
     } catch (err) { toast(err.message); }
   };
 }
 
+// Finger/mouse signature capture on a canvas sized to its container.
+function initSignaturePad(canvas, clearBtn) {
+  const ratio = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * ratio;
+  canvas.height = rect.height * ratio;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(ratio, ratio);
+  ctx.lineWidth = 2.2;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.strokeStyle = '#111';
+
+  let drawing = false;
+  let dirty = false;
+  const pos = (e) => {
+    const r = canvas.getBoundingClientRect();
+    const t = e.touches ? e.touches[0] : e;
+    return { x: t.clientX - r.left, y: t.clientY - r.top };
+  };
+  const start = (e) => { e.preventDefault(); drawing = true; const { x, y } = pos(e); ctx.beginPath(); ctx.moveTo(x, y); };
+  const move = (e) => {
+    if (!drawing) return;
+    e.preventDefault();
+    const { x, y } = pos(e);
+    ctx.lineTo(x, y); ctx.stroke();
+    dirty = true;
+  };
+  const end = () => { drawing = false; };
+
+  canvas.addEventListener('mousedown', start);
+  canvas.addEventListener('mousemove', move);
+  window.addEventListener('mouseup', end);
+  canvas.addEventListener('touchstart', start, { passive: false });
+  canvas.addEventListener('touchmove', move, { passive: false });
+  canvas.addEventListener('touchend', end);
+
+  clearBtn.onclick = () => { ctx.clearRect(0, 0, canvas.width, canvas.height); dirty = false; };
+
+  return {
+    isEmpty: () => !dirty,
+    // Flatten onto white so the PNG reads correctly in the PDF.
+    toDataURL: () => {
+      const out = document.createElement('canvas');
+      out.width = canvas.width; out.height = canvas.height;
+      const octx = out.getContext('2d');
+      octx.fillStyle = '#fff';
+      octx.fillRect(0, 0, out.width, out.height);
+      octx.drawImage(canvas, 0, 0);
+      return out.toDataURL('image/png');
+    },
+  };
+}
+
+// Admin view: who has completed a form, with per-person PDF downloads.
+async function openFormStatus(formId) {
+  const { form, people } = await api(`/api/forms/${formId}/status`);
+  const done = people.filter((p) => p.submission_id);
+  const modal = openModal(`
+    <h3>${esc(form.title)}</h3>
+    <p class="sub"><b>${done.length} of ${people.length}</b> completed</p>
+    <div class="detail-people" style="margin-top:12px">
+      ${people.map((p) => `
+        <div class="row detail-person">
+          <span class="avatar lg" style="background:${esc(p.color)}">${esc(initials(p.name))}</span>
+          <span class="grow">
+            <div style="font-weight:700">${esc(p.name)}</div>
+            <div class="sub ${p.submission_id ? 'accepted' : 'pending'}">
+              ${p.submission_id ? `✓ ${p.signed_at ? 'Signed' : 'Submitted'} ${fmtWhen(p.created_at)}` : '• Not completed yet'}
+            </div>
+          </span>
+          ${p.submission_id ? `<button class="btn small secondary" data-pdf="${p.submission_id}">PDF</button>` : ''}
+        </div>`).join('')}
+    </div>
+    <div class="actions">
+      <button class="btn secondary" id="status-close">Close</button>
+      ${done.length ? `<button class="btn" id="download-all">Download all (${done.length})</button>` : ''}
+    </div>
+  `);
+  modal.querySelector('#status-close').onclick = closeModal;
+  modal.querySelectorAll('[data-pdf]').forEach((b) => {
+    b.onclick = () => window.open(`/api/forms/${formId}/submissions/${b.dataset.pdf}/pdf`, '_blank');
+  });
+  const all = modal.querySelector('#download-all');
+  if (all) all.onclick = () => {
+    // Staggered so the browser does not swallow the batch as a popup flood.
+    done.forEach((p, i) => setTimeout(
+      () => window.open(`/api/forms/${formId}/submissions/${p.submission_id}/pdf`, '_blank'), i * 400));
+  };
+}
+
 async function openSubmissions(formId) {
   const { form, submissions } = await api(`/api/forms/${formId}/submissions`);
-  openModal(`
+  const modal = openModal(`
     <h3>${esc(form.title)} — submissions</h3>
     ${submissions.length ? submissions.map((s) => `
       <div class="card" style="box-shadow:none;border:1px solid var(--line)">
@@ -1728,9 +1673,14 @@ async function openSubmissions(formId) {
           <span class="sub" style="margin-left:auto">${fmtWhen(s.created_at)}</span>
         </div>
         ${form.fields.map((f) => `<div class="sub" style="margin:3px 0"><b>${esc(f.label)}:</b> ${f.type === 'checkbox' ? (s.answers[f.id] ? '✅ yes' : '⬜ no') : esc(s.answers[f.id] || '—')}</div>`).join('')}
+        <button class="btn small secondary" data-pdf="${s.id}" style="margin-top:8px">⬇️ Download PDF</button>
       </div>`).join('') : '<p class="sub" style="margin-top:10px">No submissions yet.</p>'}
-    <div class="actions"><button class="btn secondary" onclick="document.querySelector('.modal-backdrop').remove()">Close</button></div>
+    <div class="actions"><button class="btn secondary" id="subs-close">Close</button></div>
   `);
+  modal.querySelector('#subs-close').onclick = closeModal;
+  modal.querySelectorAll('[data-pdf]').forEach((b) => {
+    b.onclick = () => window.open(`/api/forms/${formId}/submissions/${b.dataset.pdf}/pdf`, '_blank');
+  });
 }
 
 function openFormBuilder() {
@@ -1740,6 +1690,7 @@ function openFormBuilder() {
     <form id="form-builder">
       <label>Form title</label><input name="title" required placeholder="e.g. End-of-shift checklist">
       <label>Description (optional)</label><input name="description" placeholder="Shown to the team above the questions">
+      <label class="check-label"><input type="checkbox" name="require_signature" checked style="width:auto"> Require a signature to complete</label>
       <label>Questions</label>
       <div id="fields-list"></div>
       <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
@@ -1782,7 +1733,12 @@ function openFormBuilder() {
     try {
       await api('/api/forms', {
         method: 'POST',
-        body: { title: fd.get('title'), description: fd.get('description') || '', fields },
+        body: {
+          title: fd.get('title'),
+          description: fd.get('description') || '',
+          require_signature: !!fd.get('require_signature'),
+          fields,
+        },
       });
       closeModal(); toast('Form published — team notified');
       render();
@@ -2230,9 +2186,7 @@ function renderMore() {
   const isAdmin = state.me.role === 'admin';
   const items = [
     { href: '#/hours', icon: '🕐', label: 'Hours Requests', sub: 'Submit worked hours for approval' },
-    { href: '#/tasks', icon: '✅', label: 'Tasks', sub: 'To-dos for the team' },
-    { href: '#/timeoff', icon: '🏖️', label: 'Time Off', sub: 'Requests & approvals' },
-    { href: '#/forms', icon: '📋', label: 'Forms', sub: 'Checklists & reports' },
+    { href: '#/forms', icon: '📋', label: 'Forms', sub: 'Review, sign & download documents' },
     ...(isAdmin ? [
       { href: '#/timesheets', icon: '🧾', label: 'Timesheets', sub: 'Hours, approval & payroll CSV' },
       { href: '#/kiosk', icon: '🔢', label: 'Kiosk Mode', sub: 'Lock this device into a PIN punch clock' },
@@ -2287,8 +2241,6 @@ async function render() {
     else if (view === 'roles') await renderRoles();
     else if (view === 'positions') await renderPositions();
     else if (view === 'timesheets') await renderTimesheets();
-    else if (view === 'timeoff') await renderTimeoff();
-    else if (view === 'tasks') await renderTasks();
     else if (view === 'forms') await renderForms();
     else if (view === 'updates') await renderUpdates();
     else if (view === 'more') renderMore();

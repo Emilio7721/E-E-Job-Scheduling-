@@ -468,6 +468,28 @@ select:disabled { opacity: .55; background: var(--bg); }
 }
 .tut-icon { display: inline-block; }
 
+/* ---------- e-signature ---------- */
+.sign-block {
+  margin-top: 18px; padding: 14px; border-radius: 12px;
+  border: 1px dashed var(--line); background: var(--card-accent);
+}
+.sign-head {
+  font-size: 13px; font-weight: 800; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--accent);
+}
+.sign-pad-wrap { position: relative; }
+.sign-pad {
+  width: 100%; height: 150px; display: block;
+  background: #fff; border: 1.5px solid var(--line); border-radius: 10px;
+  touch-action: none; cursor: crosshair;
+}
+.sign-clear {
+  position: absolute; top: 8px; right: 8px;
+  font-size: 12px; font-weight: 700; color: var(--muted);
+  background: rgba(255,255,255,.9); border: 1px solid #ddd;
+  padding: 4px 10px; border-radius: 999px;
+}
+
 /* ---------- updates ---------- */
 .like-btn {
   margin-top: 10px; padding: 6px 14px; border-radius: 999px;
