@@ -1,6 +1,6 @@
 /* Service worker: offline shell cache + push notifications. */
 
-const CACHE = 'ee-shell-v1';
+const CACHE = 'ee-shell-v2';
 const SHELL = ['/', '/styles.css', '/app.js', '/manifest.webmanifest', '/icons/icon-192.png'];
 
 self.addEventListener('install', (event) => {

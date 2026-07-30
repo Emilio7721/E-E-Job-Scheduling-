@@ -7,8 +7,14 @@ A Connecteam-style workforce app for E&E: **job scheduling**, **venues**, **team
 - **📅 Job scheduling** — week-view schedule; admins create jobs with a title, venue, start/end time, notes, and assigned team members. Employees see their jobs and **accept or decline** with one tap (admins are notified of the response).
 - **📍 Venues** — manage your venue list (name, address, notes, color). Jobs link to venues, and addresses open directly in Google Maps.
 - **💬 Team chat** — a company-wide **General** channel, admin-created group channels, and 1-on-1 direct messages. Messages arrive in real time, with unread badges and last-message previews.
-- **🔔 Notifications on your phone** — real web push notifications (banner + lock screen) for new job assignments, schedule changes, cancellations, and chat messages — even when the app is closed. Plus an in-app notification feed.
-- **👥 Team** — everyone who signs up appears in the team list; admins can promote/demote members. The **first account created becomes the admin**.
+- **⏱️ Time clock** — one-tap clock in/out, optionally linked to the day's job, with **GPS location recorded at punch time** (when the employee allows it). Employees see their weekly hours at a glance.
+- **🧾 Timesheets & payroll** — admins review everyone's punches per week, edit or delete entries, approve them, and **export a payroll CSV** with hours and pay computed from each person's hourly rate (set in Team).
+- **🏖️ Time off** — employees request vacation/sick/personal days; admins approve or deny with one tap. Both sides get notified.
+- **✅ Tasks** — admins assign to-dos with due dates; each assignee checks their own box, and admins are notified on completion. Overdue tasks are flagged.
+- **📋 Forms & checklists** — admins build forms (text, paragraph, checkbox, dropdown, number, date fields, required flags); employees fill them in from their phone and admins review all submissions.
+- **📢 Updates feed** — company announcements posted by admins, pushed to every phone, with likes.
+- **🔔 Notifications on your phone** — real web push notifications (banner + lock screen) for job assignments, schedule changes, cancellations, chat messages, tasks, time-off decisions, new forms, and announcements — even when the app is closed. Plus an in-app notification feed.
+- **👥 Team** — everyone who signs up appears in the team list; admins manage roles and hourly rates. The **first account created becomes the admin**.
 - **📱 Installable app** — add it to your home screen and it runs full-screen with its own icon, like a native app.
 
 ## Quick start

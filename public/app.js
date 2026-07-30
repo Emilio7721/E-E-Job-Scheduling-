@@ -108,6 +108,11 @@ function connectEvents() {
   es.addEventListener('shifts', () => { if (route().view === 'schedule') loadShifts().then(render); });
   es.addEventListener('venues', () => refreshVenues());
   es.addEventListener('channels', () => refreshChannels());
+  for (const [event, views] of Object.entries({
+    time: ['clock', 'timesheets'], timeoff: ['timeoff'], tasks: ['tasks'], forms: ['forms'], posts: ['updates'],
+  })) {
+    es.addEventListener(event, () => { if (views.includes(route().view)) render(); });
+  }
   es.addEventListener('notification', (e) => {
     const n = JSON.parse(e.data);
     state.notifications.unshift({ ...n, read: 0, created_at: new Date().toISOString() });
@@ -268,13 +273,17 @@ function renderAuth() {
 const TABS = [
   { id: 'schedule', icon: '📅', label: 'Schedule' },
   { id: 'chat', icon: '💬', label: 'Chat' },
-  { id: 'venues', icon: '📍', label: 'Venues' },
-  { id: 'team', icon: '👥', label: 'Team' },
-  { id: 'settings', icon: '⚙️', label: 'Settings' },
+  { id: 'clock', icon: '⏱️', label: 'Clock' },
+  { id: 'updates', icon: '📢', label: 'Updates' },
+  { id: 'more', icon: '☰', label: 'More' },
 ];
 
+// Views that live under the "More" hub still highlight the More tab.
+const MORE_VIEWS = ['more', 'venues', 'team', 'tasks', 'timeoff', 'forms', 'timesheets', 'settings', 'notifications'];
+
 function shell(title, contentHTML, { back = null, fab = null } = {}) {
-  const { view } = route();
+  let { view } = route();
+  if (MORE_VIEWS.includes(view)) view = 'more';
   $app.innerHTML = `
     ${back !== 'none' ? `
     <header class="topbar">
@@ -691,22 +700,48 @@ function renderTeam() {
           <div class="sub">${esc(u.email)}</div>
         </span>
         <span class="role-tag">${u.role}</span>
-        ${isAdmin && u.id !== state.me.id ? `<button class="icon-btn" data-role="${u.id}" data-current="${u.role}" title="Change role">↕️</button>` : ''}
+        ${isAdmin && u.hourly_rate ? `<span class="sub">$${Number(u.hourly_rate).toFixed(2)}/h</span>` : ''}
+        ${isAdmin ? `<button class="icon-btn" data-edit-user="${u.id}" title="Edit">✏️</button>` : ''}
       </div>`).join('')}
     <div class="card">
       <div style="font-weight:700;margin-bottom:6px">Invite your team</div>
       <p class="hint">Share this app's link with your team — they sign up with their email and instantly appear here, in chat, and in the schedule.</p>
     </div>
   `);
-  document.querySelectorAll('[data-role]').forEach((b) => {
-    b.onclick = async () => {
-      const next = b.dataset.current === 'admin' ? 'member' : 'admin';
-      if (!confirm(`Make this person ${next === 'admin' ? 'an admin (can manage jobs, venues, channels)' : 'a regular member'}?`)) return;
-      await api(`/api/users/${b.dataset.role}`, { method: 'PATCH', body: { role: next } });
-      state.users = (await api('/api/users')).users;
-      render();
-    };
+  document.querySelectorAll('[data-edit-user]').forEach((b) => {
+    b.onclick = () => openUserModal(state.users.find((u) => u.id === Number(b.dataset.editUser)));
   });
+}
+
+function openUserModal(user) {
+  const isSelf = user.id === state.me.id;
+  const modal = openModal(`
+    <h3>${esc(user.name)}</h3>
+    <p class="sub">${esc(user.email)}</p>
+    <form id="user-form">
+      <label>Role</label>
+      <select name="role" ${isSelf ? 'disabled' : ''}>
+        <option value="member" ${user.role === 'member' ? 'selected' : ''}>Member</option>
+        <option value="admin" ${user.role === 'admin' ? 'selected' : ''}>Admin — manages jobs, venues, forms, payroll</option>
+      </select>
+      ${isSelf ? '<p class="hint">You cannot change your own role.</p>' : ''}
+      <label>Hourly rate ($) — used for payroll export</label>
+      <input name="hourly_rate" type="number" min="0" step="0.01" value="${Number(user.hourly_rate || 0).toFixed(2)}">
+      <div class="actions"><button type="submit" class="btn">Save</button></div>
+    </form>
+  `);
+  modal.querySelector('#user-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api(`/api/users/${user.id}`, {
+        method: 'PATCH',
+        body: { role: isSelf ? user.role : fd.get('role'), hourly_rate: Number(fd.get('hourly_rate')) || 0 },
+      });
+      state.users = (await api('/api/users')).users;
+      closeModal(); render();
+    } catch (err) { toast(err.message); }
+  };
 }
 
 /* ------------------------------ notifications ------------------------------ */
@@ -786,15 +821,633 @@ async function renderSettings() {
   };
 }
 
+/* -------------------------------- time clock -------------------------------- */
+
+function fmtDur(ms) {
+  const mins = Math.floor(ms / 60000);
+  return `${Math.floor(mins / 60)}h ${String(mins % 60).padStart(2, '0')}m`;
+}
+
+function getLocation() {
+  return new Promise((resolve) => {
+    if (!navigator.geolocation) return resolve({});
+    const timer = setTimeout(() => resolve({}), 4000);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => { clearTimeout(timer); resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }); },
+      () => { clearTimeout(timer); resolve({}); },
+      { timeout: 3500, maximumAge: 60000 }
+    );
+  });
+}
+
+async function renderClock() {
+  const [{ entry }, weekAgoEntries] = await Promise.all([
+    api('/api/time/status'),
+    (async () => {
+      const from = new Date(startOfWeek(new Date())).toISOString();
+      return (await api(`/api/time/entries?from=${from}`)).entries.filter((e) => e.user_id === state.me.id);
+    })(),
+  ]);
+  const { shifts } = await api(`/api/shifts?from=${new Date(Date.now() - 12 * 3600000).toISOString()}&to=${new Date(Date.now() + 24 * 3600000).toISOString()}&mine=1`);
+
+  const weekMs = weekAgoEntries.reduce((sum, e) => {
+    const end = e.clock_out ? new Date(e.clock_out) : new Date();
+    return sum + (end - new Date(e.clock_in));
+  }, 0);
+
+  shell('Time Clock', `
+    <div class="card clock-card">
+      <div class="clock-status">${entry ? '🟢 Clocked in' : '⚪ Clocked out'}</div>
+      <div class="clock-timer" id="clock-timer">${entry ? fmtDur(Date.now() - new Date(entry.clock_in)) : '0h 00m'}</div>
+      ${entry?.shift_title ? `<div class="sub" style="text-align:center">Working: ${esc(entry.shift_title)}</div>` : ''}
+      ${entry ? `<div class="sub" style="text-align:center">Since ${fmtTime(entry.clock_in)}${entry.in_lat ? ' · 📍 location recorded' : ''}</div>` : ''}
+      ${!entry && shifts.length ? `
+        <label>Clock in for job (optional)</label>
+        <select id="clock-shift">
+          <option value="">General work</option>
+          ${shifts.map((s) => `<option value="${s.id}">${esc(s.title)} (${fmtTime(s.starts_at)})</option>`).join('')}
+        </select>` : ''}
+      <button class="btn ${entry ? 'danger' : ''}" id="clock-btn" style="margin-top:16px">
+        ${entry ? 'Clock out' : 'Clock in'}
+      </button>
+      <p class="hint" style="text-align:center">Your location is recorded at punch time if you allow it.</p>
+    </div>
+
+    <div class="section-title">This week · ${fmtDur(weekMs)} total</div>
+    ${weekAgoEntries.length ? weekAgoEntries.map((e) => `
+      <div class="card row">
+        <span class="grow">
+          <div style="font-weight:700">${fmtDay(e.clock_in)}</div>
+          <div class="sub">${fmtTime(e.clock_in)} – ${e.clock_out ? fmtTime(e.clock_out) : 'now'}${e.shift_title ? ` · ${esc(e.shift_title)}` : ''}</div>
+        </span>
+        <span style="font-weight:700">${fmtDur((e.clock_out ? new Date(e.clock_out) : new Date()) - new Date(e.clock_in))}</span>
+        ${e.approved ? '<span title="Approved">✅</span>' : ''}
+      </div>`).join('') : '<div class="empty"><div class="big">⏱️</div>No punches yet this week</div>'}
+    ${state.me.role === 'admin' ? `<button class="btn secondary" id="goto-timesheets" style="margin-top:8px">Open timesheets & payroll →</button>` : ''}
+  `);
+
+  if (entry) {
+    state.timer = setInterval(() => {
+      const el = document.getElementById('clock-timer');
+      if (el) el.textContent = fmtDur(Date.now() - new Date(entry.clock_in));
+      else clearInterval(state.timer);
+    }, 30000);
+  }
+  document.getElementById('clock-btn').onclick = async (e) => {
+    e.target.disabled = true;
+    const loc = await getLocation();
+    try {
+      if (entry) {
+        await api('/api/time/clock-out', { method: 'POST', body: loc });
+        toast('Clocked out 👋');
+      } else {
+        const shiftSel = document.getElementById('clock-shift');
+        await api('/api/time/clock-in', { method: 'POST', body: { ...loc, shift_id: shiftSel?.value ? Number(shiftSel.value) : null } });
+        toast('Clocked in ✅');
+      }
+    } catch (err) { toast(err.message); }
+    render();
+  };
+  const ts = document.getElementById('goto-timesheets');
+  if (ts) ts.onclick = () => { location.hash = '#/timesheets'; };
+}
+
+/* -------------------------------- timesheets -------------------------------- */
+
+function tsRange() {
+  const from = new Date(state.tsWeekStart);
+  const to = new Date(state.tsWeekStart); to.setDate(to.getDate() + 7);
+  return { from, to };
+}
+
+async function renderTimesheets() {
+  if (state.me.role !== 'admin') { location.hash = '#/clock'; return; }
+  state.tsWeekStart ||= startOfWeek(new Date());
+  const { from, to } = tsRange();
+  const { entries } = await api(`/api/time/entries?from=${from.toISOString()}&to=${to.toISOString()}`);
+
+  const byUser = new Map();
+  for (const e of entries) {
+    const u = byUser.get(e.user_id) || { name: e.user_name, color: e.user_color, rate: e.hourly_rate || 0, ms: 0, entries: [] };
+    u.ms += (e.clock_out ? new Date(e.clock_out) : new Date()) - new Date(e.clock_in);
+    u.entries.push(e);
+    byUser.set(e.user_id, u);
+  }
+
+  const rangeLabel = `${from.toLocaleDateString([], { month: 'short', day: 'numeric' })} – ${new Date(to - 1).toLocaleDateString([], { month: 'short', day: 'numeric' })}`;
+
+  shell('Timesheets', `
+    <div class="week-nav">
+      <button class="icon-btn" id="ts-prev">‹</button>
+      <div class="range">${rangeLabel}</div>
+      <button class="icon-btn" id="ts-next">›</button>
+    </div>
+    ${byUser.size ? [...byUser.entries()].map(([uid, u]) => `
+      <div class="card">
+        <div class="row" style="margin-bottom:${u.entries.length ? '10px' : '0'}">
+          <span class="avatar lg" style="background:${esc(u.color)}">${esc(initials(u.name))}</span>
+          <span class="grow">
+            <div style="font-weight:700">${esc(u.name)}</div>
+            <div class="sub">${fmtDur(u.ms)} · $${u.rate.toFixed(2)}/h · <b>$${(u.ms / 3600000 * u.rate).toFixed(2)}</b></div>
+          </span>
+        </div>
+        ${u.entries.map((e) => `
+          <div class="row ts-entry" data-entry="${e.id}">
+            <span class="grow sub">${fmtDay(e.clock_in)} · ${fmtTime(e.clock_in)} – ${e.clock_out ? fmtTime(e.clock_out) : 'open'}
+              ${e.shift_title ? `· ${esc(e.shift_title)}` : ''}
+              ${e.in_lat ? `<a href="https://maps.google.com/?q=${e.in_lat},${e.in_lng}" target="_blank" onclick="event.stopPropagation()">📍</a>` : ''}
+            </span>
+            <span style="font-weight:600;font-size:13px">${fmtDur((e.clock_out ? new Date(e.clock_out) : new Date()) - new Date(e.clock_in))}</span>
+            <button class="icon-btn" data-approve="${e.id}" data-approved="${e.approved}" title="${e.approved ? 'Approved — tap to unapprove' : 'Tap to approve'}">${e.approved ? '✅' : '⬜'}</button>
+          </div>`).join('')}
+      </div>`).join('') : '<div class="empty"><div class="big">🧾</div>No time entries this week</div>'}
+    <button class="btn" id="ts-export" style="margin-top:10px">⬇️ Export payroll CSV (${rangeLabel})</button>
+    <p class="hint">Set each person's hourly rate in the Team screen. The CSV includes hours and pay per punch plus per-person totals.</p>
+  `, { back: () => { location.hash = '#/more'; } });
+
+  document.getElementById('ts-prev').onclick = () => { state.tsWeekStart.setDate(state.tsWeekStart.getDate() - 7); render(); };
+  document.getElementById('ts-next').onclick = () => { state.tsWeekStart.setDate(state.tsWeekStart.getDate() + 7); render(); };
+  document.getElementById('ts-export').onclick = () => {
+    window.open(`/api/time/export?from=${from.toISOString()}&to=${to.toISOString()}`, '_blank');
+  };
+  document.querySelectorAll('[data-approve]').forEach((b) => {
+    b.onclick = async (e) => {
+      e.stopPropagation();
+      await api(`/api/time/entries/${b.dataset.approve}`, { method: 'PATCH', body: { approved: b.dataset.approved !== '1' } });
+      render();
+    };
+  });
+  document.querySelectorAll('[data-entry]').forEach((el) => {
+    el.onclick = () => {
+      const entry = entries.find((x) => x.id === Number(el.dataset.entry));
+      openTimeEntryModal(entry);
+    };
+  });
+}
+
+function openTimeEntryModal(entry) {
+  const modal = openModal(`
+    <h3>Edit time entry</h3>
+    <p class="sub">${esc(entry.user_name)}</p>
+    <form id="entry-form">
+      <label>Clock in</label><input name="clock_in" type="datetime-local" required value="${toLocalInput(entry.clock_in)}">
+      <label>Clock out</label><input name="clock_out" type="datetime-local" ${entry.clock_out ? `value="${toLocalInput(entry.clock_out)}"` : ''}>
+      <div class="actions">
+        <button type="button" class="btn danger" id="entry-delete">Delete</button>
+        <button type="submit" class="btn">Save</button>
+      </div>
+    </form>
+  `);
+  modal.querySelector('#entry-delete').onclick = async () => {
+    if (!confirm('Delete this time entry?')) return;
+    await api(`/api/time/entries/${entry.id}`, { method: 'DELETE' });
+    closeModal(); render();
+  };
+  modal.querySelector('#entry-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api(`/api/time/entries/${entry.id}`, {
+        method: 'PATCH',
+        body: {
+          clock_in: new Date(fd.get('clock_in')).toISOString(),
+          clock_out: fd.get('clock_out') ? new Date(fd.get('clock_out')).toISOString() : null,
+          approved: entry.approved,
+        },
+      });
+      closeModal(); render();
+    } catch (err) { toast(err.message); }
+  };
+}
+
+/* --------------------------------- time off --------------------------------- */
+
+const TIMEOFF_ICONS = { vacation: '🏖️', sick: '🤒', personal: '🏠', other: '📅' };
+
+async function renderTimeoff() {
+  const { requests } = await api('/api/timeoff');
+  const isAdmin = state.me.role === 'admin';
+  const pending = requests.filter((r) => r.status === 'pending');
+  const rest = requests.filter((r) => r.status !== 'pending');
+
+  const reqCard = (r) => `
+    <div class="card row">
+      <span style="font-size:26px">${TIMEOFF_ICONS[r.kind] || '📅'}</span>
+      <span class="grow">
+        <div style="font-weight:700">${isAdmin ? esc(r.user_name) + ' · ' : ''}${r.kind}</div>
+        <div class="sub">${r.start_date === r.end_date ? r.start_date : `${r.start_date} → ${r.end_date}`}</div>
+        ${r.note ? `<div class="sub">${esc(r.note)}</div>` : ''}
+      </span>
+      ${r.status === 'pending' && isAdmin ? `
+        <button class="btn small" data-decide="approved" data-id="${r.id}">✓</button>
+        <button class="btn small danger" data-decide="denied" data-id="${r.id}">✗</button>` : `
+        <span class="status-tag ${r.status}">${r.status}</span>`}
+      ${r.status === 'pending' && !isAdmin && r.user_id === state.me.id ? `<button class="icon-btn" data-cancel="${r.id}" title="Cancel request">🗑️</button>` : ''}
+    </div>`;
+
+  shell('Time Off', `
+    ${pending.length ? `<div class="section-title">Pending${isAdmin ? ' approval' : ''}</div>${pending.map(reqCard).join('')}` : ''}
+    <div class="section-title">History</div>
+    ${rest.length ? rest.map(reqCard).join('') : '<div class="empty"><div class="big">🏖️</div>No time-off requests yet</div>'}
+  `, { back: () => { location.hash = '#/more'; }, fab: true });
+
+  document.getElementById('fab').onclick = () => {
+    const today = dateKey(new Date());
+    const modal = openModal(`
+      <h3>Request time off</h3>
+      <form id="timeoff-form">
+        <label>Type</label>
+        <select name="kind">
+          <option value="vacation">🏖️ Vacation</option>
+          <option value="sick">🤒 Sick</option>
+          <option value="personal">🏠 Personal</option>
+          <option value="other">📅 Other</option>
+        </select>
+        <label>First day</label><input name="start_date" type="date" required value="${today}">
+        <label>Last day</label><input name="end_date" type="date" required value="${today}">
+        <label>Note (optional)</label><textarea name="note" rows="2" placeholder="Anything your manager should know…"></textarea>
+        <div class="actions"><button type="submit" class="btn">Send request</button></div>
+      </form>
+    `);
+    modal.querySelector('#timeoff-form').onsubmit = async (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      try {
+        await api('/api/timeoff', { method: 'POST', body: Object.fromEntries(fd.entries()) });
+        closeModal(); toast('Request sent — your manager was notified');
+        render();
+      } catch (err) { toast(err.message); }
+    };
+  };
+  document.querySelectorAll('[data-decide]').forEach((b) => {
+    b.onclick = async () => {
+      await api(`/api/timeoff/${b.dataset.id}/decide`, { method: 'POST', body: { status: b.dataset.decide } });
+      toast(`Request ${b.dataset.decide}`);
+      render();
+    };
+  });
+  document.querySelectorAll('[data-cancel]').forEach((b) => {
+    b.onclick = async () => {
+      await api(`/api/timeoff/${b.dataset.cancel}`, { method: 'DELETE' });
+      render();
+    };
+  });
+}
+
+/* ---------------------------------- tasks ----------------------------------- */
+
+async function renderTasks() {
+  const { tasks } = await api('/api/tasks');
+  const isAdmin = state.me.role === 'admin';
+  const isDone = (t) => t.assignees.length > 0 && t.assignees.every((a) => a.done_at);
+  const open = tasks.filter((t) => !isDone(t));
+  const done = tasks.filter(isDone);
+
+  const taskCard = (t) => {
+    const mine = t.assignees.find((a) => a.id === state.me.id);
+    const overdue = t.due_at && !isDone(t) && new Date(t.due_at) < new Date();
+    return `
+    <div class="card" data-task="${t.id}">
+      <div class="row">
+        ${mine ? `<button class="task-check ${mine.done_at ? 'on' : ''}" data-toggle="${t.id}">${mine.done_at ? '✓' : ''}</button>` : '<span style="width:6px"></span>'}
+        <span class="grow">
+          <div style="font-weight:700;${mine?.done_at ? 'text-decoration:line-through;color:var(--muted)' : ''}">${esc(t.title)}</div>
+          ${t.notes ? `<div class="sub">${esc(t.notes)}</div>` : ''}
+          ${t.due_at ? `<div class="sub" style="${overdue ? 'color:var(--red);font-weight:600' : ''}">Due ${fmtDay(t.due_at)}${overdue ? ' · overdue' : ''}</div>` : ''}
+        </span>
+        ${isAdmin ? `<button class="icon-btn" data-edit-task="${t.id}">✏️</button>` : ''}
+      </div>
+      ${t.assignees.length ? `<div class="shift-people" style="margin-top:8px">
+        ${t.assignees.map((a) => `<span class="chip ${a.done_at ? 'accepted' : 'pending'}">
+          <span class="avatar" style="background:${esc(a.color)}">${esc(initials(a.name))}</span>
+          ${esc(a.name)}<span class="st">${a.done_at ? '✓ Done' : '• Open'}</span></span>`).join('')}
+      </div>` : ''}
+    </div>`;
+  };
+
+  shell('Tasks', `
+    ${open.length ? open.map(taskCard).join('') : '<div class="empty"><div class="big">✅</div>No open tasks</div>'}
+    ${done.length ? `<div class="section-title">Completed</div>${done.map(taskCard).join('')}` : ''}
+  `, { back: () => { location.hash = '#/more'; }, fab: isAdmin });
+
+  if (isAdmin) document.getElementById('fab').onclick = () => openTaskModal();
+  document.querySelectorAll('[data-toggle]').forEach((b) => {
+    b.onclick = async (e) => {
+      e.stopPropagation();
+      await api(`/api/tasks/${b.dataset.toggle}/toggle`, { method: 'POST' });
+      render();
+    };
+  });
+  document.querySelectorAll('[data-edit-task]').forEach((b) => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      openTaskModal(tasks.find((t) => t.id === Number(b.dataset.editTask)));
+    };
+  });
+}
+
+function openTaskModal(task = null) {
+  const selected = new Set(task ? task.assignees.map((a) => a.id) : []);
+  const modal = openModal(`
+    <h3>${task ? 'Edit task' : 'New task'}</h3>
+    <form id="task-form">
+      <label>Task</label><input name="title" required placeholder="e.g. Restock the bar fridge" value="${esc(task?.title || '')}">
+      <label>Details (optional)</label><textarea name="notes" rows="2">${esc(task?.notes || '')}</textarea>
+      <label>Due date (optional)</label><input name="due_at" type="date" value="${task?.due_at ? task.due_at.slice(0, 10) : ''}">
+      <label>Assign to</label>
+      <div class="assignee-list">
+        ${state.users.map((u) => `
+          <button type="button" class="opt ${selected.has(u.id) ? 'on' : ''}" data-user="${u.id}">
+            <span class="avatar" style="background:${esc(u.color)}">${esc(initials(u.name))}</span>
+            ${esc(u.name)}<span class="check">✓</span>
+          </button>`).join('')}
+      </div>
+      <div class="actions">
+        ${task ? '<button type="button" class="btn danger" id="task-delete">Delete</button>' : ''}
+        <button type="submit" class="btn">${task ? 'Save' : 'Create task'}</button>
+      </div>
+    </form>
+  `);
+  modal.querySelectorAll('[data-user]').forEach((b) => {
+    b.onclick = () => {
+      const id = Number(b.dataset.user);
+      selected.has(id) ? selected.delete(id) : selected.add(id);
+      b.classList.toggle('on');
+    };
+  });
+  const del = modal.querySelector('#task-delete');
+  if (del) del.onclick = async () => {
+    if (!confirm('Delete this task?')) return;
+    await api(`/api/tasks/${task.id}`, { method: 'DELETE' });
+    closeModal(); render();
+  };
+  modal.querySelector('#task-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const body = {
+      title: fd.get('title'),
+      notes: fd.get('notes') || '',
+      due_at: fd.get('due_at') ? `${fd.get('due_at')}T23:59:00.000Z` : null,
+      assignee_ids: [...selected],
+    };
+    try {
+      await api(task ? `/api/tasks/${task.id}` : '/api/tasks', { method: task ? 'PATCH' : 'POST', body });
+      closeModal(); toast(task ? 'Task updated' : 'Task created — assignees notified');
+      render();
+    } catch (err) { toast(err.message); }
+  };
+}
+
+/* ---------------------------------- forms ----------------------------------- */
+
+async function renderForms() {
+  const { forms } = await api('/api/forms');
+  const isAdmin = state.me.role === 'admin';
+  shell('Forms', `
+    ${forms.length ? forms.map((f) => `
+      <div class="card">
+        <div class="row">
+          <span class="venue-icon" style="background:var(--brand)">📋</span>
+          <span class="grow">
+            <div style="font-weight:700">${esc(f.title)}</div>
+            ${f.description ? `<div class="sub">${esc(f.description)}</div>` : ''}
+            <div class="sub">${f.fields.length} question${f.fields.length === 1 ? '' : 's'}${f.my_submissions ? ` · you submitted ${f.my_submissions}×` : ''}${isAdmin ? ` · ${f.total_submissions} total submissions` : ''}</div>
+          </span>
+        </div>
+        <div class="shift-actions">
+          <button class="btn small" data-fill="${f.id}">Fill in</button>
+          <button class="btn small secondary" data-subs="${f.id}">${isAdmin ? 'Submissions' : 'My submissions'}</button>
+          ${isAdmin ? `<button class="btn small danger" data-del-form="${f.id}">Delete</button>` : ''}
+        </div>
+      </div>`).join('') : `<div class="empty"><div class="big">📋</div>No forms yet${isAdmin ? '<br>Tap ＋ to build one (checklists, incident reports, inspections…)' : ''}</div>`}
+  `, { back: () => { location.hash = '#/more'; }, fab: isAdmin });
+
+  if (isAdmin) document.getElementById('fab').onclick = openFormBuilder;
+  document.querySelectorAll('[data-fill]').forEach((b) => {
+    b.onclick = () => openFormFill(forms.find((f) => f.id === Number(b.dataset.fill)));
+  });
+  document.querySelectorAll('[data-subs]').forEach((b) => {
+    b.onclick = () => openSubmissions(Number(b.dataset.subs));
+  });
+  document.querySelectorAll('[data-del-form]').forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm('Delete this form? Past submissions are kept but hidden.')) return;
+      await api(`/api/forms/${b.dataset.delForm}`, { method: 'DELETE' });
+      render();
+    };
+  });
+}
+
+function openFormFill(form) {
+  const modal = openModal(`
+    <h3>${esc(form.title)}</h3>
+    ${form.description ? `<p class="sub">${esc(form.description)}</p>` : ''}
+    <form id="fill-form">
+      ${form.fields.map((f) => {
+        const req = f.required ? 'required' : '';
+        if (f.type === 'checkbox') return `<label class="check-label"><input type="checkbox" name="f${f.id}" style="width:auto"> ${esc(f.label)}${f.required ? ' *' : ''}</label>`;
+        const label = `<label>${esc(f.label)}${f.required ? ' *' : ''}</label>`;
+        if (f.type === 'textarea') return `${label}<textarea name="f${f.id}" rows="3" ${req}></textarea>`;
+        if (f.type === 'select') return `${label}<select name="f${f.id}" ${req}><option value="">Choose…</option>${(f.options || []).map((o) => `<option>${esc(o)}</option>`).join('')}</select>`;
+        return `${label}<input name="f${f.id}" type="${f.type}" ${req}>`;
+      }).join('')}
+      <div class="actions"><button type="submit" class="btn">Submit</button></div>
+    </form>
+  `);
+  modal.querySelector('#fill-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const answers = {};
+    for (const f of form.fields) {
+      const el = e.target.elements[`f${f.id}`];
+      answers[f.id] = f.type === 'checkbox' ? el.checked : el.value;
+    }
+    try {
+      await api(`/api/forms/${form.id}/submit`, { method: 'POST', body: { answers } });
+      closeModal(); toast('Submitted ✅');
+      render();
+    } catch (err) { toast(err.message); }
+  };
+}
+
+async function openSubmissions(formId) {
+  const { form, submissions } = await api(`/api/forms/${formId}/submissions`);
+  openModal(`
+    <h3>${esc(form.title)} — submissions</h3>
+    ${submissions.length ? submissions.map((s) => `
+      <div class="card" style="box-shadow:none;border:1px solid var(--line)">
+        <div class="row" style="margin-bottom:6px">
+          <span class="avatar" style="background:${esc(s.user_color || '#888')}">${esc(initials(s.user_name || '?'))}</span>
+          <b>${esc(s.user_name || 'Removed user')}</b>
+          <span class="sub" style="margin-left:auto">${fmtWhen(s.created_at)}</span>
+        </div>
+        ${form.fields.map((f) => `<div class="sub" style="margin:3px 0"><b>${esc(f.label)}:</b> ${f.type === 'checkbox' ? (s.answers[f.id] ? '✅ yes' : '⬜ no') : esc(s.answers[f.id] || '—')}</div>`).join('')}
+      </div>`).join('') : '<p class="sub" style="margin-top:10px">No submissions yet.</p>'}
+    <div class="actions"><button class="btn secondary" onclick="document.querySelector('.modal-backdrop').remove()">Close</button></div>
+  `);
+}
+
+function openFormBuilder() {
+  const fields = [];
+  const modal = openModal(`
+    <h3>New form</h3>
+    <form id="form-builder">
+      <label>Form title</label><input name="title" required placeholder="e.g. End-of-shift checklist">
+      <label>Description (optional)</label><input name="description" placeholder="Shown to the team above the questions">
+      <label>Questions</label>
+      <div id="fields-list"></div>
+      <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+        <button type="button" class="btn small secondary" data-add="text">+ Text</button>
+        <button type="button" class="btn small secondary" data-add="textarea">+ Paragraph</button>
+        <button type="button" class="btn small secondary" data-add="checkbox">+ Checkbox</button>
+        <button type="button" class="btn small secondary" data-add="select">+ Dropdown</button>
+        <button type="button" class="btn small secondary" data-add="number">+ Number</button>
+        <button type="button" class="btn small secondary" data-add="date">+ Date</button>
+      </div>
+      <div class="actions"><button type="submit" class="btn">Create form</button></div>
+    </form>
+  `);
+  const list = modal.querySelector('#fields-list');
+  const typeNames = { text: 'Text', textarea: 'Paragraph', checkbox: 'Checkbox', select: 'Dropdown', number: 'Number', date: 'Date' };
+
+  function redraw() {
+    list.innerHTML = fields.map((f, i) => `
+      <div class="builder-field">
+        <div class="row">
+          <span class="role-tag">${typeNames[f.type]}</span>
+          <input data-label="${i}" placeholder="Question label" value="${esc(f.label)}" style="flex:1">
+          <button type="button" class="icon-btn" data-remove="${i}">🗑️</button>
+        </div>
+        ${f.type === 'select' ? `<input data-options="${i}" placeholder="Options, comma separated" value="${esc((f.options || []).join(', '))}" style="margin-top:6px">` : ''}
+        <label class="check-label" style="margin-top:6px;font-weight:400"><input type="checkbox" data-required="${i}" ${f.required ? 'checked' : ''} style="width:auto"> Required</label>
+      </div>`).join('') || '<p class="sub">Add at least one question below.</p>';
+    list.querySelectorAll('[data-label]').forEach((el) => { el.oninput = () => { fields[el.dataset.label].label = el.value; }; });
+    list.querySelectorAll('[data-options]').forEach((el) => { el.oninput = () => { fields[el.dataset.options].options = el.value.split(',').map((s) => s.trim()).filter(Boolean); }; });
+    list.querySelectorAll('[data-required]').forEach((el) => { el.onchange = () => { fields[el.dataset.required].required = el.checked; }; });
+    list.querySelectorAll('[data-remove]').forEach((el) => { el.onclick = () => { fields.splice(Number(el.dataset.remove), 1); redraw(); }; });
+  }
+  redraw();
+  modal.querySelectorAll('[data-add]').forEach((b) => {
+    b.onclick = () => { fields.push({ type: b.dataset.add, label: '', required: false, options: [] }); redraw(); };
+  });
+  modal.querySelector('#form-builder').onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api('/api/forms', {
+        method: 'POST',
+        body: { title: fd.get('title'), description: fd.get('description') || '', fields },
+      });
+      closeModal(); toast('Form published — team notified');
+      render();
+    } catch (err) { toast(err.message); }
+  };
+}
+
+/* ------------------------------- updates feed ------------------------------- */
+
+async function renderUpdates() {
+  const { posts } = await api('/api/posts');
+  const isAdmin = state.me.role === 'admin';
+  shell('Updates', `
+    ${posts.length ? posts.map((p) => `
+      <div class="card">
+        <div class="row" style="margin-bottom:8px">
+          <span class="avatar lg" style="background:${esc(p.user_color || '#888')}">${esc(initials(p.user_name || '?'))}</span>
+          <span class="grow">
+            <div style="font-weight:700">${esc(p.user_name || 'Removed user')}</div>
+            <div class="sub">${fmtWhen(p.created_at)}</div>
+          </span>
+          ${isAdmin ? `<button class="icon-btn" data-del-post="${p.id}">🗑️</button>` : ''}
+        </div>
+        ${p.title ? `<div style="font-weight:700;font-size:16px;margin-bottom:4px">${esc(p.title)}</div>` : ''}
+        <div style="white-space:pre-wrap">${esc(p.body)}</div>
+        <button class="like-btn ${p.liked ? 'on' : ''}" data-like="${p.id}">👍 ${p.likes || ''}</button>
+      </div>`).join('') : `<div class="empty"><div class="big">📢</div>No updates yet${isAdmin ? '<br>Tap ＋ to post a company update' : ''}</div>`}
+  `, { fab: isAdmin });
+
+  if (isAdmin) {
+    document.getElementById('fab').onclick = () => {
+      const modal = openModal(`
+        <h3>New update</h3>
+        <form id="post-form">
+          <label>Title (optional)</label><input name="title" placeholder="e.g. Schedule for the holiday weekend">
+          <label>Message</label><textarea name="body" rows="5" required placeholder="Everyone gets a notification on their phone…"></textarea>
+          <div class="actions"><button type="submit" class="btn">Post & notify team</button></div>
+        </form>
+      `);
+      modal.querySelector('#post-form').onsubmit = async (e) => {
+        e.preventDefault();
+        const fd = new FormData(e.target);
+        await api('/api/posts', { method: 'POST', body: { title: fd.get('title') || '', body: fd.get('body') } });
+        closeModal(); toast('Posted — team notified');
+        render();
+      };
+    };
+    document.querySelectorAll('[data-del-post]').forEach((b) => {
+      b.onclick = async () => {
+        if (!confirm('Delete this update?')) return;
+        await api(`/api/posts/${b.dataset.delPost}`, { method: 'DELETE' });
+        render();
+      };
+    });
+  }
+  document.querySelectorAll('[data-like]').forEach((b) => {
+    b.onclick = async () => { await api(`/api/posts/${b.dataset.like}/like`, { method: 'POST' }); render(); };
+  });
+}
+
+/* ---------------------------------- more hub --------------------------------- */
+
+function renderMore() {
+  const isAdmin = state.me.role === 'admin';
+  const items = [
+    { href: '#/tasks', icon: '✅', label: 'Tasks', sub: 'To-dos for the team' },
+    { href: '#/timeoff', icon: '🏖️', label: 'Time Off', sub: 'Requests & approvals' },
+    { href: '#/forms', icon: '📋', label: 'Forms', sub: 'Checklists & reports' },
+    ...(isAdmin ? [{ href: '#/timesheets', icon: '🧾', label: 'Timesheets', sub: 'Hours, approval & payroll CSV' }] : []),
+    { href: '#/venues', icon: '📍', label: 'Venues', sub: 'Work locations' },
+    { href: '#/team', icon: '👥', label: 'Team', sub: 'People & roles' },
+    { href: '#/notifications', icon: '🔔', label: 'Notifications', sub: 'Your activity feed' },
+    { href: '#/settings', icon: '⚙️', label: 'Settings', sub: 'Notifications & account' },
+  ];
+  shell('More', `
+    <div class="card row" style="margin-bottom:16px">
+      <span class="avatar lg" style="background:${esc(state.me.color)}">${esc(initials(state.me.name))}</span>
+      <span class="grow">
+        <div style="font-weight:700">${esc(state.me.name)}</div>
+        <div class="sub">${esc(state.me.email)}</div>
+      </span>
+      <span class="role-tag">${state.me.role}</span>
+    </div>
+    ${items.map((i) => `
+      <button class="channel-row" data-href="${i.href}">
+        <span class="venue-icon" style="background:var(--brand-soft);color:var(--text);font-size:20px">${i.icon}</span>
+        <span class="info"><div class="name">${i.label}</div><div class="preview">${i.sub}</div></span>
+        <span class="sub">›</span>
+      </button>`).join('')}
+  `);
+  document.querySelectorAll('[data-href]').forEach((b) => {
+    b.onclick = () => { location.hash = b.dataset.href; };
+  });
+}
+
 /* --------------------------------- render ---------------------------------- */
 
 async function render() {
   if (!state.me) return renderAuth();
+  clearInterval(state.timer);
   const { view, arg } = route();
   try {
     if (view === 'schedule') renderSchedule();
     else if (view === 'chat' && arg) await renderChat(arg);
     else if (view === 'chat') await renderChatList();
+    else if (view === 'clock') await renderClock();
+    else if (view === 'timesheets') await renderTimesheets();
+    else if (view === 'timeoff') await renderTimeoff();
+    else if (view === 'tasks') await renderTasks();
+    else if (view === 'forms') await renderForms();
+    else if (view === 'updates') await renderUpdates();
+    else if (view === 'more') renderMore();
     else if (view === 'venues') renderVenues();
     else if (view === 'team') renderTeam();
     else if (view === 'notifications') await renderNotifications();

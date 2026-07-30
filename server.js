@@ -74,15 +74,22 @@ app.get('/api/me', requireAuth, (req, res) => {
 /* ---------------------------------- team ---------------------------------- */
 
 app.get('/api/users', requireAuth, (req, res) => {
-  res.json({ users: db.prepare('SELECT id, name, email, role, color FROM users ORDER BY name').all() });
+  const cols = req.user.role === 'admin'
+    ? 'id, name, email, role, color, hourly_rate'
+    : 'id, name, email, role, color';
+  res.json({ users: db.prepare(`SELECT ${cols} FROM users ORDER BY name`).all() });
 });
 
 app.patch('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
-  const { role } = req.body || {};
+  const target = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.id));
+  if (!target) return res.status(404).json({ error: 'User not found' });
+  const { role = target.role, hourly_rate = target.hourly_rate } = req.body || {};
   if (!['admin', 'member'].includes(role)) return res.status(400).json({ error: 'Invalid role' });
-  const target = Number(req.params.id);
-  if (target === req.user.id) return res.status(400).json({ error: 'You cannot change your own role' });
-  db.prepare('UPDATE users SET role = ? WHERE id = ?').run(role, target);
+  if (role !== target.role && target.id === req.user.id) {
+    return res.status(400).json({ error: 'You cannot change your own role' });
+  }
+  const rate = Math.max(0, Number(hourly_rate) || 0);
+  db.prepare('UPDATE users SET role = ?, hourly_rate = ? WHERE id = ?').run(role, rate, target.id);
   res.json({ ok: true });
 });
 
@@ -423,6 +430,380 @@ app.get('/api/events', (req, res) => {
   events.addClient(userId, res);
   const heartbeat = setInterval(() => res.write(': ping\n\n'), 25000);
   res.on('close', () => clearInterval(heartbeat));
+});
+
+/* -------------------------------- time clock -------------------------------- */
+
+const TIME_ENTRY_QUERY = `
+  SELECT t.*, u.name AS user_name, u.color AS user_color, u.hourly_rate,
+         s.title AS shift_title
+  FROM time_entries t
+  JOIN users u ON u.id = t.user_id
+  LEFT JOIN shifts s ON s.id = t.shift_id
+`;
+
+app.get('/api/time/status', requireAuth, (req, res) => {
+  const entry = db.prepare(TIME_ENTRY_QUERY + ' WHERE t.user_id = ? AND t.clock_out IS NULL').get(req.user.id);
+  res.json({ entry: entry || null });
+});
+
+app.post('/api/time/clock-in', requireAuth, (req, res) => {
+  const open = db.prepare('SELECT id FROM time_entries WHERE user_id = ? AND clock_out IS NULL').get(req.user.id);
+  if (open) return res.status(400).json({ error: 'You are already clocked in' });
+  const { lat = null, lng = null, shift_id = null, note = '' } = req.body || {};
+  const info = db.prepare(
+    'INSERT INTO time_entries (user_id, shift_id, clock_in, in_lat, in_lng, note) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(req.user.id, shift_id || null, new Date().toISOString(), lat, lng, String(note).slice(0, 500));
+  events.broadcast('time', {});
+  res.json({ entry: db.prepare(TIME_ENTRY_QUERY + ' WHERE t.id = ?').get(Number(info.lastInsertRowid)) });
+});
+
+app.post('/api/time/clock-out', requireAuth, (req, res) => {
+  const open = db.prepare('SELECT * FROM time_entries WHERE user_id = ? AND clock_out IS NULL').get(req.user.id);
+  if (!open) return res.status(400).json({ error: 'You are not clocked in' });
+  const { lat = null, lng = null } = req.body || {};
+  db.prepare('UPDATE time_entries SET clock_out = ?, out_lat = ?, out_lng = ? WHERE id = ?')
+    .run(new Date().toISOString(), lat, lng, open.id);
+  events.broadcast('time', {});
+  res.json({ entry: db.prepare(TIME_ENTRY_QUERY + ' WHERE t.id = ?').get(open.id) });
+});
+
+// Members see their own entries; admins see everyone's (optionally one user).
+app.get('/api/time/entries', requireAuth, (req, res) => {
+  const { from, to, user_id } = req.query;
+  let sql = TIME_ENTRY_QUERY + ' WHERE 1=1';
+  const params = [];
+  if (req.user.role !== 'admin') { sql += ' AND t.user_id = ?'; params.push(req.user.id); }
+  else if (user_id) { sql += ' AND t.user_id = ?'; params.push(Number(user_id)); }
+  if (from) { sql += ' AND t.clock_in >= ?'; params.push(from); }
+  if (to) { sql += ' AND t.clock_in < ?'; params.push(to); }
+  sql += ' ORDER BY t.clock_in DESC LIMIT 500';
+  const entries = db.prepare(sql).all(...params);
+  if (req.user.role !== 'admin') for (const e of entries) delete e.hourly_rate;
+  res.json({ entries });
+});
+
+app.patch('/api/time/entries/:id', requireAuth, requireAdmin, (req, res) => {
+  const entry = db.prepare('SELECT * FROM time_entries WHERE id = ?').get(Number(req.params.id));
+  if (!entry) return res.status(404).json({ error: 'Entry not found' });
+  const { clock_in = entry.clock_in, clock_out = entry.clock_out, approved = entry.approved } = req.body || {};
+  if (clock_out && new Date(clock_out) <= new Date(clock_in)) {
+    return res.status(400).json({ error: 'Clock-out must be after clock-in' });
+  }
+  db.prepare('UPDATE time_entries SET clock_in = ?, clock_out = ?, approved = ? WHERE id = ?')
+    .run(clock_in, clock_out, approved ? 1 : 0, entry.id);
+  events.broadcast('time', {});
+  res.json({ ok: true });
+});
+
+app.delete('/api/time/entries/:id', requireAuth, requireAdmin, (req, res) => {
+  db.prepare('DELETE FROM time_entries WHERE id = ?').run(Number(req.params.id));
+  events.broadcast('time', {});
+  res.json({ ok: true });
+});
+
+// Payroll CSV export: one row per entry with hours and computed pay.
+app.get('/api/time/export', requireAuth, requireAdmin, (req, res) => {
+  const { from = '1970-01-01', to = '9999-12-31' } = req.query;
+  const entries = db.prepare(
+    TIME_ENTRY_QUERY + ' WHERE t.clock_in >= ? AND t.clock_in < ? AND t.clock_out IS NOT NULL ORDER BY u.name, t.clock_in'
+  ).all(from, to);
+  const csvEsc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const rows = [['Employee', 'Email', 'Clock in', 'Clock out', 'Hours', 'Hourly rate', 'Pay', 'Job', 'Approved']];
+  const totals = new Map();
+  for (const e of entries) {
+    const hours = (new Date(e.clock_out) - new Date(e.clock_in)) / 3600000;
+    const pay = hours * (e.hourly_rate || 0);
+    const email = db.prepare('SELECT email FROM users WHERE id = ?').get(e.user_id)?.email || '';
+    rows.push([e.user_name, email, e.clock_in, e.clock_out, hours.toFixed(2), (e.hourly_rate || 0).toFixed(2), pay.toFixed(2), e.shift_title || '', e.approved ? 'yes' : 'no']);
+    const t = totals.get(e.user_name) || { hours: 0, pay: 0 };
+    t.hours += hours; t.pay += pay;
+    totals.set(e.user_name, t);
+  }
+  rows.push([]);
+  rows.push(['TOTALS']);
+  for (const [name, t] of totals) rows.push([name, '', '', '', t.hours.toFixed(2), '', t.pay.toFixed(2)]);
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', `attachment; filename="timesheet-${from.slice(0, 10)}-to-${to.slice(0, 10)}.csv"`);
+  res.send(rows.map((r) => r.map(csvEsc).join(',')).join('\n'));
+});
+
+/* --------------------------------- time off --------------------------------- */
+
+const TIMEOFF_QUERY = `
+  SELECT r.*, u.name AS user_name, u.color AS user_color
+  FROM timeoff_requests r JOIN users u ON u.id = r.user_id
+`;
+
+app.get('/api/timeoff', requireAuth, (req, res) => {
+  const requests = req.user.role === 'admin'
+    ? db.prepare(TIMEOFF_QUERY + ' ORDER BY r.id DESC LIMIT 200').all()
+    : db.prepare(TIMEOFF_QUERY + ' WHERE r.user_id = ? ORDER BY r.id DESC LIMIT 200').all(req.user.id);
+  res.json({ requests });
+});
+
+app.post('/api/timeoff', requireAuth, (req, res) => {
+  const { start_date, end_date, kind = 'vacation', note = '' } = req.body || {};
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(start_date || '') || !/^\d{4}-\d{2}-\d{2}$/.test(end_date || '') || end_date < start_date) {
+    return res.status(400).json({ error: 'Valid start and end dates are required' });
+  }
+  if (!['vacation', 'sick', 'personal', 'other'].includes(kind)) return res.status(400).json({ error: 'Invalid type' });
+  const info = db.prepare('INSERT INTO timeoff_requests (user_id, start_date, end_date, kind, note) VALUES (?, ?, ?, ?, ?)')
+    .run(req.user.id, start_date, end_date, kind, String(note).slice(0, 500));
+  events.broadcast('timeoff', {});
+  const admins = db.prepare(`SELECT id FROM users WHERE role = 'admin'`).all().map((r) => r.id);
+  notify(admins.filter((id) => id !== req.user.id), {
+    title: `Time-off request from ${req.user.name}`,
+    body: `${kind} · ${start_date} → ${end_date}`,
+    url: '/#/timeoff',
+  });
+  res.json({ request: db.prepare(TIMEOFF_QUERY + ' WHERE r.id = ?').get(Number(info.lastInsertRowid)) });
+});
+
+app.post('/api/timeoff/:id/decide', requireAuth, requireAdmin, (req, res) => {
+  const { status } = req.body || {};
+  if (!['approved', 'denied'].includes(status)) return res.status(400).json({ error: 'Invalid decision' });
+  const request = db.prepare('SELECT * FROM timeoff_requests WHERE id = ?').get(Number(req.params.id));
+  if (!request) return res.status(404).json({ error: 'Request not found' });
+  db.prepare('UPDATE timeoff_requests SET status = ?, decided_by = ? WHERE id = ?').run(status, req.user.id, request.id);
+  events.broadcast('timeoff', {});
+  notify([request.user_id].filter((id) => id !== req.user.id), {
+    title: `Time off ${status}`,
+    body: `${request.kind} · ${request.start_date} → ${request.end_date}`,
+    url: '/#/timeoff',
+  });
+  res.json({ ok: true });
+});
+
+app.delete('/api/timeoff/:id', requireAuth, (req, res) => {
+  const request = db.prepare('SELECT * FROM timeoff_requests WHERE id = ?').get(Number(req.params.id));
+  if (!request) return res.status(404).json({ error: 'Request not found' });
+  if (request.user_id !== req.user.id && req.user.role !== 'admin') return res.status(403).json({ error: 'Not allowed' });
+  db.prepare('DELETE FROM timeoff_requests WHERE id = ?').run(request.id);
+  events.broadcast('timeoff', {});
+  res.json({ ok: true });
+});
+
+/* ---------------------------------- tasks ----------------------------------- */
+
+function taskWithAssignees(task) {
+  const assignees = db.prepare(`
+    SELECT u.id, u.name, u.color, a.done_at
+    FROM task_assignees a JOIN users u ON u.id = a.user_id
+    WHERE a.task_id = ? ORDER BY u.name
+  `).all(task.id);
+  return { ...task, assignees };
+}
+
+app.get('/api/tasks', requireAuth, (req, res) => {
+  const tasks = (req.user.role === 'admin'
+    ? db.prepare('SELECT * FROM tasks ORDER BY due_at IS NULL, due_at, id DESC LIMIT 300').all()
+    : db.prepare(`
+        SELECT t.* FROM tasks t JOIN task_assignees a ON a.task_id = t.id
+        WHERE a.user_id = ? ORDER BY t.due_at IS NULL, t.due_at, t.id DESC LIMIT 300
+      `).all(req.user.id)
+  ).map(taskWithAssignees);
+  res.json({ tasks });
+});
+
+app.post('/api/tasks', requireAuth, requireAdmin, (req, res) => {
+  const { title, notes = '', due_at = null, assignee_ids = [] } = req.body || {};
+  if (!title?.trim()) return res.status(400).json({ error: 'Task title is required' });
+  const info = db.prepare('INSERT INTO tasks (title, notes, due_at, created_by) VALUES (?, ?, ?, ?)')
+    .run(title.trim(), String(notes).trim(), due_at, req.user.id);
+  const taskId = Number(info.lastInsertRowid);
+  const add = db.prepare('INSERT OR IGNORE INTO task_assignees (task_id, user_id) VALUES (?, ?)');
+  for (const uid of assignee_ids) add.run(taskId, uid);
+  events.broadcast('tasks', {});
+  notify(assignee_ids.filter((id) => id !== req.user.id), {
+    title: `New task: ${title.trim()}`,
+    body: due_at ? `Due ${new Date(due_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: process.env.APP_TZ || 'America/New_York' })}` : '',
+    url: '/#/tasks',
+  });
+  res.json({ task: taskWithAssignees(db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId)) });
+});
+
+app.patch('/api/tasks/:id', requireAuth, requireAdmin, (req, res) => {
+  const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(Number(req.params.id));
+  if (!task) return res.status(404).json({ error: 'Task not found' });
+  const { title = task.title, notes = task.notes, due_at = task.due_at, assignee_ids } = req.body || {};
+  if (!title?.trim()) return res.status(400).json({ error: 'Task title is required' });
+  db.prepare('UPDATE tasks SET title = ?, notes = ?, due_at = ? WHERE id = ?')
+    .run(title.trim(), String(notes).trim(), due_at, task.id);
+  if (Array.isArray(assignee_ids)) {
+    const before = db.prepare('SELECT user_id FROM task_assignees WHERE task_id = ?').all(task.id).map((r) => r.user_id);
+    db.prepare('DELETE FROM task_assignees WHERE task_id = ?').run(task.id);
+    const add = db.prepare('INSERT OR IGNORE INTO task_assignees (task_id, user_id) VALUES (?, ?)');
+    for (const uid of assignee_ids) add.run(task.id, uid);
+    notify(assignee_ids.filter((id) => !before.includes(id) && id !== req.user.id), {
+      title: `New task: ${title.trim()}`,
+      url: '/#/tasks',
+    });
+  }
+  events.broadcast('tasks', {});
+  res.json({ ok: true });
+});
+
+app.delete('/api/tasks/:id', requireAuth, requireAdmin, (req, res) => {
+  db.prepare('DELETE FROM tasks WHERE id = ?').run(Number(req.params.id));
+  events.broadcast('tasks', {});
+  res.json({ ok: true });
+});
+
+app.post('/api/tasks/:id/toggle', requireAuth, (req, res) => {
+  const taskId = Number(req.params.id);
+  const row = db.prepare('SELECT * FROM task_assignees WHERE task_id = ? AND user_id = ?').get(taskId, req.user.id);
+  if (!row) return res.status(404).json({ error: 'You are not assigned to this task' });
+  const done = !row.done_at;
+  db.prepare('UPDATE task_assignees SET done_at = ? WHERE task_id = ? AND user_id = ?')
+    .run(done ? new Date().toISOString() : null, taskId, req.user.id);
+  events.broadcast('tasks', {});
+  if (done) {
+    const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId);
+    const admins = db.prepare(`SELECT id FROM users WHERE role = 'admin'`).all().map((r) => r.id);
+    notify(admins.filter((id) => id !== req.user.id), {
+      title: `${req.user.name} completed a task`,
+      body: task.title,
+      url: '/#/tasks',
+    });
+  }
+  res.json({ ok: true });
+});
+
+/* ---------------------------------- forms ----------------------------------- */
+
+const FIELD_TYPES = ['text', 'textarea', 'number', 'date', 'checkbox', 'select'];
+
+function sanitizeFields(fields) {
+  if (!Array.isArray(fields)) return null;
+  const out = [];
+  for (const f of fields.slice(0, 30)) {
+    if (!f || typeof f.label !== 'string' || !f.label.trim()) return null;
+    if (!FIELD_TYPES.includes(f.type)) return null;
+    out.push({
+      id: out.length + 1,
+      label: f.label.trim().slice(0, 200),
+      type: f.type,
+      required: !!f.required,
+      options: f.type === 'select' ? (Array.isArray(f.options) ? f.options.map(String).filter(Boolean).slice(0, 30) : []) : undefined,
+    });
+  }
+  return out.length ? out : null;
+}
+
+app.get('/api/forms', requireAuth, (req, res) => {
+  const forms = db.prepare('SELECT * FROM forms WHERE archived = 0 ORDER BY id DESC').all()
+    .map((f) => ({
+      ...f,
+      fields: JSON.parse(f.fields),
+      my_submissions: db.prepare('SELECT COUNT(*) AS n FROM form_submissions WHERE form_id = ? AND user_id = ?').get(f.id, req.user.id).n,
+      total_submissions: req.user.role === 'admin'
+        ? db.prepare('SELECT COUNT(*) AS n FROM form_submissions WHERE form_id = ?').get(f.id).n
+        : undefined,
+    }));
+  res.json({ forms });
+});
+
+app.post('/api/forms', requireAuth, requireAdmin, (req, res) => {
+  const { title, description = '', fields } = req.body || {};
+  if (!title?.trim()) return res.status(400).json({ error: 'Form title is required' });
+  const clean = sanitizeFields(fields);
+  if (!clean) return res.status(400).json({ error: 'The form needs at least one valid field' });
+  const info = db.prepare('INSERT INTO forms (title, description, fields, created_by) VALUES (?, ?, ?, ?)')
+    .run(title.trim(), String(description).trim(), JSON.stringify(clean), req.user.id);
+  events.broadcast('forms', {});
+  const members = db.prepare('SELECT id FROM users WHERE id != ?').all(req.user.id).map((r) => r.id);
+  notify(members, { title: `New form: ${title.trim()}`, body: 'Tap to fill it in', url: '/#/forms' });
+  res.json({ form: db.prepare('SELECT * FROM forms WHERE id = ?').get(Number(info.lastInsertRowid)) });
+});
+
+app.delete('/api/forms/:id', requireAuth, requireAdmin, (req, res) => {
+  db.prepare('UPDATE forms SET archived = 1 WHERE id = ?').run(Number(req.params.id));
+  events.broadcast('forms', {});
+  res.json({ ok: true });
+});
+
+app.post('/api/forms/:id/submit', requireAuth, (req, res) => {
+  const form = db.prepare('SELECT * FROM forms WHERE id = ? AND archived = 0').get(Number(req.params.id));
+  if (!form) return res.status(404).json({ error: 'Form not found' });
+  const fields = JSON.parse(form.fields);
+  const answers = req.body?.answers || {};
+  const clean = {};
+  for (const f of fields) {
+    const v = answers[f.id];
+    if (f.required && (v === undefined || v === null || v === '' || (f.type === 'checkbox' && !v))) {
+      return res.status(400).json({ error: `"${f.label}" is required` });
+    }
+    clean[f.id] = f.type === 'checkbox' ? !!v : String(v ?? '').slice(0, 2000);
+  }
+  db.prepare('INSERT INTO form_submissions (form_id, user_id, answers) VALUES (?, ?, ?)')
+    .run(form.id, req.user.id, JSON.stringify(clean));
+  events.broadcast('forms', {});
+  const admins = db.prepare(`SELECT id FROM users WHERE role = 'admin'`).all().map((r) => r.id);
+  notify(admins.filter((id) => id !== req.user.id), {
+    title: `${req.user.name} submitted "${form.title}"`,
+    url: '/#/forms',
+  });
+  res.json({ ok: true });
+});
+
+app.get('/api/forms/:id/submissions', requireAuth, (req, res) => {
+  const form = db.prepare('SELECT * FROM forms WHERE id = ?').get(Number(req.params.id));
+  if (!form) return res.status(404).json({ error: 'Form not found' });
+  let sql = `
+    SELECT s.*, u.name AS user_name, u.color AS user_color
+    FROM form_submissions s LEFT JOIN users u ON u.id = s.user_id
+    WHERE s.form_id = ?`;
+  const params = [form.id];
+  if (req.user.role !== 'admin') { sql += ' AND s.user_id = ?'; params.push(req.user.id); }
+  sql += ' ORDER BY s.id DESC LIMIT 200';
+  const submissions = db.prepare(sql).all(...params).map((s) => ({ ...s, answers: JSON.parse(s.answers) }));
+  res.json({ form: { ...form, fields: JSON.parse(form.fields) }, submissions });
+});
+
+/* ------------------------------- updates feed ------------------------------- */
+
+app.get('/api/posts', requireAuth, (req, res) => {
+  const posts = db.prepare(`
+    SELECT p.*, u.name AS user_name, u.color AS user_color,
+           (SELECT COUNT(*) FROM post_likes WHERE post_id = p.id) AS likes,
+           EXISTS(SELECT 1 FROM post_likes WHERE post_id = p.id AND user_id = ?) AS liked
+    FROM posts p LEFT JOIN users u ON u.id = p.user_id
+    ORDER BY p.id DESC LIMIT 100
+  `).all(req.user.id);
+  res.json({ posts });
+});
+
+app.post('/api/posts', requireAuth, requireAdmin, (req, res) => {
+  const { title = '', body } = req.body || {};
+  if (!body?.trim()) return res.status(400).json({ error: 'Post text is required' });
+  const info = db.prepare('INSERT INTO posts (user_id, title, body) VALUES (?, ?, ?)')
+    .run(req.user.id, String(title).trim().slice(0, 200), body.trim().slice(0, 5000));
+  events.broadcast('posts', {});
+  const members = db.prepare('SELECT id FROM users WHERE id != ?').all(req.user.id).map((r) => r.id);
+  notify(members, {
+    title: title.trim() ? `📢 ${title.trim()}` : '📢 Company update',
+    body: body.trim().length > 120 ? body.trim().slice(0, 117) + '…' : body.trim(),
+    url: '/#/updates',
+  });
+  res.json({ ok: true, id: Number(info.lastInsertRowid) });
+});
+
+app.delete('/api/posts/:id', requireAuth, requireAdmin, (req, res) => {
+  db.prepare('DELETE FROM posts WHERE id = ?').run(Number(req.params.id));
+  events.broadcast('posts', {});
+  res.json({ ok: true });
+});
+
+app.post('/api/posts/:id/like', requireAuth, (req, res) => {
+  const postId = Number(req.params.id);
+  const post = db.prepare('SELECT id FROM posts WHERE id = ?').get(postId);
+  if (!post) return res.status(404).json({ error: 'Post not found' });
+  const liked = db.prepare('SELECT 1 FROM post_likes WHERE post_id = ? AND user_id = ?').get(postId, req.user.id);
+  if (liked) db.prepare('DELETE FROM post_likes WHERE post_id = ? AND user_id = ?').run(postId, req.user.id);
+  else db.prepare('INSERT INTO post_likes (post_id, user_id) VALUES (?, ?)').run(postId, req.user.id);
+  events.broadcast('posts', {});
+  res.json({ liked: !liked });
 });
 
 /* ---------------------------------- static --------------------------------- */

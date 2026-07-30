@@ -96,6 +96,88 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, id);
 `);
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS time_entries (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    shift_id   INTEGER REFERENCES shifts(id) ON DELETE SET NULL,
+    clock_in   TEXT NOT NULL,
+    clock_out  TEXT,
+    in_lat     REAL, in_lng REAL,
+    out_lat    REAL, out_lng REAL,
+    note       TEXT NOT NULL DEFAULT '',
+    approved   INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE INDEX IF NOT EXISTS idx_time_user ON time_entries(user_id, clock_in);
+
+  CREATE TABLE IF NOT EXISTS timeoff_requests (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    start_date TEXT NOT NULL, -- YYYY-MM-DD
+    end_date   TEXT NOT NULL,
+    kind       TEXT NOT NULL DEFAULT 'vacation', -- vacation | sick | personal | other
+    note       TEXT NOT NULL DEFAULT '',
+    status     TEXT NOT NULL DEFAULT 'pending',  -- pending | approved | denied
+    decided_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS tasks (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    title      TEXT NOT NULL,
+    notes      TEXT NOT NULL DEFAULT '',
+    due_at     TEXT,
+    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS task_assignees (
+    task_id  INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    user_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    done_at  TEXT,
+    PRIMARY KEY (task_id, user_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS forms (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    title       TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    fields      TEXT NOT NULL DEFAULT '[]', -- JSON array of field specs
+    created_by  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    archived    INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS form_submissions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    form_id    INTEGER NOT NULL REFERENCES forms(id) ON DELETE CASCADE,
+    user_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    answers    TEXT NOT NULL DEFAULT '{}', -- JSON: field id -> answer
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS posts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    title      TEXT NOT NULL DEFAULT '',
+    body       TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS post_likes (
+    post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY (post_id, user_id)
+  );
+`);
+
+// Lightweight migrations for databases created before a column existed.
+function ensureColumn(table, column, ddl) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+  if (!cols.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+}
+ensureColumn('users', 'hourly_rate', 'hourly_rate REAL NOT NULL DEFAULT 0');
+
 // Ensure the company-wide "General" channel exists.
 const general = db.prepare(`SELECT id FROM channels WHERE kind = 'group' AND name = 'General'`).get();
 if (!general) {
