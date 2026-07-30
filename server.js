@@ -1,7 +1,9 @@
 const express = require('express');
 const path = require('node:path');
-const PDFDocument = require('pdfkit');
-const { db, newPin } = require('./src/db');
+const fs = require('node:fs');
+const crypto = require('node:crypto');
+const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
+const { db, UPLOAD_DIR, newPin } = require('./src/db');
 const {
   hashPassword, verifyPassword, issueToken, verifyToken, tokenFromReq,
   requireAuth, requireAdmin,
@@ -10,7 +12,7 @@ const push = require('./src/push');
 const events = require('./src/events');
 
 const app = express();
-app.use(express.json({ limit: '2mb' })); // signature PNGs ride along with form submissions
+app.use(express.json({ limit: '20mb' })); // uploaded documents and signature PNGs arrive as base64
 
 const PORT = process.env.PORT || 3000;
 const COOKIE_OPTS = 'Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000';
@@ -720,21 +722,48 @@ app.get('/api/forms', requireAuth, (req, res) => {
   res.json({ forms });
 });
 
-app.post('/api/forms', requireAuth, requireAdmin, (req, res) => {
-  const { title, description = '', fields, require_signature = true } = req.body || {};
-  if (!title?.trim()) return res.status(400).json({ error: 'Form title is required' });
-  const clean = sanitizeFields(fields);
-  if (!clean) return res.status(400).json({ error: 'The form needs at least one valid field' });
-  const info = db.prepare('INSERT INTO forms (title, description, fields, require_signature, created_by) VALUES (?, ?, ?, ?, ?)')
-    .run(title.trim(), String(description).trim(), JSON.stringify(clean), require_signature ? 1 : 0, req.user.id);
+// Admins upload a PDF; the team signs that document as-is.
+app.post('/api/forms', requireAuth, requireAdmin, async (req, res) => {
+  const { title, description = '', file } = req.body || {};
+  if (!title?.trim()) return res.status(400).json({ error: 'Document title is required' });
+  if (!file?.data || typeof file.data !== 'string') return res.status(400).json({ error: 'Choose a PDF to upload' });
+
+  const base64 = file.data.includes(',') ? file.data.split(',').pop() : file.data;
+  let bytes;
+  try { bytes = Buffer.from(base64, 'base64'); } catch { return res.status(400).json({ error: 'That file could not be read' }); }
+  if (!bytes.length) return res.status(400).json({ error: 'That file is empty' });
+  if (bytes.length > 12 * 1024 * 1024) return res.status(400).json({ error: 'PDFs must be under 12 MB' });
+  if (bytes.subarray(0, 5).toString() !== '%PDF-') return res.status(400).json({ error: 'Only PDF documents can be uploaded' });
+
+  let pages;
+  try { pages = (await PDFDocument.load(bytes, { ignoreEncryption: true })).getPageCount(); }
+  catch { return res.status(400).json({ error: 'That PDF could not be opened — try re-saving it' }); }
+
+  const docPath = path.join(UPLOAD_DIR, `${Date.now()}-${crypto.randomBytes(4).toString('hex')}.pdf`);
+  fs.writeFileSync(docPath, bytes);
+
+  const info = db.prepare(
+    'INSERT INTO forms (title, description, fields, require_signature, doc_name, doc_path, doc_pages, created_by) VALUES (?, ?, ?, 1, ?, ?, ?, ?)'
+  ).run(title.trim(), String(description).trim(), '[]',
+    String(file.name || 'document.pdf').slice(0, 200), docPath, pages, req.user.id);
+
   events.broadcast('forms', {});
   const members = db.prepare('SELECT id FROM users WHERE id != ?').all(req.user.id).map((r) => r.id);
   notify(members, {
-    title: `New form to sign: ${title.trim()}`,
-    body: require_signature ? 'Tap to review and sign' : 'Tap to fill it in',
+    title: `New document to sign: ${title.trim()}`,
+    body: 'Tap to read and sign it',
     url: '/#/forms',
   });
   res.json({ form: db.prepare('SELECT * FROM forms WHERE id = ?').get(Number(info.lastInsertRowid)) });
+});
+
+// The original document, for reading before signing.
+app.get('/api/forms/:id/document', requireAuth, (req, res) => {
+  const form = db.prepare('SELECT * FROM forms WHERE id = ?').get(Number(req.params.id));
+  if (!form?.doc_path || !fs.existsSync(form.doc_path)) return res.status(404).json({ error: 'Document not found' });
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `inline; filename="${(form.doc_name || 'document.pdf').replace(/[^\w.-]+/g, '_')}"`);
+  fs.createReadStream(form.doc_path).pipe(res);
 });
 
 app.delete('/api/forms/:id', requireAuth, requireAdmin, (req, res) => {
@@ -743,45 +772,112 @@ app.delete('/api/forms/:id', requireAuth, requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/forms/:id/submit', requireAuth, (req, res) => {
-  const form = db.prepare('SELECT * FROM forms WHERE id = ? AND archived = 0').get(Number(req.params.id));
-  if (!form) return res.status(404).json({ error: 'Form not found' });
-  const fields = JSON.parse(form.fields);
-  const answers = req.body?.answers || {};
-  const clean = {};
-  for (const f of fields) {
-    const v = answers[f.id];
-    if (f.required && (v === undefined || v === null || v === '' || (f.type === 'checkbox' && !v))) {
-      return res.status(400).json({ error: `"${f.label}" is required` });
-    }
-    clean[f.id] = f.type === 'checkbox' ? !!v : String(v ?? '').slice(0, 2000);
+// Builds the signed copy: the original document with a signature page appended.
+async function buildSignedPdf(form, { signerName, typedName, signature, signedAt, docId, contact }) {
+  const original = fs.readFileSync(form.doc_path);
+  const pdf = await PDFDocument.load(original, { ignoreEncryption: true });
+  const font = await pdf.embedFont(StandardFonts.Helvetica);
+  const bold = await pdf.embedFont(StandardFonts.HelveticaBold);
+
+  const last = pdf.getPage(pdf.getPageCount() - 1);
+  const { width, height } = last.getSize();
+  const page = pdf.addPage([width, height]);
+  const margin = 54;
+  let y = height - margin;
+
+  const line = (text, { size = 11, f = font, color = rgb(0, 0, 0), gap = 16 } = {}) => {
+    page.drawText(text, { x: margin, y, size, font: f, color });
+    y -= gap;
+  };
+
+  line('E&E Management', { size: 18, f: bold, gap: 14 });
+  line('Event Services and More', { size: 9, color: rgb(0.4, 0.4, 0.4), gap: 26 });
+  line('Signature Page', { size: 15, f: bold, gap: 20 });
+  line(form.title, { size: 12, f: bold, gap: 14 });
+  line(`Document: ${form.doc_name || 'document.pdf'}`, { size: 9, color: rgb(0.35, 0.35, 0.35), gap: 26 });
+
+  page.drawLine({
+    start: { x: margin, y }, end: { x: width - margin, y },
+    thickness: 0.8, color: rgb(0.8, 0.8, 0.8),
+  });
+  y -= 30;
+
+  line('Signed by', { size: 9, color: rgb(0.35, 0.35, 0.35), gap: 15 });
+  line(signerName, { size: 13, f: bold, gap: 30 });
+
+  if (signature) {
+    try {
+      const png = await pdf.embedPng(Buffer.from(signature.split(',').pop(), 'base64'));
+      const w = 220;
+      const h = (png.height / png.width) * w;
+      page.drawImage(png, { x: margin, y: y - h + 10, width: w, height: h });
+      y -= h + 6;
+    } catch { /* a corrupt signature image must not block the document */ }
   }
 
-  // Signature: a typed legal name plus a drawn PNG, both stored with the
-  // submission so the downloaded document stands on its own.
+  page.drawLine({
+    start: { x: margin, y }, end: { x: margin + 240, y },
+    thickness: 1, color: rgb(0.2, 0.2, 0.2),
+  });
+  y -= 16;
+  line(typedName || signerName, { size: 11, gap: 18 });
+  line(`Signed electronically on ${signedAt}`, { size: 9, color: rgb(0.35, 0.35, 0.35), gap: 13 });
+  line(`Signer: ${signerName}${contact ? ' · ' + contact : ''}`, { size: 9, color: rgb(0.35, 0.35, 0.35), gap: 13 });
+  line(`Document ID ${docId}`, { size: 9, color: rgb(0.35, 0.35, 0.35), gap: 13 });
+  line('This electronic signature is the legal equivalent of a handwritten signature.', {
+    size: 8, color: rgb(0.5, 0.5, 0.5), gap: 13,
+  });
+
+  return Buffer.from(await pdf.save());
+}
+
+app.post('/api/forms/:id/submit', requireAuth, async (req, res) => {
+  const form = db.prepare('SELECT * FROM forms WHERE id = ? AND archived = 0').get(Number(req.params.id));
+  if (!form) return res.status(404).json({ error: 'Document not found' });
+
   let { signature = null, signed_name = '' } = req.body || {};
   signed_name = String(signed_name).trim().slice(0, 120);
-  if (form.require_signature) {
-    if (!signed_name) return res.status(400).json({ error: 'Type your full name to sign' });
-    if (typeof signature !== 'string' || !signature.startsWith('data:image/png;base64,')) {
-      return res.status(400).json({ error: 'Draw your signature to sign' });
-    }
-    if (signature.length > 400000) return res.status(400).json({ error: 'Signature image is too large' });
-  } else {
-    signature = null;
+  if (!signed_name) return res.status(400).json({ error: 'Type your full name to sign' });
+  if (typeof signature !== 'string' || !signature.startsWith('data:image/png;base64,')) {
+    return res.status(400).json({ error: 'Draw your signature to sign' });
   }
+  if (signature.length > 400000) return res.status(400).json({ error: 'Signature image is too large' });
 
-  db.prepare(
+  const signedAtIso = new Date().toISOString();
+  const info = db.prepare(
     'INSERT INTO form_submissions (form_id, user_id, answers, signature, signed_name, signed_at) VALUES (?, ?, ?, ?, ?, ?)'
-  ).run(form.id, req.user.id, JSON.stringify(clean), signature, signed_name || null,
-    form.require_signature ? new Date().toISOString() : null);
+  ).run(form.id, req.user.id, '{}', signature, signed_name, signedAtIso);
+  const submissionId = Number(info.lastInsertRowid);
+
+  // Stamp the signature into a copy of the uploaded document and keep that
+  // file — it is the artifact admins download later.
+  if (form.doc_path && fs.existsSync(form.doc_path)) {
+    try {
+      const signedAt = new Date(signedAtIso).toLocaleString('en-US', {
+        dateStyle: 'long', timeStyle: 'short', timeZone: process.env.APP_TZ || 'America/New_York',
+      });
+      const pdfBytes = await buildSignedPdf(form, {
+        signerName: req.user.name,
+        typedName: signed_name,
+        signature,
+        signedAt,
+        docId: `${form.id}-${submissionId}`,
+        contact: req.user.phone || '',
+      });
+      const outPath = path.join(UPLOAD_DIR, `signed-${form.id}-${submissionId}.pdf`);
+      fs.writeFileSync(outPath, pdfBytes);
+      db.prepare('UPDATE form_submissions SET signed_path = ? WHERE id = ?').run(outPath, submissionId);
+    } catch (err) {
+      console.error('signed pdf generation failed:', err.message);
+    }
+  }
 
   events.broadcast('forms', {});
   const admins = db.prepare(`SELECT id FROM users WHERE role = 'admin'`).all().map((r) => r.id);
   notify(admins.filter((id) => id !== req.user.id), {
-    title: `${req.user.name} ${form.require_signature ? 'signed' : 'submitted'} "${form.title}"`,
-    body: 'Tap to review or download it',
-    url: '/#/forms',
+    title: `${req.user.name} signed "${form.title}"`,
+    body: 'Tap to review or download the signed copy',
+    url: '/#/signed',
   });
   res.json({ ok: true });
 });
@@ -1023,75 +1119,48 @@ app.delete('/api/hour-requests/:id', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-// Download a completed form as a signed PDF document.
+// Download the signed copy of a document.
 app.get('/api/forms/:id/submissions/:sid/pdf', requireAuth, (req, res) => {
   const form = db.prepare('SELECT * FROM forms WHERE id = ?').get(Number(req.params.id));
-  if (!form) return res.status(404).json({ error: 'Form not found' });
+  if (!form) return res.status(404).json({ error: 'Document not found' });
   const sub = db.prepare(`
-    SELECT s.*, u.name AS user_name, u.phone, u.email
-    FROM form_submissions s LEFT JOIN users u ON u.id = s.user_id
+    SELECT s.*, u.name AS user_name FROM form_submissions s
+    LEFT JOIN users u ON u.id = s.user_id
     WHERE s.id = ? AND s.form_id = ?
   `).get(Number(req.params.sid), form.id);
-  if (!sub) return res.status(404).json({ error: 'Submission not found' });
+  if (!sub) return res.status(404).json({ error: 'Signature not found' });
   // Members may download their own copy; admins may download anyone's.
   if (req.user.role !== 'admin' && sub.user_id !== req.user.id) {
     return res.status(403).json({ error: 'Not allowed' });
   }
-
-  const fields = JSON.parse(form.fields);
-  const answers = JSON.parse(sub.answers);
-  const when = (iso) => new Date(iso.endsWith('Z') || iso.includes('+') ? iso : iso + 'Z')
-    .toLocaleString('en-US', { dateStyle: 'long', timeStyle: 'short', timeZone: process.env.APP_TZ || 'America/New_York' });
-
-  const safe = (form.title + '-' + (sub.user_name || 'employee')).replace(/[^a-z0-9]+/gi, '-').toLowerCase();
+  if (!sub.signed_path || !fs.existsSync(sub.signed_path)) {
+    return res.status(404).json({ error: 'Signed file is not available' });
+  }
+  const safe = `${form.title}-${sub.user_name || 'signed'}`.replace(/[^a-z0-9]+/gi, '-').toLowerCase();
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `attachment; filename="${safe}.pdf"`);
+  fs.createReadStream(sub.signed_path).pipe(res);
+});
 
-  const doc = new PDFDocument({ size: 'LETTER', margin: 54 });
-  doc.pipe(res);
-
-  doc.fontSize(20).font('Helvetica-Bold').text('E&E Management');
-  doc.fontSize(9).font('Helvetica').fillColor('#666').text('Event Services and More');
-  doc.moveDown(1.2).fillColor('#000');
-  doc.fontSize(16).font('Helvetica-Bold').text(form.title);
-  if (form.description) doc.moveDown(0.2).fontSize(10).font('Helvetica').fillColor('#444').text(form.description);
-  doc.fillColor('#000').moveDown(0.8);
-  doc.moveTo(54, doc.y).lineTo(558, doc.y).strokeColor('#ccc').stroke().moveDown(0.8);
-
-  doc.fontSize(10).font('Helvetica-Bold').text('Completed by: ', { continued: true })
-    .font('Helvetica').text(sub.user_name || 'Removed user');
-  doc.font('Helvetica-Bold').text('Submitted: ', { continued: true })
-    .font('Helvetica').text(when(sub.created_at));
-  doc.moveDown(1);
-
-  for (const f of fields) {
-    const raw = answers[f.id];
-    const value = f.type === 'checkbox' ? (raw ? 'Yes' : 'No') : (String(raw ?? '').trim() || '—');
-    doc.fontSize(10).font('Helvetica-Bold').fillColor('#333').text(f.label);
-    doc.font('Helvetica').fillColor('#000').text(value, { indent: 12 });
-    doc.moveDown(0.6);
-  }
-
-  if (sub.signed_at) {
-    doc.moveDown(0.6);
-    doc.moveTo(54, doc.y).lineTo(558, doc.y).strokeColor('#ccc').stroke().moveDown(0.8);
-    doc.fontSize(11).font('Helvetica-Bold').fillColor('#000').text('Signature');
-    doc.moveDown(0.4);
-    if (sub.signature) {
-      try {
-        const png = Buffer.from(sub.signature.split(',')[1], 'base64');
-        doc.image(png, { fit: [230, 80] });
-      } catch { /* a corrupt image should not block the rest of the document */ }
-    }
-    const y = doc.y + 4;
-    doc.moveTo(54, y).lineTo(284, y).strokeColor('#333').stroke();
-    doc.moveDown(0.6).fontSize(10).font('Helvetica').fillColor('#000').text(sub.signed_name || sub.user_name || '');
-    doc.fontSize(8).fillColor('#666')
-      .text(`Signed electronically on ${when(sub.signed_at)}`)
-      .text(`Signer: ${sub.user_name || ''}${sub.phone ? ' · ' + sub.phone : ''} · Document ID ${form.id}-${sub.id}`);
-  }
-
-  doc.end();
+// Every document with who has signed it — the admin overview.
+app.get('/api/forms/signed-overview', requireAuth, requireAdmin, (req, res) => {
+  const people = db.prepare('SELECT id, name, color FROM users ORDER BY name').all();
+  const forms = db.prepare('SELECT * FROM forms WHERE archived = 0 ORDER BY id DESC').all().map((f) => {
+    const signers = db.prepare(`
+      SELECT s.id AS submission_id, s.signed_at, s.created_at, s.user_id, u.name AS user_name, u.color AS user_color
+      FROM form_submissions s LEFT JOIN users u ON u.id = s.user_id
+      WHERE s.form_id = ? AND s.id = (SELECT MAX(id) FROM form_submissions WHERE form_id = s.form_id AND user_id = s.user_id)
+      ORDER BY s.id DESC
+    `).all(f.id);
+    const signedIds = new Set(signers.map((x) => x.user_id));
+    return {
+      id: f.id, title: f.title, doc_name: f.doc_name, created_at: f.created_at,
+      signers,
+      pending: people.filter((p) => !signedIds.has(p.id)),
+      headcount: people.length,
+    };
+  });
+  res.json({ forms });
 });
 
 /* ------------------------------- updates feed ------------------------------- */

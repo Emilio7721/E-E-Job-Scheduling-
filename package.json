@@ -18,7 +18,7 @@
   "type": "commonjs",
   "dependencies": {
     "express": "^5.2.1",
-    "pdfkit": "^0.19.1",
+    "pdf-lib": "^1.17.1",
     "web-push": "^3.6.7"
   },
   "engines": {
