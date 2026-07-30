@@ -9,6 +9,7 @@ const state = {
   users: [],
   venues: [],
   roles: [],
+  positions: [],
   channels: [],
   notifications: [],
   authMode: 'login',
@@ -132,7 +133,7 @@ function connectEvents() {
   es.addEventListener('channels', () => refreshChannels());
   for (const [event, views] of Object.entries({
     time: ['clock', 'timesheets'], timeoff: ['timeoff'], tasks: ['tasks'], forms: ['forms'], posts: ['updates'],
-    hours: ['hours'], roles: ['roles'],
+    hours: ['hours'], roles: ['roles'], positions: ['positions', 'team'],
   })) {
     es.addEventListener(event, () => { if (views.includes(route().view)) render(); });
   }
@@ -469,7 +470,7 @@ const TABS = [
 ];
 
 // Views that live under the "More" hub still highlight the More tab.
-const MORE_VIEWS = ['more', 'venues', 'team', 'tasks', 'timeoff', 'forms', 'timesheets', 'settings', 'notifications', 'hours', 'roles'];
+const MORE_VIEWS = ['more', 'venues', 'team', 'tasks', 'timeoff', 'forms', 'timesheets', 'settings', 'notifications', 'hours', 'roles', 'positions'];
 
 async function signOut() {
   if (!confirm('Sign out of E&E?')) return;
@@ -670,15 +671,15 @@ function openShiftModal(shift = null) {
   const modal = openModal(`
     <h3>${shift ? 'Edit job' : 'New job'}</h3>
     <form id="shift-form">
-      <label>Job title</label><input name="title" required placeholder="e.g. Bar setup — wedding" value="${esc(shift?.title || '')}">
+      <label>Title</label><input name="title" required placeholder="e.g. Bar setup — wedding" value="${esc(shift?.title || '')}">
       <label>Venue</label>
       <select name="venue_id">
         <option value="">No venue</option>
         ${state.venues.map((v) => `<option value="${v.id}" ${shift?.venue_id === v.id ? 'selected' : ''}>${esc(v.name)}</option>`).join('')}
       </select>
-      <label>Sub-job / role (optional)</label>
+      <label>Job (optional)</label>
       <select name="role_id">
-        <option value="">No role</option>
+        <option value="">No job</option>
         ${state.roles.map((r) => `<option value="${r.id}" ${shift?.role_id === r.id ? 'selected' : ''}>${esc(r.name)}</option>`).join('')}
       </select>
       <label>Starts</label><input name="starts_at" type="datetime-local" required value="${startVal}">
@@ -953,7 +954,7 @@ function renderTeam() {
         <span class="avatar lg" style="background:${esc(u.color)}">${esc(initials(u.name))}</span>
         <span class="grow">
           <div style="font-weight:700">${esc(u.name)} ${u.id === state.me.id ? '<span class="sub">(you)</span>' : ''}</div>
-          <div class="sub">${esc(contactOf(u))}${u.role_id ? ` · 🧑‍🍳 ${esc(state.roles.find((r) => r.id === u.role_id)?.name || '')}` : ''}</div>
+          <div class="sub">${esc(contactOf(u))}${u.position_id ? ` · 🎖️ ${esc(state.positions.find((r) => r.id === u.position_id)?.name || '')}` : ''}</div>
         </span>
         <span class="role-tag">${u.role}</span>
         ${isAdmin && u.hourly_rate ? `<span class="sub">$${Number(u.hourly_rate).toFixed(2)}/h</span>` : ''}
@@ -975,12 +976,12 @@ function openUserModal(user) {
     <h3>${esc(user.name)}</h3>
     <p class="sub">${esc(contactOf(user))}</p>
     <form id="user-form">
-      <label>Sub-job / position</label>
-      <select name="role_id" id="position-select">
+      <label>Position</label>
+      <select name="position_id" id="position-select">
         <option value="">No position</option>
-        ${state.roles.map((r) => `<option value="${r.id}" ${user.role_id === r.id ? 'selected' : ''}>${esc(r.name)}${r.is_admin ? ' — ⭐ admin' : ''}</option>`).join('')}
+        ${state.positions.map((r) => `<option value="${r.id}" ${user.position_id === r.id ? 'selected' : ''}>${esc(r.name)}${r.is_admin ? ' — ⭐ admin' : ''}</option>`).join('')}
       </select>
-      <p class="hint">Positions marked ⭐ grant admin access automatically. Manage positions in Sub-Jobs / Roles.</p>
+      <p class="hint">Positions marked ⭐ grant admin access automatically. Manage them in More → Positions.</p>
       <label>Account access</label>
       <select name="role" id="access-select" ${isSelf ? 'disabled' : ''}>
         <option value="member" ${user.role === 'member' ? 'selected' : ''}>Member</option>
@@ -1008,7 +1009,7 @@ function openUserModal(user) {
   const posSel = modal.querySelector('#position-select');
   const accSel = modal.querySelector('#access-select');
   const syncAccess = () => {
-    const pos = state.roles.find((r) => r.id === Number(posSel.value));
+    const pos = state.positions.find((r) => r.id === Number(posSel.value));
     if (pos) { accSel.value = pos.is_admin ? 'admin' : 'member'; accSel.disabled = true; }
     else if (!isSelf) accSel.disabled = false;
   };
@@ -1023,7 +1024,7 @@ function openUserModal(user) {
         method: 'PATCH',
         body: {
           role: isSelf || accSel.disabled ? user.role : fd.get('role'),
-          role_id: posSel.value ? Number(posSel.value) : null,
+          position_id: posSel.value ? Number(posSel.value) : null,
           hourly_rate: Number(fd.get('hourly_rate')) || 0,
         },
       });
@@ -1685,9 +1686,9 @@ function openHourRequestModal() {
         <option value="">No venue</option>
         ${state.venues.map((v) => `<option value="${v.id}">${esc(v.name)}</option>`).join('')}
       </select>
-      <label>Sub-job / role</label>
+      <label>Job</label>
       <select name="role_id">
-        <option value="">No role</option>
+        <option value="">No job</option>
         ${state.roles.map((r) => `<option value="${r.id}">${esc(r.name)}</option>`).join('')}
       </select>
       <label>Date</label><input name="date" type="date" required value="${today}">
@@ -1776,47 +1777,27 @@ async function renderRoles() {
   if (state.me.role !== 'admin') { location.hash = '#/more'; return; }
   const { roles } = await api('/api/roles');
   state.roles = roles;
-  shell('Sub-Jobs / Roles', `
-    <p class="hint" style="margin-bottom:12px">Roles your team works (Server, Bar Back, Set Up…). Assign them in Team — a role with <b>admin permission</b> automatically makes its holders admins.</p>
+  shell('Jobs', `
+    <p class="hint" style="margin-bottom:12px">Jobs your team works (Server, Bar Back, Set Up…). Used when scheduling and when clocking out. Team positions are managed separately in <b>Positions</b>.</p>
     ${roles.length ? roles.map((r) => `
       <div class="card row">
         <span class="venue-icon" style="background:var(--brand-soft);color:var(--text)">🧑‍🍳</span>
-        <span class="grow">
-          <div style="font-weight:700">${esc(r.name)}</div>
-          <div class="sub">${r.is_admin ? '⭐ Has admin permission' : 'Member permission'}</div>
-        </span>
-        <button class="btn small ${r.is_admin ? '' : 'secondary'}" data-adm-role="${r.id}">${r.is_admin ? 'Admin ✓' : 'Member'}</button>
+        <span class="grow" style="font-weight:700">${esc(r.name)}</span>
         <button class="icon-btn" data-edit-role="${r.id}">✏️</button>
         <button class="icon-btn" data-del-role="${r.id}">🗑️</button>
-      </div>`).join('') : '<div class="empty"><div class="big">🧑‍🍳</div>No roles yet — tap ＋ to add Server, Bar Back, Set Up…</div>'}
+      </div>`).join('') : '<div class="empty"><div class="big">🧑‍🍳</div>No jobs yet — tap ＋ to add Server, Bar Back, Set Up…</div>'}
   `, { back: () => { location.hash = '#/more'; }, fab: true });
 
   document.getElementById('fab').onclick = async () => {
-    const name = prompt('New role name (e.g. Server, Bar Back):');
+    const name = prompt('New job name (e.g. Server, Bar Back):');
     if (!name?.trim()) return;
-    const is_admin = confirm('Should this role have ADMIN permission?\n\nAdmins can manage jobs, venues, payroll, and approvals.\n\nOK = admin role · Cancel = regular member role');
-    await api('/api/roles', { method: 'POST', body: { name, is_admin } });
+    await api('/api/roles', { method: 'POST', body: { name } });
     render();
   };
-  document.querySelectorAll('[data-adm-role]').forEach((b) => {
-    b.onclick = async () => {
-      const role = roles.find((r) => r.id === Number(b.dataset.admRole));
-      const grant = !role.is_admin;
-      if (!confirm(grant
-        ? `Give ADMIN permission to the "${role.name}" role? Everyone assigned to it becomes an admin.`
-        : `Remove admin permission from "${role.name}"? Everyone assigned to it becomes a regular member.`)) return;
-      try {
-        await api(`/api/roles/${role.id}`, { method: 'PATCH', body: { is_admin: grant } });
-        toast(grant ? 'Role now grants admin access' : 'Role is member-level now');
-      } catch (err) { toast(err.message); }
-      state.users = (await api('/api/users')).users;
-      render();
-    };
-  });
   document.querySelectorAll('[data-edit-role]').forEach((b) => {
     b.onclick = async () => {
       const role = roles.find((r) => r.id === Number(b.dataset.editRole));
-      const name = prompt('Rename role:', role.name);
+      const name = prompt('Rename job:', role.name);
       if (!name?.trim() || name === role.name) return;
       await api(`/api/roles/${role.id}`, { method: 'PATCH', body: { name } });
       render();
@@ -1824,8 +1805,70 @@ async function renderRoles() {
   });
   document.querySelectorAll('[data-del-role]').forEach((b) => {
     b.onclick = async () => {
-      if (!confirm('Delete this role? People assigned to it keep their current access level.')) return;
+      if (!confirm('Delete this job? Past timesheet entries keep their label.')) return;
       await api(`/api/roles/${b.dataset.delRole}`, { method: 'DELETE' });
+      render();
+    };
+  });
+}
+
+/* -------------------------------- positions --------------------------------- */
+
+async function renderPositions() {
+  if (state.me.role !== 'admin') { location.hash = '#/more'; return; }
+  const { positions } = await api('/api/positions');
+  state.positions = positions;
+  shell('Positions', `
+    <p class="hint" style="margin-bottom:12px">Team positions you assign in <b>Team</b>. A position with <b>⭐ admin permission</b> automatically makes everyone holding it an admin.</p>
+    ${positions.length ? positions.map((r) => `
+      <div class="card row">
+        <span class="venue-icon" style="background:var(--brand-soft);color:var(--text)">🎖️</span>
+        <span class="grow">
+          <div style="font-weight:700">${esc(r.name)}</div>
+          <div class="sub">${r.is_admin ? '⭐ Grants admin access' : 'Member access'}</div>
+        </span>
+        <button class="btn small ${r.is_admin ? '' : 'secondary'}" data-adm-pos="${r.id}">${r.is_admin ? 'Admin ✓' : 'Member'}</button>
+        <button class="icon-btn" data-edit-pos="${r.id}">✏️</button>
+        <button class="icon-btn" data-del-pos="${r.id}">🗑️</button>
+      </div>`).join('') : '<div class="empty"><div class="big">🎖️</div>No positions yet — tap ＋ to add e.g. Operations Manager, Shift Lead…</div>'}
+  `, { back: () => { location.hash = '#/more'; }, fab: true });
+
+  document.getElementById('fab').onclick = async () => {
+    const name = prompt('New position name (e.g. Operations Manager, Shift Lead):');
+    if (!name?.trim()) return;
+    const is_admin = confirm('Should this position have ADMIN permission?\n\nAdmins can manage the schedule, venues, payroll, and approvals.\n\nOK = admin · Cancel = member');
+    await api('/api/positions', { method: 'POST', body: { name, is_admin } });
+    render();
+  };
+  document.querySelectorAll('[data-adm-pos]').forEach((b) => {
+    b.onclick = async () => {
+      const position = positions.find((r) => r.id === Number(b.dataset.admPos));
+      const grant = !position.is_admin;
+      if (!confirm(grant
+        ? `Give ADMIN permission to "${position.name}"? Everyone holding it becomes an admin.`
+        : `Remove admin permission from "${position.name}"? Everyone holding it becomes a regular member.`)) return;
+      try {
+        await api(`/api/positions/${position.id}`, { method: 'PATCH', body: { is_admin: grant } });
+        toast(grant ? 'Position now grants admin access' : 'Position is member-level now');
+      } catch (err) { toast(err.message); }
+      state.users = (await api('/api/users')).users;
+      render();
+    };
+  });
+  document.querySelectorAll('[data-edit-pos]').forEach((b) => {
+    b.onclick = async () => {
+      const position = positions.find((r) => r.id === Number(b.dataset.editPos));
+      const name = prompt('Rename position:', position.name);
+      if (!name?.trim() || name === position.name) return;
+      await api(`/api/positions/${position.id}`, { method: 'PATCH', body: { name } });
+      render();
+    };
+  });
+  document.querySelectorAll('[data-del-pos]').forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm('Delete this position? People holding it keep their current access level.')) return;
+      await api(`/api/positions/${b.dataset.delPos}`, { method: 'DELETE' });
+      state.users = (await api('/api/users')).users;
       render();
     };
   });
@@ -1879,8 +1922,9 @@ function pickKioskVenue(onDone) {
   });
 }
 
-// The clock-out summary popup: time tally, venue, sub-job, mileage, note.
-function openClockoutForm({ title, entry, shift, onSubmit }) {
+// The clock-out summary popup: time tally, venue, job, mileage, note.
+// Members see the venue but can't change it — only admins can.
+function openClockoutForm({ title, entry, shift, lockVenue = false, onSubmit }) {
   const defVenue = kioskVenue()?.id || entry.venue_id || shift?.venue_id || '';
   const defRole = entry.role_id || shift?.role_id || '';
   const elapsed = fmtDur(Date.now() - new Date(entry.clock_in));
@@ -1888,20 +1932,20 @@ function openClockoutForm({ title, entry, shift, onSubmit }) {
     <h3>${esc(title)}</h3>
     <div class="clockout-tally">⏱️ ${elapsed} <span class="sub">since ${fmtTime(entry.clock_in)}</span></div>
     <form id="clockout-form">
-      <label>Venue</label>
-      <select name="venue_id">
+      <label>Venue${lockVenue ? ' <span class="lock-note">🔒 set by admin</span>' : ''}</label>
+      <select name="venue_id" id="co-venue" ${lockVenue ? 'disabled' : ''}>
         <option value="">No venue</option>
         ${state.venues.map((v) => `<option value="${v.id}" ${defVenue === v.id ? 'selected' : ''}>${esc(v.name)}</option>`).join('')}
       </select>
-      <label>Sub-job / role</label>
-      <select name="role_id">
-        <option value="">No role</option>
+      <label>Job</label>
+      <select name="role_id" id="co-role">
+        <option value="">No job</option>
         ${state.roles.map((r) => `<option value="${r.id}" ${defRole === r.id ? 'selected' : ''}>${esc(r.name)}</option>`).join('')}
       </select>
       <label>Mileage (miles, optional)</label>
-      <input name="mileage" type="number" min="0" step="0.1" inputmode="decimal" placeholder="0">
+      <input name="mileage" id="co-mileage" type="number" min="0" step="0.1" inputmode="decimal" placeholder="0">
       <label>Note (optional)</label>
-      <textarea name="note" rows="2" placeholder="Anything to report from this shift…"></textarea>
+      <textarea name="note" id="co-note" rows="2" placeholder="Anything to report from this shift…"></textarea>
       <div class="actions">
         <button type="button" class="btn secondary" id="clockout-cancel">Cancel</button>
         <button type="submit" class="btn">Confirm clock out</button>
@@ -1911,13 +1955,14 @@ function openClockoutForm({ title, entry, shift, onSubmit }) {
   modal.querySelector('#clockout-cancel').onclick = closeModal;
   modal.querySelector('#clockout-form').onsubmit = async (e) => {
     e.preventDefault();
-    const fd = new FormData(e.target);
+    // Read elements directly: a disabled (locked) venue select still submits its value.
+    const val = (id) => modal.querySelector(`#${id}`).value;
     try {
       await onSubmit({
-        venue_id: fd.get('venue_id') ? Number(fd.get('venue_id')) : null,
-        role_id: fd.get('role_id') ? Number(fd.get('role_id')) : null,
-        mileage: fd.get('mileage') ? Number(fd.get('mileage')) : null,
-        note: fd.get('note') || '',
+        venue_id: val('co-venue') ? Number(val('co-venue')) : null,
+        role_id: val('co-role') ? Number(val('co-role')) : null,
+        mileage: val('co-mileage') ? Number(val('co-mileage')) : null,
+        note: val('co-note') || '',
       });
       closeModal();
     } catch (err) { toast(err.message); }
@@ -1999,6 +2044,7 @@ function renderKiosk() {
       openClockoutForm({
         title: `Clock out — ${user.name}`,
         entry, shift,
+        lockVenue: user.role !== 'admin',
         onSubmit: async (fields) => {
           const loc = await getLocation();
           const { name, action, at } = await api('/api/kiosk/punch', { method: 'POST', body: { ...loc, pin, ...fields } });
@@ -2074,7 +2120,8 @@ function renderMore() {
     ...(isAdmin ? [
       { href: '#/timesheets', icon: '🧾', label: 'Timesheets', sub: 'Hours, approval & payroll CSV' },
       { href: '#/kiosk', icon: '🔢', label: 'Kiosk Mode', sub: 'Lock this device into a PIN punch clock' },
-      { href: '#/roles', icon: '🧑‍🍳', label: 'Sub-Jobs / Roles', sub: 'Server, Bar Back, Set Up…' },
+      { href: '#/roles', icon: '🧑‍🍳', label: 'Jobs', sub: 'Server, Bar Back, Set Up… (clock-outs & scheduling)' },
+      { href: '#/positions', icon: '🎖️', label: 'Positions', sub: 'Team positions & admin permissions' },
     ] : []),
     { href: '#/venues', icon: '📍', label: 'Venues', sub: 'Work locations' },
     { href: '#/team', icon: '👥', label: 'Team', sub: 'People & roles' },
@@ -2122,6 +2169,7 @@ async function render() {
     else if (view === 'kiosk') renderKiosk();
     else if (view === 'hours') await renderHours();
     else if (view === 'roles') await renderRoles();
+    else if (view === 'positions') await renderPositions();
     else if (view === 'timesheets') await renderTimesheets();
     else if (view === 'timeoff') await renderTimeoff();
     else if (view === 'tasks') await renderTasks();
@@ -2142,14 +2190,15 @@ async function render() {
 /* -------------------------------- bootstrap -------------------------------- */
 
 async function bootstrap() {
-  const [me, users, venues, roles, channels, notifs] = await Promise.all([
-    api('/api/me'), api('/api/users'), api('/api/venues'), api('/api/roles'), api('/api/channels'), api('/api/notifications'),
+  const [me, users, venues, roles, positions, channels, notifs] = await Promise.all([
+    api('/api/me'), api('/api/users'), api('/api/venues'), api('/api/roles'), api('/api/positions'), api('/api/channels'), api('/api/notifications'),
   ]);
   state.me = me.user;
   state.vapidPublicKey = me.vapidPublicKey;
   state.users = users.users;
   state.venues = venues.venues;
   state.roles = roles.roles;
+  state.positions = positions.positions;
   state.channels = channels.channels;
   state.notifications = notifs.notifications;
   connectEvents();
