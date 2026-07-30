@@ -201,6 +201,12 @@ function ensureColumn(table, column, ddl) {
 ensureColumn('users', 'hourly_rate', 'hourly_rate REAL NOT NULL DEFAULT 0');
 ensureColumn('users', 'pin', 'pin TEXT');
 ensureColumn('users', 'phone', 'phone TEXT');
+ensureColumn('users', 'role_id', 'role_id INTEGER');
+ensureColumn('roles', 'is_admin', 'is_admin INTEGER NOT NULL DEFAULT 0');
+ensureColumn('shifts', 'role_id', 'role_id INTEGER');
+ensureColumn('time_entries', 'venue_id', 'venue_id INTEGER');
+ensureColumn('time_entries', 'role_id', 'role_id INTEGER');
+ensureColumn('time_entries', 'mileage', 'mileage REAL NOT NULL DEFAULT 0');
 
 // Every user gets a unique 5-digit clock-in PIN.
 function newPin() {
