@@ -717,6 +717,7 @@ app.get('/api/forms', requireAuth, (req, res) => {
       fields: JSON.parse(f.fields),
       my_submissions: db.prepare('SELECT COUNT(*) AS n FROM form_submissions WHERE form_id = ? AND user_id = ?').get(f.id, req.user.id).n,
       signed_count: db.prepare('SELECT COUNT(DISTINCT user_id) AS n FROM form_submissions WHERE form_id = ?').get(f.id).n,
+      field_count: db.prepare('SELECT COUNT(*) AS n FROM signature_fields WHERE form_id = ?').get(f.id).n,
       headcount,
     }));
   res.json({ forms });
@@ -757,6 +758,44 @@ app.post('/api/forms', requireAuth, requireAdmin, async (req, res) => {
   res.json({ form: db.prepare('SELECT * FROM forms WHERE id = ?').get(Number(info.lastInsertRowid)) });
 });
 
+const FIELD_KINDS = ['signature', 'date', 'name'];
+
+// Where each stamp goes on the uploaded PDF. Coordinates arrive already
+// converted to PDF points by the placement screen, so no rotation math here.
+app.get('/api/forms/:id/fields', requireAuth, (req, res) => {
+  const fields = db.prepare('SELECT id, page, kind, x, y, w, h FROM signature_fields WHERE form_id = ? ORDER BY id')
+    .all(Number(req.params.id));
+  res.json({ fields });
+});
+
+app.put('/api/forms/:id/fields', requireAuth, requireAdmin, (req, res) => {
+  const form = db.prepare('SELECT * FROM forms WHERE id = ?').get(Number(req.params.id));
+  if (!form) return res.status(404).json({ error: 'Document not found' });
+  const incoming = Array.isArray(req.body?.fields) ? req.body.fields : null;
+  if (!incoming) return res.status(400).json({ error: 'No fields supplied' });
+  if (incoming.length > 60) return res.status(400).json({ error: 'That is too many fields for one document' });
+
+  const clean = [];
+  for (const f of incoming) {
+    const page = Number(f.page);
+    const [x, y, w, h] = [Number(f.x), Number(f.y), Number(f.w), Number(f.h)];
+    if (!Number.isInteger(page) || page < 0 || page >= (form.doc_pages || 1)) {
+      return res.status(400).json({ error: 'A field points at a page that does not exist' });
+    }
+    if (![x, y, w, h].every(Number.isFinite) || w <= 0 || h <= 0) {
+      return res.status(400).json({ error: 'A field has an invalid position' });
+    }
+    if (!FIELD_KINDS.includes(f.kind)) return res.status(400).json({ error: 'Unknown field type' });
+    clean.push({ page, kind: f.kind, x, y, w, h });
+  }
+
+  db.prepare('DELETE FROM signature_fields WHERE form_id = ?').run(form.id);
+  const insert = db.prepare('INSERT INTO signature_fields (form_id, page, kind, x, y, w, h) VALUES (?, ?, ?, ?, ?, ?, ?)');
+  for (const f of clean) insert.run(form.id, f.page, f.kind, f.x, f.y, f.w, f.h);
+  events.broadcast('forms', {});
+  res.json({ ok: true, count: clean.length });
+});
+
 // The original document, for reading before signing.
 app.get('/api/forms/:id/document', requireAuth, (req, res) => {
   const form = db.prepare('SELECT * FROM forms WHERE id = ?').get(Number(req.params.id));
@@ -773,11 +812,35 @@ app.delete('/api/forms/:id', requireAuth, requireAdmin, (req, res) => {
 });
 
 // Builds the signed copy: the original document with a signature page appended.
-async function buildSignedPdf(form, { signerName, typedName, signature, signedAt, docId, contact }) {
+async function buildSignedPdf(form, { signerName, typedName, signature, signedAt, shortDate, docId, contact }) {
   const original = fs.readFileSync(form.doc_path);
   const pdf = await PDFDocument.load(original, { ignoreEncryption: true });
   const font = await pdf.embedFont(StandardFonts.Helvetica);
   const bold = await pdf.embedFont(StandardFonts.HelveticaBold);
+
+  // Stamp wherever the admin placed fields on the document itself.
+  const placed = db.prepare('SELECT page, kind, x, y, w, h FROM signature_fields WHERE form_id = ? ORDER BY id').all(form.id);
+  let sigImage = null;
+  if (placed.some((f) => f.kind === 'signature') && signature) {
+    try { sigImage = await pdf.embedPng(Buffer.from(signature.split(',').pop(), 'base64')); }
+    catch { sigImage = null; }
+  }
+  for (const f of placed) {
+    if (f.page >= pdf.getPageCount()) continue;
+    const target = pdf.getPage(f.page);
+    if (f.kind === 'signature') {
+      if (!sigImage) continue;
+      // Fit inside the box without distorting the handwriting.
+      const scale = Math.min(f.w / sigImage.width, f.h / sigImage.height);
+      const dw = sigImage.width * scale;
+      const dh = sigImage.height * scale;
+      target.drawImage(sigImage, { x: f.x + (f.w - dw) / 2, y: f.y + (f.h - dh) / 2, width: dw, height: dh });
+    } else {
+      const text = f.kind === 'date' ? shortDate : (typedName || signerName);
+      const size = Math.min(12, Math.max(7, f.h * 0.62));
+      target.drawText(text, { x: f.x + 2, y: f.y + (f.h - size) / 2 + 1, size, font, color: rgb(0, 0, 0) });
+    }
+  }
 
   const last = pdf.getPage(pdf.getPageCount() - 1);
   const { width, height } = last.getSize();
@@ -861,6 +924,9 @@ app.post('/api/forms/:id/submit', requireAuth, async (req, res) => {
         typedName: signed_name,
         signature,
         signedAt,
+        shortDate: new Date(signedAtIso).toLocaleDateString('en-US', {
+          month: 'numeric', day: 'numeric', year: 'numeric', timeZone: process.env.APP_TZ || 'America/New_York',
+        }),
         docId: `${form.id}-${submissionId}`,
         contact: req.user.phone || '',
       });

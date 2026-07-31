@@ -479,7 +479,7 @@ const TABS = [
 ];
 
 // Views that live under the "More" hub still highlight the More tab.
-const MORE_VIEWS = ['more', 'venues', 'team', 'forms', 'signed', 'timesheets', 'settings', 'notifications', 'hours', 'roles', 'positions'];
+const MORE_VIEWS = ['more', 'venues', 'team', 'forms', 'signed', 'place', 'timesheets', 'settings', 'notifications', 'hours', 'roles', 'positions'];
 
 async function signOut() {
   if (!confirm('Sign out of E&E?')) return;
@@ -1491,13 +1491,14 @@ async function renderForms() {
             ${f.description ? `<div class="sub">${esc(f.description)}</div>` : ''}
             <div class="sub">
               ${f.doc_name ? `${esc(f.doc_name)}${f.doc_pages ? ` · ${f.doc_pages} page${f.doc_pages === 1 ? '' : 's'}` : ''}` : 'Document'}
-              ${isAdmin ? `<br><b>${f.signed_count} of ${f.headcount}</b> signed` : (f.my_submissions ? '<br>✅ You signed this' : '<br>⏳ Awaiting your signature')}
+              ${isAdmin ? `<br><b>${f.signed_count} of ${f.headcount}</b> signed · ${f.field_count ? `${f.field_count} signature field${f.field_count === 1 ? '' : 's'} placed` : 'signature page appended'}` : (f.my_submissions ? '<br>✅ You signed this' : '<br>⏳ Awaiting your signature')}
             </div>
           </span>
         </div>
         <div class="shift-actions">
           <button class="btn small secondary" data-view-doc="${f.id}">Read</button>
           <button class="btn small" data-fill="${f.id}">${f.my_submissions ? 'Sign again' : 'Sign'}</button>
+          ${isAdmin ? `<button class="btn small secondary" data-place="${f.id}">✍️ Place</button>` : ''}
           ${isAdmin ? `<button class="btn small secondary" data-subs="${f.id}">Signers</button>` : ''}
           ${isAdmin ? `<button class="btn small danger" data-del-form="${f.id}">Delete</button>` : ''}
         </div>
@@ -1516,6 +1517,9 @@ async function renderForms() {
   });
   document.querySelectorAll('[data-subs]').forEach((b) => {
     b.onclick = () => openFormStatus(Number(b.dataset.subs));
+  });
+  document.querySelectorAll('[data-place]').forEach((b) => {
+    b.onclick = () => { location.hash = `#/place/${b.dataset.place}`; };
   });
   document.querySelectorAll('[data-del-form]').forEach((b) => {
     b.onclick = async () => {
@@ -1626,6 +1630,188 @@ function openSignDocument(form) {
       });
       closeModal(); toast('Signed ✅');
       render();
+    } catch (err) { toast(err.message); }
+  };
+}
+
+/* --------------------- signature field placement (admin) -------------------- */
+
+const FIELD_SPECS = {
+  signature: { label: 'Signature', w: 180, h: 50, icon: '✍️' },
+  date: { label: 'Date', w: 110, h: 20, icon: '📅' },
+  name: { label: 'Printed name', w: 150, h: 20, icon: '🔤' },
+};
+
+let pdfjsLib = null;
+async function loadPdfJs() {
+  if (pdfjsLib) return pdfjsLib;
+  pdfjsLib = await import('/vendor/pdf.min.mjs');
+  pdfjsLib.GlobalWorkerOptions.workerSrc = '/vendor/pdf.worker.min.mjs';
+  return pdfjsLib;
+}
+
+// Full-screen editor: renders every page and lets the admin drop, drag and
+// delete stamps. Tap positions are converted to PDF points by pdf.js itself,
+// so placement stays exact on rotated or oddly sized pages.
+async function renderFieldPlacer(formId) {
+  if (state.me.role !== 'admin') { location.hash = '#/forms'; return; }
+  const [{ forms }, { fields }] = await Promise.all([api('/api/forms'), api(`/api/forms/${formId}/fields`)]);
+  const form = forms.find((f) => f.id === formId);
+  if (!form) { location.hash = '#/forms'; return; }
+
+  let placing = 'signature';
+  const placed = fields.map((f) => ({ ...f }));
+
+  $app.innerHTML = `
+    <header class="topbar">
+      <button class="icon-btn" id="fp-back">←</button>
+      <h2>Place signatures</h2>
+      <button class="btn small" id="fp-save">Save</button>
+    </header>
+    <div class="fp-bar">
+      ${Object.entries(FIELD_SPECS).map(([kind, spec]) => `
+        <button class="pill ${kind === 'signature' ? 'active' : ''}" data-kind="${kind}">${spec.icon} ${spec.label}</button>`).join('')}
+    </div>
+    <p class="fp-hint">Tap the page where the <b id="fp-current">signature</b> should go. Drag a stamp to move it, tap ✕ to remove it.</p>
+    <div class="main" id="fp-pages"><div class="empty">Loading document…</div></div>`;
+
+  document.getElementById('fp-back').onclick = () => { location.hash = '#/forms'; };
+  document.querySelectorAll('[data-kind]').forEach((b) => {
+    b.onclick = () => {
+      placing = b.dataset.kind;
+      document.querySelectorAll('[data-kind]').forEach((x) => x.classList.toggle('active', x === b));
+      document.getElementById('fp-current').textContent = FIELD_SPECS[placing].label.toLowerCase();
+    };
+  });
+
+  const pagesEl = document.getElementById('fp-pages');
+  let viewports = [];
+  try {
+    const pdfjs = await loadPdfJs();
+    const doc = await pdfjs.getDocument({ url: `/api/forms/${formId}/document`, withCredentials: true }).promise;
+    pagesEl.innerHTML = '';
+    for (let n = 1; n <= doc.numPages; n++) {
+      const page = await doc.getPage(n);
+      const width = Math.min(pagesEl.clientWidth - 4, 720);
+      const viewport = page.getViewport({ scale: width / page.getViewport({ scale: 1 }).width });
+      viewports[n - 1] = viewport;
+
+      const wrap = document.createElement('div');
+      wrap.className = 'fp-page';
+      wrap.dataset.page = String(n - 1);
+      wrap.style.width = `${viewport.width}px`;
+      wrap.style.height = `${viewport.height}px`;
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.floor(viewport.width * (window.devicePixelRatio || 1));
+      canvas.height = Math.floor(viewport.height * (window.devicePixelRatio || 1));
+      canvas.style.width = `${viewport.width}px`;
+      canvas.style.height = `${viewport.height}px`;
+      wrap.appendChild(canvas);
+      pagesEl.appendChild(wrap);
+
+      const ctx = canvas.getContext('2d');
+      const dpr = window.devicePixelRatio || 1;
+      ctx.scale(dpr, dpr);
+      await page.render({ canvasContext: ctx, viewport }).promise;
+    }
+  } catch (err) {
+    pagesEl.innerHTML = `<div class="empty"><div class="big">⚠️</div>Could not display this document.<br><span class="sub">${esc(err.message)}</span></div>`;
+    return;
+  }
+
+  const drawAll = () => {
+    document.querySelectorAll('.fp-page').forEach((wrap) => {
+      const pageIdx = Number(wrap.dataset.page);
+      wrap.querySelectorAll('.fp-stamp').forEach((el) => el.remove());
+      const vp = viewports[pageIdx];
+      placed.forEach((f, i) => {
+        if (f.page !== pageIdx) return;
+        // PDF points -> screen: y flips because PDF measures from the bottom.
+        const [left, top] = vp.convertToViewportPoint(f.x, f.y + f.h);
+        const [right, bottom] = vp.convertToViewportPoint(f.x + f.w, f.y);
+        const el = document.createElement('div');
+        el.className = `fp-stamp fp-${f.kind}`;
+        el.dataset.index = String(i);
+        el.style.left = `${Math.min(left, right)}px`;
+        el.style.top = `${Math.min(top, bottom)}px`;
+        el.style.width = `${Math.abs(right - left)}px`;
+        el.style.height = `${Math.abs(bottom - top)}px`;
+        el.innerHTML = `<span>${FIELD_SPECS[f.kind].icon} ${FIELD_SPECS[f.kind].label}</span><button type="button" class="fp-del">✕</button>`;
+        wrap.appendChild(el);
+      });
+    });
+    bindStamps();
+  };
+
+  function bindStamps() {
+    document.querySelectorAll('.fp-stamp').forEach((el) => {
+      const idx = Number(el.dataset.index);
+      el.querySelector('.fp-del').onclick = (e) => {
+        e.stopPropagation();
+        placed.splice(idx, 1);
+        drawAll();
+      };
+      const startDrag = (e) => {
+        if (e.target.classList.contains('fp-del')) return;
+        e.preventDefault(); e.stopPropagation();
+        const wrap = el.parentElement;
+        const vp = viewports[Number(wrap.dataset.page)];
+        const point = (ev) => { const t = ev.touches ? ev.touches[0] : ev; return t; };
+        const startRect = el.getBoundingClientRect();
+        const grabX = point(e).clientX - startRect.left;
+        const grabY = point(e).clientY - startRect.top;
+        const onMove = (ev) => {
+          ev.preventDefault();
+          const box = wrap.getBoundingClientRect();
+          const left = Math.max(0, Math.min(box.width - startRect.width, point(ev).clientX - box.left - grabX));
+          const top = Math.max(0, Math.min(box.height - startRect.height, point(ev).clientY - box.top - grabY));
+          el.style.left = `${left}px`;
+          el.style.top = `${top}px`;
+          const [px, py] = vp.convertToPdfPoint(left, top + startRect.height);
+          placed[idx].x = px;
+          placed[idx].y = py;
+        };
+        const onUp = () => {
+          window.removeEventListener('mousemove', onMove);
+          window.removeEventListener('mouseup', onUp);
+          window.removeEventListener('touchmove', onMove);
+          window.removeEventListener('touchend', onUp);
+        };
+        window.addEventListener('mousemove', onMove);
+        window.addEventListener('mouseup', onUp);
+        window.addEventListener('touchmove', onMove, { passive: false });
+        window.addEventListener('touchend', onUp);
+      };
+      el.addEventListener('mousedown', startDrag);
+      el.addEventListener('touchstart', startDrag, { passive: false });
+    });
+  }
+
+  document.querySelectorAll('.fp-page').forEach((wrap) => {
+    wrap.onclick = (e) => {
+      if (e.target.closest('.fp-stamp')) return;
+      const pageIdx = Number(wrap.dataset.page);
+      const vp = viewports[pageIdx];
+      const box = wrap.getBoundingClientRect();
+      const spec = FIELD_SPECS[placing];
+      // Convert the tap to PDF points and centre the new stamp on it.
+      const [px, py] = vp.convertToPdfPoint(e.clientX - box.left, e.clientY - box.top);
+      placed.push({
+        page: pageIdx, kind: placing,
+        x: Math.max(0, px - spec.w / 2),
+        y: Math.max(0, py - spec.h / 2),
+        w: spec.w, h: spec.h,
+      });
+      drawAll();
+    };
+  });
+
+  drawAll();
+  document.getElementById('fp-save').onclick = async () => {
+    try {
+      const { count } = await api(`/api/forms/${formId}/fields`, { method: 'PUT', body: { fields: placed } });
+      toast(count ? `${count} field${count === 1 ? '' : 's'} saved` : 'Fields cleared — signatures append at the end');
+      location.hash = '#/forms';
     } catch (err) { toast(err.message); }
   };
 }
@@ -2259,6 +2445,7 @@ async function render() {
     else if (view === 'timesheets') await renderTimesheets();
     else if (view === 'forms') await renderForms();
     else if (view === 'signed') await renderSignedDocs();
+    else if (view === 'place' && arg) await renderFieldPlacer(Number(arg));
     else if (view === 'updates') await renderUpdates();
     else if (view === 'more') renderMore();
     else if (view === 'venues') renderVenues();

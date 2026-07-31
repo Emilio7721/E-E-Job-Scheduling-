@@ -230,6 +230,20 @@ ensureColumn('forms', 'doc_path', 'doc_path TEXT');
 ensureColumn('forms', 'doc_pages', 'doc_pages INTEGER');
 ensureColumn('form_submissions', 'signed_path', 'signed_path TEXT');
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS signature_fields (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    form_id INTEGER NOT NULL REFERENCES forms(id) ON DELETE CASCADE,
+    page    INTEGER NOT NULL DEFAULT 0,
+    kind    TEXT NOT NULL DEFAULT 'signature', -- signature | date | name
+    x       REAL NOT NULL,  -- PDF points, bottom-left of the box
+    y       REAL NOT NULL,
+    w       REAL NOT NULL,
+    h       REAL NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_sigfields_form ON signature_fields(form_id);
+`);
+
 // Every user gets a unique 5-digit clock-in PIN.
 function newPin() {
   for (;;) {
