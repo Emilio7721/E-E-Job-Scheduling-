@@ -54,6 +54,7 @@ function fmtDay(iso) {
 }
 
 function fmtWhen(iso) {
+  if (!iso) return '';
   const d = new Date(iso + (iso.endsWith('Z') || iso.includes('+') ? '' : 'Z'));
   const now = new Date();
   if (dateKey(d) === dateKey(now)) return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
@@ -478,7 +479,7 @@ const TABS = [
 ];
 
 // Views that live under the "More" hub still highlight the More tab.
-const MORE_VIEWS = ['more', 'venues', 'team', 'forms', 'timesheets', 'settings', 'notifications', 'hours', 'roles', 'positions'];
+const MORE_VIEWS = ['more', 'venues', 'team', 'forms', 'signed', 'timesheets', 'settings', 'notifications', 'hours', 'roles', 'positions'];
 
 async function signOut() {
   if (!confirm('Sign out of E&E?')) return;
@@ -1479,95 +1480,194 @@ function openTimeEntryModal(entry) {
 async function renderForms() {
   const { forms } = await api('/api/forms');
   const isAdmin = state.me.role === 'admin';
-  shell('Forms', `
+  shell('Documents', `
+    ${isAdmin ? `<button class="btn secondary" id="goto-signed" style="margin-bottom:14px">📁 Signed documents & who\u2019s completed them</button>` : ''}
     ${forms.length ? forms.map((f) => `
       <div class="card">
         <div class="row">
-          <span class="venue-icon" style="background:var(--brand)">📋</span>
+          <span class="venue-icon" style="background:var(--brand)">📄</span>
           <span class="grow">
             <div style="font-weight:700">${esc(f.title)}</div>
             ${f.description ? `<div class="sub">${esc(f.description)}</div>` : ''}
             <div class="sub">
-              ${f.fields.length} question${f.fields.length === 1 ? '' : 's'}${f.require_signature ? ' · signature required' : ''}
-              ${isAdmin ? `<br><b>${f.signed_count} of ${f.headcount}</b> completed` : (f.my_submissions ? '<br>✅ You completed this' : '<br>⏳ Awaiting your signature')}
+              ${f.doc_name ? `${esc(f.doc_name)}${f.doc_pages ? ` · ${f.doc_pages} page${f.doc_pages === 1 ? '' : 's'}` : ''}` : 'Document'}
+              ${isAdmin ? `<br><b>${f.signed_count} of ${f.headcount}</b> signed` : (f.my_submissions ? '<br>✅ You signed this' : '<br>⏳ Awaiting your signature')}
             </div>
           </span>
         </div>
         <div class="shift-actions">
-          <button class="btn small" data-fill="${f.id}">${f.my_submissions ? 'Sign again' : (f.require_signature ? 'Review & sign' : 'Fill in')}</button>
-          <button class="btn small secondary" data-subs="${f.id}">${isAdmin ? 'Completions' : 'My copies'}</button>
+          <button class="btn small secondary" data-view-doc="${f.id}">Read</button>
+          <button class="btn small" data-fill="${f.id}">${f.my_submissions ? 'Sign again' : 'Sign'}</button>
+          ${isAdmin ? `<button class="btn small secondary" data-subs="${f.id}">Signers</button>` : ''}
           ${isAdmin ? `<button class="btn small danger" data-del-form="${f.id}">Delete</button>` : ''}
         </div>
-      </div>`).join('') : `<div class="empty"><div class="big">📋</div>No forms yet${isAdmin ? '<br>Tap ＋ to build one (waivers, policies, checklists…)' : ''}</div>`}
+      </div>`).join('') : `<div class="empty"><div class="big">📄</div>No documents yet${isAdmin ? '<br>Tap ＋ to upload a PDF for the team to sign' : ''}</div>`}
   `, { back: () => { location.hash = '#/more'; }, fab: isAdmin });
 
-  if (isAdmin) document.getElementById('fab').onclick = openFormBuilder;
+  if (isAdmin) {
+    document.getElementById('fab').onclick = openDocumentUpload;
+    document.getElementById('goto-signed').onclick = () => { location.hash = '#/signed'; };
+  }
+  document.querySelectorAll('[data-view-doc]').forEach((b) => {
+    b.onclick = () => window.open(`/api/forms/${b.dataset.viewDoc}/document`, '_blank');
+  });
   document.querySelectorAll('[data-fill]').forEach((b) => {
-    b.onclick = () => openFormFill(forms.find((f) => f.id === Number(b.dataset.fill)));
+    b.onclick = () => openSignDocument(forms.find((f) => f.id === Number(b.dataset.fill)));
   });
   document.querySelectorAll('[data-subs]').forEach((b) => {
-    b.onclick = () => (state.me.role === 'admin' ? openFormStatus(Number(b.dataset.subs)) : openSubmissions(Number(b.dataset.subs)));
+    b.onclick = () => openFormStatus(Number(b.dataset.subs));
   });
   document.querySelectorAll('[data-del-form]').forEach((b) => {
     b.onclick = async () => {
-      if (!confirm('Delete this form? Past submissions are kept but hidden.')) return;
+      if (!confirm('Delete this document? Signed copies already collected stay downloadable.')) return;
       await api(`/api/forms/${b.dataset.delForm}`, { method: 'DELETE' });
       render();
     };
   });
 }
 
-function openFormFill(form) {
+function openDocumentUpload() {
+  const modal = openModal(`
+    <h3>Upload a document</h3>
+    <p class="sub">The team reads it and signs it as-is. PDF only, up to 12 MB.</p>
+    <form id="doc-form">
+      <label>Title</label><input name="title" required placeholder="e.g. Employee Handbook Acknowledgment">
+      <label>Description (optional)</label><input name="description" placeholder="Shown under the title">
+      <label>PDF file</label>
+      <input name="file" id="doc-file" type="file" accept="application/pdf,.pdf" required>
+      <div class="sub" id="doc-file-note" style="margin-top:6px"></div>
+      <div class="actions"><button type="submit" class="btn" id="doc-submit">Upload & notify team</button></div>
+    </form>
+  `);
+  const fileInput = modal.querySelector('#doc-file');
+  const note = modal.querySelector('#doc-file-note');
+  fileInput.onchange = () => {
+    const f = fileInput.files[0];
+    note.textContent = f ? `${f.name} · ${(f.size / 1024 / 1024).toFixed(1)} MB` : '';
+  };
+  modal.querySelector('#doc-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const file = fileInput.files[0];
+    if (!file) return toast('Choose a PDF first');
+    if (file.size > 12 * 1024 * 1024) return toast('That PDF is over 12 MB');
+    const btn = modal.querySelector('#doc-submit');
+    btn.disabled = true; btn.textContent = 'Uploading…';
+    try {
+      const data = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error('Could not read that file'));
+        reader.readAsDataURL(file);
+      });
+      const fd = new FormData(e.target);
+      await api('/api/forms', {
+        method: 'POST',
+        body: {
+          title: fd.get('title'),
+          description: fd.get('description') || '',
+          file: { name: file.name, data },
+        },
+      });
+      closeModal(); toast('Uploaded — team notified');
+      render();
+    } catch (err) {
+      toast(err.message);
+      btn.disabled = false; btn.textContent = 'Upload & notify team';
+    }
+  };
+}
+
+function openSignDocument(form) {
   const modal = openModal(`
     <h3>${esc(form.title)}</h3>
     ${form.description ? `<p class="sub">${esc(form.description)}</p>` : ''}
-    <form id="fill-form">
-      ${form.fields.map((f) => {
-        const req = f.required ? 'required' : '';
-        if (f.type === 'checkbox') return `<label class="check-label"><input type="checkbox" name="f${f.id}" style="width:auto"> ${esc(f.label)}${f.required ? ' *' : ''}</label>`;
-        const label = `<label>${esc(f.label)}${f.required ? ' *' : ''}</label>`;
-        if (f.type === 'textarea') return `${label}<textarea name="f${f.id}" rows="3" ${req}></textarea>`;
-        if (f.type === 'select') return `${label}<select name="f${f.id}" ${req}><option value="">Choose…</option>${(f.options || []).map((o) => `<option>${esc(o)}</option>`).join('')}</select>`;
-        return `${label}<input name="f${f.id}" type="${f.type}" ${req}>`;
-      }).join('')}
-      ${form.require_signature ? `
-        <div class="sign-block">
-          <div class="sign-head">Signature</div>
-          <label>Type your full legal name</label>
-          <input name="signed_name" required autocomplete="name" placeholder="Jane Doe" value="${esc(state.me.name)}">
-          <label>Draw your signature</label>
-          <div class="sign-pad-wrap">
-            <canvas id="sign-pad" class="sign-pad"></canvas>
-            <button type="button" class="sign-clear" id="sign-clear">Clear</button>
-          </div>
-          <p class="hint">By signing you agree this electronic signature is the legal equivalent of your handwritten signature on this document.</p>
-        </div>` : ''}
-      <div class="actions"><button type="submit" class="btn">${form.require_signature ? 'Sign & submit' : 'Submit'}</button></div>
+    ${isIOS() ? `
+      <div class="doc-card">
+        <div class="doc-card-ico">📄</div>
+        <div>
+          <div style="font-weight:700">${esc(form.doc_name || 'document.pdf')}</div>
+          <div class="sub">${form.doc_pages ? `${form.doc_pages} page${form.doc_pages === 1 ? '' : 's'} · ` : ''}Tap below to read it</div>
+        </div>
+      </div>` : `
+      <div class="doc-preview">
+        <iframe src="/api/forms/${form.id}/document#view=FitH" title="Document preview"></iframe>
+      </div>`}
+    <button type="button" class="btn secondary" id="open-doc">📄 Open document full screen</button>
+    <form id="sign-form">
+      <label class="check-label"><input type="checkbox" id="read-ack" required style="width:auto"> I have read this document</label>
+      <div class="sign-block">
+        <div class="sign-head">Signature</div>
+        <label>Type your full legal name</label>
+        <input name="signed_name" required autocomplete="name" placeholder="Jane Doe" value="${esc(state.me.name)}">
+        <label>Draw your signature</label>
+        <div class="sign-pad-wrap">
+          <canvas id="sign-pad" class="sign-pad"></canvas>
+          <button type="button" class="sign-clear" id="sign-clear">Clear</button>
+        </div>
+        <p class="hint">By signing you agree this electronic signature is the legal equivalent of your handwritten signature on this document.</p>
+      </div>
+      <div class="actions">
+        <button type="button" class="btn secondary" id="sign-cancel">Cancel</button>
+        <button type="submit" class="btn">Sign document</button>
+      </div>
     </form>
   `);
 
-  let pad = null;
-  if (form.require_signature) pad = initSignaturePad(modal.querySelector('#sign-pad'), modal.querySelector('#sign-clear'));
-
-  modal.querySelector('#fill-form').onsubmit = async (e) => {
+  const pad = initSignaturePad(modal.querySelector('#sign-pad'), modal.querySelector('#sign-clear'));
+  modal.querySelector('#open-doc').onclick = () => window.open(`/api/forms/${form.id}/document`, '_blank');
+  modal.querySelector('#sign-cancel').onclick = closeModal;
+  modal.querySelector('#sign-form').onsubmit = async (e) => {
     e.preventDefault();
-    const answers = {};
-    for (const f of form.fields) {
-      const el = e.target.elements[`f${f.id}`];
-      answers[f.id] = f.type === 'checkbox' ? el.checked : el.value;
-    }
-    const body = { answers };
-    if (form.require_signature) {
-      if (pad.isEmpty()) return toast('Please draw your signature');
-      body.signature = pad.toDataURL();
-      body.signed_name = e.target.elements.signed_name.value;
-    }
+    if (pad.isEmpty()) return toast('Please draw your signature');
     try {
-      await api(`/api/forms/${form.id}/submit`, { method: 'POST', body });
-      closeModal(); toast(form.require_signature ? 'Signed ✅' : 'Submitted ✅');
+      await api(`/api/forms/${form.id}/submit`, {
+        method: 'POST',
+        body: { signature: pad.toDataURL(), signed_name: e.target.elements.signed_name.value },
+      });
+      closeModal(); toast('Signed ✅');
       render();
     } catch (err) { toast(err.message); }
   };
+}
+
+// Admin overview: every document, who signed it, and downloads.
+async function renderSignedDocs() {
+  if (state.me.role !== 'admin') { location.hash = '#/forms'; return; }
+  const { forms } = await api('/api/forms/signed-overview');
+  shell('Signed Documents', `
+    ${forms.length ? forms.map((f) => `
+      <div class="card">
+        <div class="row" style="margin-bottom:8px">
+          <span class="grow">
+            <div style="font-weight:700">${esc(f.title)}</div>
+            <div class="sub">${esc(f.doc_name || 'document.pdf')} · <b>${f.signers.length} of ${f.headcount}</b> signed</div>
+          </span>
+          ${f.signers.length ? `<button class="btn small" data-all-form="${f.id}">Download all</button>` : ''}
+        </div>
+        ${f.signers.map((sg) => `
+          <div class="row detail-person">
+            <span class="avatar" style="background:${esc(sg.user_color || '#888')}">${esc(initials(sg.user_name || '?'))}</span>
+            <span class="grow">
+              <div style="font-weight:600">${esc(sg.user_name || 'Removed user')}</div>
+              <div class="sub accepted">✓ Signed ${fmtWhen(sg.signed_at || sg.created_at)}</div>
+            </span>
+            <button class="btn small secondary" data-pdf="${f.id}:${sg.submission_id}">PDF</button>
+          </div>`).join('')}
+        ${f.pending.length ? `<div class="sub" style="margin-top:10px">Still waiting on: ${f.pending.map((p) => esc(p.name)).join(', ')}</div>` : '<div class="sub accepted" style="margin-top:10px">✓ Everyone has signed</div>'}
+      </div>`).join('') : '<div class="empty"><div class="big">📁</div>No documents uploaded yet</div>'}
+  `, { back: () => { location.hash = '#/forms'; } });
+
+  document.querySelectorAll('[data-pdf]').forEach((b) => {
+    const [formId, subId] = b.dataset.pdf.split(':');
+    b.onclick = () => window.open(`/api/forms/${formId}/submissions/${subId}/pdf`, '_blank');
+  });
+  document.querySelectorAll('[data-all-form]').forEach((b) => {
+    b.onclick = () => {
+      const f = forms.find((x) => x.id === Number(b.dataset.allForm));
+      f.signers.forEach((sg, i) => setTimeout(
+        () => window.open(`/api/forms/${f.id}/submissions/${sg.submission_id}/pdf`, '_blank'), i * 400));
+    };
+  });
 }
 
 // Finger/mouse signature capture on a canvas sized to its container.
@@ -1658,91 +1758,6 @@ async function openFormStatus(formId) {
     // Staggered so the browser does not swallow the batch as a popup flood.
     done.forEach((p, i) => setTimeout(
       () => window.open(`/api/forms/${formId}/submissions/${p.submission_id}/pdf`, '_blank'), i * 400));
-  };
-}
-
-async function openSubmissions(formId) {
-  const { form, submissions } = await api(`/api/forms/${formId}/submissions`);
-  const modal = openModal(`
-    <h3>${esc(form.title)} — submissions</h3>
-    ${submissions.length ? submissions.map((s) => `
-      <div class="card" style="box-shadow:none;border:1px solid var(--line)">
-        <div class="row" style="margin-bottom:6px">
-          <span class="avatar" style="background:${esc(s.user_color || '#888')}">${esc(initials(s.user_name || '?'))}</span>
-          <b>${esc(s.user_name || 'Removed user')}</b>
-          <span class="sub" style="margin-left:auto">${fmtWhen(s.created_at)}</span>
-        </div>
-        ${form.fields.map((f) => `<div class="sub" style="margin:3px 0"><b>${esc(f.label)}:</b> ${f.type === 'checkbox' ? (s.answers[f.id] ? '✅ yes' : '⬜ no') : esc(s.answers[f.id] || '—')}</div>`).join('')}
-        <button class="btn small secondary" data-pdf="${s.id}" style="margin-top:8px">⬇️ Download PDF</button>
-      </div>`).join('') : '<p class="sub" style="margin-top:10px">No submissions yet.</p>'}
-    <div class="actions"><button class="btn secondary" id="subs-close">Close</button></div>
-  `);
-  modal.querySelector('#subs-close').onclick = closeModal;
-  modal.querySelectorAll('[data-pdf]').forEach((b) => {
-    b.onclick = () => window.open(`/api/forms/${formId}/submissions/${b.dataset.pdf}/pdf`, '_blank');
-  });
-}
-
-function openFormBuilder() {
-  const fields = [];
-  const modal = openModal(`
-    <h3>New form</h3>
-    <form id="form-builder">
-      <label>Form title</label><input name="title" required placeholder="e.g. End-of-shift checklist">
-      <label>Description (optional)</label><input name="description" placeholder="Shown to the team above the questions">
-      <label class="check-label"><input type="checkbox" name="require_signature" checked style="width:auto"> Require a signature to complete</label>
-      <label>Questions</label>
-      <div id="fields-list"></div>
-      <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
-        <button type="button" class="btn small secondary" data-add="text">+ Text</button>
-        <button type="button" class="btn small secondary" data-add="textarea">+ Paragraph</button>
-        <button type="button" class="btn small secondary" data-add="checkbox">+ Checkbox</button>
-        <button type="button" class="btn small secondary" data-add="select">+ Dropdown</button>
-        <button type="button" class="btn small secondary" data-add="number">+ Number</button>
-        <button type="button" class="btn small secondary" data-add="date">+ Date</button>
-      </div>
-      <div class="actions"><button type="submit" class="btn">Create form</button></div>
-    </form>
-  `);
-  const list = modal.querySelector('#fields-list');
-  const typeNames = { text: 'Text', textarea: 'Paragraph', checkbox: 'Checkbox', select: 'Dropdown', number: 'Number', date: 'Date' };
-
-  function redraw() {
-    list.innerHTML = fields.map((f, i) => `
-      <div class="builder-field">
-        <div class="row">
-          <span class="role-tag">${typeNames[f.type]}</span>
-          <input data-label="${i}" placeholder="Question label" value="${esc(f.label)}" style="flex:1">
-          <button type="button" class="icon-btn" data-remove="${i}">🗑️</button>
-        </div>
-        ${f.type === 'select' ? `<input data-options="${i}" placeholder="Options, comma separated" value="${esc((f.options || []).join(', '))}" style="margin-top:6px">` : ''}
-        <label class="check-label" style="margin-top:6px;font-weight:400"><input type="checkbox" data-required="${i}" ${f.required ? 'checked' : ''} style="width:auto"> Required</label>
-      </div>`).join('') || '<p class="sub">Add at least one question below.</p>';
-    list.querySelectorAll('[data-label]').forEach((el) => { el.oninput = () => { fields[el.dataset.label].label = el.value; }; });
-    list.querySelectorAll('[data-options]').forEach((el) => { el.oninput = () => { fields[el.dataset.options].options = el.value.split(',').map((s) => s.trim()).filter(Boolean); }; });
-    list.querySelectorAll('[data-required]').forEach((el) => { el.onchange = () => { fields[el.dataset.required].required = el.checked; }; });
-    list.querySelectorAll('[data-remove]').forEach((el) => { el.onclick = () => { fields.splice(Number(el.dataset.remove), 1); redraw(); }; });
-  }
-  redraw();
-  modal.querySelectorAll('[data-add]').forEach((b) => {
-    b.onclick = () => { fields.push({ type: b.dataset.add, label: '', required: false, options: [] }); redraw(); };
-  });
-  modal.querySelector('#form-builder').onsubmit = async (e) => {
-    e.preventDefault();
-    const fd = new FormData(e.target);
-    try {
-      await api('/api/forms', {
-        method: 'POST',
-        body: {
-          title: fd.get('title'),
-          description: fd.get('description') || '',
-          require_signature: !!fd.get('require_signature'),
-          fields,
-        },
-      });
-      closeModal(); toast('Form published — team notified');
-      render();
-    } catch (err) { toast(err.message); }
   };
 }
 
@@ -2186,10 +2201,11 @@ function renderMore() {
   const isAdmin = state.me.role === 'admin';
   const items = [
     { href: '#/hours', icon: '🕐', label: 'Hours Requests', sub: 'Submit worked hours for approval' },
-    { href: '#/forms', icon: '📋', label: 'Forms', sub: 'Review, sign & download documents' },
+    { href: '#/forms', icon: '📄', label: 'Documents', sub: 'Read & sign uploaded documents' },
     ...(isAdmin ? [
       { href: '#/timesheets', icon: '🧾', label: 'Timesheets', sub: 'Hours, approval & payroll CSV' },
       { href: '#/kiosk', icon: '🔢', label: 'Kiosk Mode', sub: 'Lock this device into a PIN punch clock' },
+      { href: '#/signed', icon: '📁', label: 'Signed Documents', sub: 'Who signed what & download copies' },
       { href: '#/roles', icon: '🧑‍🍳', label: 'Jobs', sub: 'Server, Bar Back, Set Up… (clock-outs & scheduling)' },
       { href: '#/positions', icon: '👥', label: 'Positions', sub: 'Team positions & admin permissions' },
     ] : []),
@@ -2242,6 +2258,7 @@ async function render() {
     else if (view === 'positions') await renderPositions();
     else if (view === 'timesheets') await renderTimesheets();
     else if (view === 'forms') await renderForms();
+    else if (view === 'signed') await renderSignedDocs();
     else if (view === 'updates') await renderUpdates();
     else if (view === 'more') renderMore();
     else if (view === 'venues') renderVenues();

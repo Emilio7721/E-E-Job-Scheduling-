@@ -3,7 +3,9 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const DATA_DIR = path.join(__dirname, '..', 'data');
+const UPLOAD_DIR = path.join(DATA_DIR, 'documents');
 fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const db = new DatabaseSync(path.join(DATA_DIR, 'app.db'));
 
@@ -223,6 +225,10 @@ ensureColumn('forms', 'require_signature', 'require_signature INTEGER NOT NULL D
 ensureColumn('form_submissions', 'signature', 'signature TEXT');
 ensureColumn('form_submissions', 'signed_name', 'signed_name TEXT');
 ensureColumn('form_submissions', 'signed_at', 'signed_at TEXT');
+ensureColumn('forms', 'doc_name', 'doc_name TEXT');
+ensureColumn('forms', 'doc_path', 'doc_path TEXT');
+ensureColumn('forms', 'doc_pages', 'doc_pages INTEGER');
+ensureColumn('form_submissions', 'signed_path', 'signed_path TEXT');
 
 // Every user gets a unique 5-digit clock-in PIN.
 function newPin() {
@@ -241,4 +247,4 @@ if (!general) {
   db.prepare(`INSERT INTO channels (name, kind) VALUES ('General', 'group')`).run();
 }
 
-module.exports = { db, DATA_DIR, newPin };
+module.exports = { db, DATA_DIR, UPLOAD_DIR, newPin };

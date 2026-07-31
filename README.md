@@ -8,10 +8,8 @@ A Connecteam-style workforce app for E&E: **job scheduling**, **venues**, **team
 - **📍 Venues** — manage your venue list (name, address, notes, color). Jobs link to venues, and addresses open directly in Google Maps.
 - **💬 Team chat** — a company-wide **General** channel, admin-created group channels, and 1-on-1 direct messages. Messages arrive in real time, with unread badges and last-message previews.
 - **⏱️ Time clock** — one-tap clock in/out, optionally linked to the day's job, with **GPS location recorded at punch time** (when the employee allows it). Employees see their weekly hours at a glance.
-- **🧾 Timesheets & payroll** — admins review everyone's punches per week, edit or delete entries, approve them, and **export a payroll CSV** with hours and pay computed from each person's hourly rate (set in Team).
-- **🏖️ Time off** — employees request vacation/sick/personal days; admins approve or deny with one tap. Both sides get notified.
-- **✅ Tasks** — admins assign to-dos with due dates; each assignee checks their own box, and admins are notified on completion. Overdue tasks are flagged.
-- **📋 Forms & checklists** — admins build forms (text, paragraph, checkbox, dropdown, number, date fields, required flags); employees fill them in from their phone and admins review all submissions.
+- **🧾 Timesheets & hours export** — admins review everyone's punches per week, edit or delete entries, approve them, and **export an hours CSV** with per-punch hours, job, venue and mileage plus per-person totals.
+- **📄 Documents & e-signatures** — admins upload a PDF (handbook, waiver, policy); the team reads it on their phone and signs with a typed name plus a drawn signature. The signature is embedded into a copy of the original PDF as an appended signature page with a full audit trail. Admins get a **Signed Documents** screen showing who has and hasn't signed, with per-person and bulk downloads.
 - **📢 Updates feed** — company announcements posted by admins, pushed to every phone, with likes.
 - **🔔 Notifications on your phone** — real web push notifications (banner + lock screen) for job assignments, schedule changes, cancellations, chat messages, tasks, time-off decisions, new forms, and announcements — even when the app is closed. Plus an in-app notification feed.
 - **🔑 PIN sign-in** — no passwords: new team members sign up with their **name and phone number** and get a unique **5-digit PIN** used to sign in and clock in. The **first account created becomes the admin**.
@@ -55,7 +53,7 @@ Use the **Test** button in Settings to confirm the device receives notifications
 
 ## Tech
 
-- **Backend:** Node.js + Express, SQLite (`node:sqlite`), Server-Sent Events for realtime, `web-push` (VAPID) for phone notifications.
+- **Backend:** Node.js + Express, SQLite (`node:sqlite`), Server-Sent Events for realtime, `web-push` (VAPID) for phone notifications, `pdf-lib` for embedding signatures into uploaded PDFs.
 - **Frontend:** dependency-free vanilla JS single-page app, mobile-first, PWA (service worker + manifest, offline shell caching).
 - **Auth:** PIN-based sign-in with per-IP rate limiting, HMAC-signed session cookies. Admin/member roles; members can only punch at an admin-armed kiosk.
 
@@ -68,5 +66,5 @@ src/auth.js        # sessions, password hashing, auth middleware
 src/push.js        # web-push / VAPID key management
 src/events.js      # SSE realtime hub
 public/            # the PWA (index.html, app.js, styles.css, sw.js, manifest, icons)
-data/              # created at runtime: SQLite db, secrets, VAPID keys (git-ignored)
+data/              # created at runtime: SQLite db, secrets, VAPID keys, uploaded and signed documents (git-ignored)
 ```
