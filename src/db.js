@@ -215,6 +215,7 @@ ensureColumn('users', 'pin', 'pin TEXT');
 ensureColumn('users', 'phone', 'phone TEXT');
 ensureColumn('users', 'role_id', 'role_id INTEGER');
 ensureColumn('users', 'position_id', 'position_id INTEGER');
+ensureColumn('users', 'worker_id', 'worker_id TEXT');
 ensureColumn('roles', 'is_admin', 'is_admin INTEGER NOT NULL DEFAULT 0');
 ensureColumn('shifts', 'role_id', 'role_id INTEGER');
 ensureColumn('shifts', 'reminded_at', 'reminded_at TEXT');
@@ -231,6 +232,11 @@ ensureColumn('forms', 'doc_pages', 'doc_pages INTEGER');
 ensureColumn('form_submissions', 'signed_path', 'signed_path TEXT');
 
 db.exec(`
+  CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS signature_fields (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     form_id INTEGER NOT NULL REFERENCES forms(id) ON DELETE CASCADE,

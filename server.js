@@ -94,11 +94,54 @@ app.get('/api/me', requireAuth, (req, res) => {
   res.json({ user: { ...req.user, pin }, vapidPublicKey: push.publicKey });
 });
 
+/* -------------------------------- settings --------------------------------- */
+
+const SETTING_DEFAULTS = {
+  paychex_company_id: '',
+  pay_component: 'Hourly',
+  // Monday of the first pay period; every period runs 14 days from here.
+  period_anchor: '2026-01-05',
+  export_per_day: '0',   // one row per employee per day (adds Line Date)
+  export_jobs: '0',      // include venue as Job Number / Job Name
+};
+
+function getSettings() {
+  const rows = db.prepare('SELECT key, value FROM settings').all();
+  const out = { ...SETTING_DEFAULTS };
+  for (const r of rows) if (r.key in out) out[r.key] = r.value;
+  return out;
+}
+
+app.get('/api/settings', requireAuth, (req, res) => {
+  res.json({ settings: getSettings() });
+});
+
+app.put('/api/settings', requireAuth, requireAdmin, (req, res) => {
+  const body = req.body || {};
+  const save = db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');
+  for (const key of Object.keys(SETTING_DEFAULTS)) {
+    if (!(key in body)) continue;
+    let value = String(body[key] ?? '').trim();
+    if (key === 'paychex_company_id' && value && !/^[a-z0-9]{1,8}$/i.test(value)) {
+      return res.status(400).json({ error: 'Paychex Company ID must be up to 8 letters or numbers' });
+    }
+    if (key === 'pay_component' && value.length > 20) {
+      return res.status(400).json({ error: 'Pay Component must be 20 characters or fewer' });
+    }
+    if (key === 'period_anchor' && value && !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+      return res.status(400).json({ error: 'Pay period start must be a date' });
+    }
+    save.run(key, value);
+  }
+  events.broadcast('settings', {});
+  res.json({ settings: getSettings() });
+});
+
 /* ---------------------------------- team ---------------------------------- */
 
 app.get('/api/users', requireAuth, (req, res) => {
   const cols = req.user.role === 'admin'
-    ? 'id, name, email, phone, role, position_id, color, pin'
+    ? 'id, name, email, phone, role, position_id, color, pin, worker_id'
     : 'id, name, email, phone, role, position_id, color';
   const users = db.prepare(`SELECT ${cols} FROM users ORDER BY name`).all();
   if (req.user.role === 'admin') {
@@ -111,7 +154,16 @@ app.get('/api/users', requireAuth, (req, res) => {
 app.patch('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
   const target = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.id));
   if (!target) return res.status(404).json({ error: 'User not found' });
-  const { role = target.role, position_id } = req.body || {};
+  const { role = target.role, position_id, worker_id } = req.body || {};
+  if (worker_id !== undefined) {
+    const wid = String(worker_id || '').trim();
+    if (wid && !/^[a-z0-9]{1,10}$/i.test(wid)) {
+      return res.status(400).json({ error: 'Worker ID must be up to 10 letters or numbers' });
+    }
+    const clash = wid ? db.prepare('SELECT id FROM users WHERE worker_id = ? AND id != ?').get(wid, target.id) : null;
+    if (clash) return res.status(409).json({ error: 'Another team member already has that Worker ID' });
+    db.prepare('UPDATE users SET worker_id = ? WHERE id = ?').run(wid || null, target.id);
+  }
   if (!['admin', 'member'].includes(role)) return res.status(400).json({ error: 'Invalid role' });
 
   // A position with admin permission makes the person an admin.
@@ -647,14 +699,35 @@ app.get('/api/time/entries', requireAuth, (req, res) => {
 app.patch('/api/time/entries/:id', requireAuth, requireAdmin, (req, res) => {
   const entry = db.prepare('SELECT * FROM time_entries WHERE id = ?').get(Number(req.params.id));
   if (!entry) return res.status(404).json({ error: 'Entry not found' });
-  const { clock_in = entry.clock_in, clock_out = entry.clock_out, approved = entry.approved } = req.body || {};
+  const {
+    clock_in = entry.clock_in, clock_out = entry.clock_out, approved = entry.approved,
+    venue_id = entry.venue_id, role_id = entry.role_id,
+    mileage = entry.mileage, note = entry.note,
+  } = req.body || {};
   if (clock_out && new Date(clock_out) <= new Date(clock_in)) {
     return res.status(400).json({ error: 'Clock-out must be after clock-in' });
   }
-  db.prepare('UPDATE time_entries SET clock_in = ?, clock_out = ?, approved = ? WHERE id = ?')
-    .run(clock_in, clock_out, approved ? 1 : 0, entry.id);
+  if (approved && !clock_out) {
+    return res.status(400).json({ error: 'Add a clock-out time before approving' });
+  }
+  db.prepare(`UPDATE time_entries SET clock_in = ?, clock_out = ?, approved = ?,
+      venue_id = ?, role_id = ?, mileage = ?, note = ? WHERE id = ?`)
+    .run(clock_in, clock_out, approved ? 1 : 0, venue_id || null, role_id || null,
+      Math.max(0, Number(mileage) || 0), String(note || '').slice(0, 500), entry.id);
   events.broadcast('time', {});
   res.json({ ok: true });
+});
+
+// Approve (or un-approve) every finished punch a person has in a period.
+app.post('/api/time/approve', requireAuth, requireAdmin, (req, res) => {
+  const { user_id, from, to, approved = true } = req.body || {};
+  if (!user_id || !from || !to) return res.status(400).json({ error: 'user_id, from and to are required' });
+  const info = db.prepare(`
+    UPDATE time_entries SET approved = ?
+    WHERE user_id = ? AND clock_in >= ? AND clock_in < ? AND clock_out IS NOT NULL
+  `).run(approved ? 1 : 0, Number(user_id), from, to);
+  events.broadcast('time', {});
+  res.json({ ok: true, changed: info.changes });
 });
 
 app.delete('/api/time/entries/:id', requireAuth, requireAdmin, (req, res) => {
@@ -663,385 +736,74 @@ app.delete('/api/time/entries/:id', requireAuth, requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
-// Payroll CSV export: one row per entry with hours and computed pay.
+// Paychex SPI import file (flexible layout) for a pay period.
+// Only approved, finished punches are exported; rates are deliberately absent
+// so Paychex applies each worker's configured rate.
 app.get('/api/time/export', requireAuth, requireAdmin, (req, res) => {
-  const { from = '1970-01-01', to = '9999-12-31' } = req.query;
+  const { from, to } = req.query;
+  if (!from || !to) return res.status(400).json({ error: 'A pay period is required' });
+  const cfg = getSettings();
+
   const entries = db.prepare(
-    TIME_ENTRY_QUERY + ' WHERE t.clock_in >= ? AND t.clock_in < ? AND t.clock_out IS NOT NULL ORDER BY u.name, t.clock_in'
+    TIME_ENTRY_QUERY + ' WHERE t.approved = 1 AND t.clock_out IS NOT NULL AND t.clock_in >= ? AND t.clock_in < ? ORDER BY u.name, t.clock_in'
   ).all(from, to);
-  const csvEsc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
-  const rows = [['Employee', 'Phone', 'Clock in', 'Clock out', 'Hours', 'Job', 'Venue', 'Role', 'Mileage', 'Approved']];
-  const totals = new Map();
+
+  const workerIds = new Map(db.prepare('SELECT id, worker_id FROM users').all().map((u) => [u.id, u.worker_id]));
+  const missing = [...new Set(entries.filter((e) => !workerIds.get(e.user_id)).map((e) => e.user_name))];
+  if (missing.length) {
+    return res.status(400).json({ error: `Add a Paychex Worker ID in Team for: ${missing.join(', ')}` });
+  }
+  if (!cfg.paychex_company_id) {
+    return res.status(400).json({ error: 'Set your Paychex Company ID in Timesheets settings first' });
+  }
+
+  const perDay = cfg.export_per_day === '1';
+  const withJobs = cfg.export_jobs === '1';
+  const tz = process.env.APP_TZ || 'America/New_York';
+  const dayKey = (iso) => new Date(iso).toLocaleDateString('en-CA', { timeZone: tz });       // yyyy-mm-dd
+  const lineDate = (iso) => new Date(iso).toLocaleDateString('en-US', {
+    timeZone: tz, month: '2-digit', day: '2-digit', year: 'numeric',
+  });
+
+  // Group hours to the level the settings ask for.
+  const groups = new Map();
   for (const e of entries) {
     const hours = (new Date(e.clock_out) - new Date(e.clock_in)) / 3600000;
-    const contact = db.prepare('SELECT phone, email FROM users WHERE id = ?').get(e.user_id);
-    rows.push([e.user_name, contact?.phone || contact?.email || '', e.clock_in, e.clock_out, hours.toFixed(2), e.shift_title || '', e.venue_name || '', e.role_name || '', (e.mileage || 0).toFixed(1), e.approved ? 'yes' : 'no']);
-    const t = totals.get(e.user_name) || { hours: 0, mileage: 0 };
-    t.hours += hours; t.mileage += (e.mileage || 0);
-    totals.set(e.user_name, t);
-  }
-  rows.push([]);
-  rows.push(['TOTALS', '', '', '', 'Hours', '', '', '', 'Mileage']);
-  for (const [name, t] of totals) rows.push([name, '', '', '', t.hours.toFixed(2), '', '', '', t.mileage.toFixed(1)]);
-  res.setHeader('Content-Type', 'text/csv');
-  res.setHeader('Content-Disposition', `attachment; filename="timesheet-${from.slice(0, 10)}-to-${to.slice(0, 10)}.csv"`);
-  res.send(rows.map((r) => r.map(csvEsc).join(',')).join('\n'));
-});
-
-/* ---------------------------------- forms ----------------------------------- */
-
-const FIELD_TYPES = ['text', 'textarea', 'number', 'date', 'checkbox', 'select'];
-
-function sanitizeFields(fields) {
-  if (!Array.isArray(fields)) return null;
-  const out = [];
-  for (const f of fields.slice(0, 30)) {
-    if (!f || typeof f.label !== 'string' || !f.label.trim()) return null;
-    if (!FIELD_TYPES.includes(f.type)) return null;
-    out.push({
-      id: out.length + 1,
-      label: f.label.trim().slice(0, 200),
-      type: f.type,
-      required: !!f.required,
-      options: f.type === 'select' ? (Array.isArray(f.options) ? f.options.map(String).filter(Boolean).slice(0, 30) : []) : undefined,
-    });
-  }
-  return out.length ? out : null;
-}
-
-app.get('/api/forms', requireAuth, (req, res) => {
-  const headcount = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
-  const forms = db.prepare('SELECT * FROM forms WHERE archived = 0 ORDER BY id DESC').all()
-    .map((f) => ({
-      ...f,
-      fields: JSON.parse(f.fields),
-      my_submissions: db.prepare('SELECT COUNT(*) AS n FROM form_submissions WHERE form_id = ? AND user_id = ?').get(f.id, req.user.id).n,
-      signed_count: db.prepare('SELECT COUNT(DISTINCT user_id) AS n FROM form_submissions WHERE form_id = ?').get(f.id).n,
-      field_count: db.prepare('SELECT COUNT(*) AS n FROM signature_fields WHERE form_id = ?').get(f.id).n,
-      headcount,
-    }));
-  res.json({ forms });
-});
-
-// Admins upload a PDF; the team signs that document as-is.
-app.post('/api/forms', requireAuth, requireAdmin, async (req, res) => {
-  const { title, description = '', file } = req.body || {};
-  if (!title?.trim()) return res.status(400).json({ error: 'Document title is required' });
-  if (!file?.data || typeof file.data !== 'string') return res.status(400).json({ error: 'Choose a PDF to upload' });
-
-  const base64 = file.data.includes(',') ? file.data.split(',').pop() : file.data;
-  let bytes;
-  try { bytes = Buffer.from(base64, 'base64'); } catch { return res.status(400).json({ error: 'That file could not be read' }); }
-  if (!bytes.length) return res.status(400).json({ error: 'That file is empty' });
-  if (bytes.length > 12 * 1024 * 1024) return res.status(400).json({ error: 'PDFs must be under 12 MB' });
-  if (bytes.subarray(0, 5).toString() !== '%PDF-') return res.status(400).json({ error: 'Only PDF documents can be uploaded' });
-
-  let pages;
-  try { pages = (await PDFDocument.load(bytes, { ignoreEncryption: true })).getPageCount(); }
-  catch { return res.status(400).json({ error: 'That PDF could not be opened — try re-saving it' }); }
-
-  const docPath = path.join(UPLOAD_DIR, `${Date.now()}-${crypto.randomBytes(4).toString('hex')}.pdf`);
-  fs.writeFileSync(docPath, bytes);
-
-  const info = db.prepare(
-    'INSERT INTO forms (title, description, fields, require_signature, doc_name, doc_path, doc_pages, created_by) VALUES (?, ?, ?, 1, ?, ?, ?, ?)'
-  ).run(title.trim(), String(description).trim(), '[]',
-    String(file.name || 'document.pdf').slice(0, 200), docPath, pages, req.user.id);
-
-  events.broadcast('forms', {});
-  const members = db.prepare('SELECT id FROM users WHERE id != ?').all(req.user.id).map((r) => r.id);
-  notify(members, {
-    title: `New document to sign: ${title.trim()}`,
-    body: 'Tap to read and sign it',
-    url: '/#/forms',
-  });
-  res.json({ form: db.prepare('SELECT * FROM forms WHERE id = ?').get(Number(info.lastInsertRowid)) });
-});
-
-const FIELD_KINDS = ['signature', 'date', 'name'];
-
-// Where each stamp goes on the uploaded PDF. Coordinates arrive already
-// converted to PDF points by the placement screen, so no rotation math here.
-app.get('/api/forms/:id/fields', requireAuth, (req, res) => {
-  const fields = db.prepare('SELECT id, page, kind, x, y, w, h FROM signature_fields WHERE form_id = ? ORDER BY id')
-    .all(Number(req.params.id));
-  res.json({ fields });
-});
-
-app.put('/api/forms/:id/fields', requireAuth, requireAdmin, (req, res) => {
-  const form = db.prepare('SELECT * FROM forms WHERE id = ?').get(Number(req.params.id));
-  if (!form) return res.status(404).json({ error: 'Document not found' });
-  const incoming = Array.isArray(req.body?.fields) ? req.body.fields : null;
-  if (!incoming) return res.status(400).json({ error: 'No fields supplied' });
-  if (incoming.length > 60) return res.status(400).json({ error: 'That is too many fields for one document' });
-
-  const clean = [];
-  for (const f of incoming) {
-    const page = Number(f.page);
-    const [x, y, w, h] = [Number(f.x), Number(f.y), Number(f.w), Number(f.h)];
-    if (!Number.isInteger(page) || page < 0 || page >= (form.doc_pages || 1)) {
-      return res.status(400).json({ error: 'A field points at a page that does not exist' });
-    }
-    if (![x, y, w, h].every(Number.isFinite) || w <= 0 || h <= 0) {
-      return res.status(400).json({ error: 'A field has an invalid position' });
-    }
-    if (!FIELD_KINDS.includes(f.kind)) return res.status(400).json({ error: 'Unknown field type' });
-    clean.push({ page, kind: f.kind, x, y, w, h });
+    const key = [e.user_id, perDay ? dayKey(e.clock_in) : '', withJobs ? (e.venue_id || '') : ''].join('|');
+    const g = groups.get(key) || {
+      worker: workerIds.get(e.user_id),
+      date: e.clock_in,
+      venueName: e.venue_name || '',
+      venueId: e.venue_id || '',
+      hours: 0,
+    };
+    g.hours += hours;
+    groups.set(key, g);
   }
 
-  db.prepare('DELETE FROM signature_fields WHERE form_id = ?').run(form.id);
-  const insert = db.prepare('INSERT INTO signature_fields (form_id, page, kind, x, y, w, h) VALUES (?, ?, ?, ?, ?, ?, ?)');
-  for (const f of clean) insert.run(form.id, f.page, f.kind, f.x, f.y, f.w, f.h);
-  events.broadcast('forms', {});
-  res.json({ ok: true, count: clean.length });
-});
+  const header = ['Company ID', 'Worker ID', 'Pay Component', 'Hours'];
+  if (perDay) header.push('Line Date');
+  if (withJobs) header.push('Job Number', 'Job Name');
 
-// The original document, for reading before signing.
-app.get('/api/forms/:id/document', requireAuth, (req, res) => {
-  const form = db.prepare('SELECT * FROM forms WHERE id = ?').get(Number(req.params.id));
-  if (!form?.doc_path || !fs.existsSync(form.doc_path)) return res.status(404).json({ error: 'Document not found' });
-  res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', `inline; filename="${(form.doc_name || 'document.pdf').replace(/[^\w.-]+/g, '_')}"`);
-  fs.createReadStream(form.doc_path).pipe(res);
-});
-
-app.delete('/api/forms/:id', requireAuth, requireAdmin, (req, res) => {
-  db.prepare('UPDATE forms SET archived = 1 WHERE id = ?').run(Number(req.params.id));
-  events.broadcast('forms', {});
-  res.json({ ok: true });
-});
-
-// Builds the signed copy: the original document with a signature page appended.
-async function buildSignedPdf(form, { signerName, typedName, signature, signedAt, shortDate, docId, contact }) {
-  const original = fs.readFileSync(form.doc_path);
-  const pdf = await PDFDocument.load(original, { ignoreEncryption: true });
-  const font = await pdf.embedFont(StandardFonts.Helvetica);
-  const bold = await pdf.embedFont(StandardFonts.HelveticaBold);
-
-  // Stamp wherever the admin placed fields on the document itself.
-  const placed = db.prepare('SELECT page, kind, x, y, w, h FROM signature_fields WHERE form_id = ? ORDER BY id').all(form.id);
-  let sigImage = null;
-  if (placed.some((f) => f.kind === 'signature') && signature) {
-    try { sigImage = await pdf.embedPng(Buffer.from(signature.split(',').pop(), 'base64')); }
-    catch { sigImage = null; }
-  }
-  for (const f of placed) {
-    if (f.page >= pdf.getPageCount()) continue;
-    const target = pdf.getPage(f.page);
-    if (f.kind === 'signature') {
-      if (!sigImage) continue;
-      // Fit inside the box without distorting the handwriting.
-      const scale = Math.min(f.w / sigImage.width, f.h / sigImage.height);
-      const dw = sigImage.width * scale;
-      const dh = sigImage.height * scale;
-      target.drawImage(sigImage, { x: f.x + (f.w - dw) / 2, y: f.y + (f.h - dh) / 2, width: dw, height: dh });
-    } else {
-      const text = f.kind === 'date' ? shortDate : (typedName || signerName);
-      const size = Math.min(12, Math.max(7, f.h * 0.62));
-      target.drawText(text, { x: f.x + 2, y: f.y + (f.h - size) / 2 + 1, size, font, color: rgb(0, 0, 0) });
-    }
-  }
-
-  const last = pdf.getPage(pdf.getPageCount() - 1);
-  const { width, height } = last.getSize();
-  const page = pdf.addPage([width, height]);
-  const margin = 54;
-  let y = height - margin;
-
-  const line = (text, { size = 11, f = font, color = rgb(0, 0, 0), gap = 16 } = {}) => {
-    page.drawText(text, { x: margin, y, size, font: f, color });
-    y -= gap;
+  const csvEsc = (v) => {
+    const str = String(v ?? '');
+    return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
   };
-
-  line('E&E Management', { size: 18, f: bold, gap: 14 });
-  line('Event Services and More', { size: 9, color: rgb(0.4, 0.4, 0.4), gap: 26 });
-  line('Signature Page', { size: 15, f: bold, gap: 20 });
-  line(form.title, { size: 12, f: bold, gap: 14 });
-  line(`Document: ${form.doc_name || 'document.pdf'}`, { size: 9, color: rgb(0.35, 0.35, 0.35), gap: 26 });
-
-  page.drawLine({
-    start: { x: margin, y }, end: { x: width - margin, y },
-    thickness: 0.8, color: rgb(0.8, 0.8, 0.8),
-  });
-  y -= 30;
-
-  line('Signed by', { size: 9, color: rgb(0.35, 0.35, 0.35), gap: 15 });
-  line(signerName, { size: 13, f: bold, gap: 30 });
-
-  if (signature) {
-    try {
-      const png = await pdf.embedPng(Buffer.from(signature.split(',').pop(), 'base64'));
-      const w = 220;
-      const h = (png.height / png.width) * w;
-      page.drawImage(png, { x: margin, y: y - h + 10, width: w, height: h });
-      y -= h + 6;
-    } catch { /* a corrupt signature image must not block the document */ }
+  const rows = [header];
+  for (const g of groups.values()) {
+    // Paychex rejects meaningless zero-hour lines, so drop anything that
+    // rounds away (a punch corrected to the same in/out time, say).
+    if (g.hours < 0.005) continue;
+    const row = [cfg.paychex_company_id, g.worker, cfg.pay_component, g.hours.toFixed(2)];
+    if (perDay) row.push(lineDate(g.date));
+    if (withJobs) row.push(String(g.venueId).slice(0, 25), g.venueName.slice(0, 30));
+    rows.push(row);
   }
 
-  page.drawLine({
-    start: { x: margin, y }, end: { x: margin + 240, y },
-    thickness: 1, color: rgb(0.2, 0.2, 0.2),
-  });
-  y -= 16;
-  line(typedName || signerName, { size: 11, gap: 18 });
-  line(`Signed electronically on ${signedAt}`, { size: 9, color: rgb(0.35, 0.35, 0.35), gap: 13 });
-  line(`Signer: ${signerName}${contact ? ' · ' + contact : ''}`, { size: 9, color: rgb(0.35, 0.35, 0.35), gap: 13 });
-  line(`Document ID ${docId}`, { size: 9, color: rgb(0.35, 0.35, 0.35), gap: 13 });
-  line('This electronic signature is the legal equivalent of a handwritten signature.', {
-    size: 8, color: rgb(0.5, 0.5, 0.5), gap: 13,
-  });
-
-  return Buffer.from(await pdf.save());
-}
-
-app.post('/api/forms/:id/submit', requireAuth, async (req, res) => {
-  const form = db.prepare('SELECT * FROM forms WHERE id = ? AND archived = 0').get(Number(req.params.id));
-  if (!form) return res.status(404).json({ error: 'Document not found' });
-
-  let { signature = null, signed_name = '' } = req.body || {};
-  signed_name = String(signed_name).trim().slice(0, 120);
-  if (!signed_name) return res.status(400).json({ error: 'Type your full name to sign' });
-  if (typeof signature !== 'string' || !signature.startsWith('data:image/png;base64,')) {
-    return res.status(400).json({ error: 'Draw your signature to sign' });
-  }
-  if (signature.length > 400000) return res.status(400).json({ error: 'Signature image is too large' });
-
-  const signedAtIso = new Date().toISOString();
-  const info = db.prepare(
-    'INSERT INTO form_submissions (form_id, user_id, answers, signature, signed_name, signed_at) VALUES (?, ?, ?, ?, ?, ?)'
-  ).run(form.id, req.user.id, '{}', signature, signed_name, signedAtIso);
-  const submissionId = Number(info.lastInsertRowid);
-
-  // Stamp the signature into a copy of the uploaded document and keep that
-  // file — it is the artifact admins download later.
-  if (form.doc_path && fs.existsSync(form.doc_path)) {
-    try {
-      const signedAt = new Date(signedAtIso).toLocaleString('en-US', {
-        dateStyle: 'long', timeStyle: 'short', timeZone: process.env.APP_TZ || 'America/New_York',
-      });
-      const pdfBytes = await buildSignedPdf(form, {
-        signerName: req.user.name,
-        typedName: signed_name,
-        signature,
-        signedAt,
-        shortDate: new Date(signedAtIso).toLocaleDateString('en-US', {
-          month: 'numeric', day: 'numeric', year: 'numeric', timeZone: process.env.APP_TZ || 'America/New_York',
-        }),
-        docId: `${form.id}-${submissionId}`,
-        contact: req.user.phone || '',
-      });
-      const outPath = path.join(UPLOAD_DIR, `signed-${form.id}-${submissionId}.pdf`);
-      fs.writeFileSync(outPath, pdfBytes);
-      db.prepare('UPDATE form_submissions SET signed_path = ? WHERE id = ?').run(outPath, submissionId);
-    } catch (err) {
-      console.error('signed pdf generation failed:', err.message);
-    }
-  }
-
-  events.broadcast('forms', {});
-  const admins = db.prepare(`SELECT id FROM users WHERE role = 'admin'`).all().map((r) => r.id);
-  notify(admins.filter((id) => id !== req.user.id), {
-    title: `${req.user.name} signed "${form.title}"`,
-    body: 'Tap to review or download the signed copy',
-    url: '/#/signed',
-  });
-  res.json({ ok: true });
-});
-
-// Who has completed a form and who still owes it.
-app.get('/api/forms/:id/status', requireAuth, requireAdmin, (req, res) => {
-  const form = db.prepare('SELECT * FROM forms WHERE id = ?').get(Number(req.params.id));
-  if (!form) return res.status(404).json({ error: 'Form not found' });
-  const people = db.prepare(`
-    SELECT u.id, u.name, u.color,
-           s.id AS submission_id, s.signed_at, s.created_at
-    FROM users u
-    LEFT JOIN form_submissions s
-      ON s.user_id = u.id
-     AND s.id = (SELECT MAX(id) FROM form_submissions WHERE form_id = ? AND user_id = u.id)
-    ORDER BY u.name
-  `).all(form.id);
-  res.json({ form: { ...form, fields: JSON.parse(form.fields) }, people });
-});
-
-app.get('/api/forms/:id/submissions', requireAuth, (req, res) => {
-  const form = db.prepare('SELECT * FROM forms WHERE id = ?').get(Number(req.params.id));
-  if (!form) return res.status(404).json({ error: 'Form not found' });
-  let sql = `
-    SELECT s.*, u.name AS user_name, u.color AS user_color
-    FROM form_submissions s LEFT JOIN users u ON u.id = s.user_id
-    WHERE s.form_id = ?`;
-  const params = [form.id];
-  if (req.user.role !== 'admin') { sql += ' AND s.user_id = ?'; params.push(req.user.id); }
-  sql += ' ORDER BY s.id DESC LIMIT 200';
-  const submissions = db.prepare(sql).all(...params).map((s) => ({ ...s, answers: JSON.parse(s.answers) }));
-  res.json({ form: { ...form, fields: JSON.parse(form.fields) }, submissions });
-});
-
-/* ---------------------------------- kiosk ----------------------------------- */
-
-// Arm (or verify to disarm) kiosk mode: only an admin PIN unlocks it.
-// On success the device's session becomes that admin's, so punches authorize.
-app.post('/api/kiosk/arm', (req, res) => {
-  if (tooManyAttempts(req)) return res.status(429).json({ error: 'Too many attempts — wait a few minutes' });
-  const pin = String(req.body?.pin || '');
-  const user = /^\d{5}$/.test(pin)
-    ? db.prepare(`SELECT * FROM users WHERE pin = ? AND role = 'admin'`).get(pin)
-    : null;
-  if (!user) return res.status(403).json({ error: 'Admin PIN required' });
-  setAuthCookie(res, user.id);
-  res.json({ ok: true, name: user.name });
-});
-
-// Look up a PIN at the kiosk: who it is, whether they're clocked in, and
-// their scheduled job right now (used to prefill venue and sub-job).
-app.post('/api/kiosk/status', requireAuth, requireAdmin, (req, res) => {
-  const pin = String(req.body?.pin || '');
-  if (!/^\d{5}$/.test(pin)) return res.status(400).json({ error: 'Enter a 5-digit PIN' });
-  const user = db.prepare('SELECT id, name, role FROM users WHERE pin = ?').get(pin);
-  if (!user) return res.status(404).json({ error: 'PIN not recognized' });
-  const entry = db.prepare(TIME_ENTRY_QUERY + ' WHERE t.user_id = ? AND t.clock_out IS NULL').get(user.id) || null;
-  const now = Date.now();
-  const shift = db.prepare(`
-    SELECT s.id, s.venue_id, s.role_id, v.name AS venue_name, r.name AS role_name
-    FROM shifts s
-    JOIN shift_assignees a ON a.shift_id = s.id
-    LEFT JOIN venues v ON v.id = s.venue_id
-    LEFT JOIN roles r ON r.id = s.role_id
-    WHERE a.user_id = ? AND s.starts_at < ? AND s.ends_at > ?
-    ORDER BY s.starts_at LIMIT 1
-  `).get(user.id, new Date(now + 12 * 3600000).toISOString(), new Date(now - 12 * 3600000).toISOString()) || null;
-  res.json({ user, entry, shift });
-});
-
-// A shared device (armed by an admin) where workers punch in/out by PIN.
-app.post('/api/kiosk/punch', requireAuth, requireAdmin, (req, res) => {
-  const pin = String(req.body?.pin || '');
-  if (!/^\d{5}$/.test(pin)) return res.status(400).json({ error: 'Enter a 5-digit PIN' });
-  const user = db.prepare('SELECT id, name FROM users WHERE pin = ?').get(pin);
-  if (!user) return res.status(404).json({ error: 'PIN not recognized' });
-  const { lat = null, lng = null, venue_id = null, role_id = null, shift_id = null, mileage = null, note = '' } = req.body || {};
-
-  const open = db.prepare('SELECT * FROM time_entries WHERE user_id = ? AND clock_out IS NULL').get(user.id);
-  const now = new Date().toISOString();
-  let action;
-  if (open) {
-    db.prepare(`UPDATE time_entries SET clock_out = ?, out_lat = ?, out_lng = ?,
-        venue_id = COALESCE(?, venue_id), role_id = COALESCE(?, role_id),
-        mileage = COALESCE(?, mileage),
-        note = CASE WHEN ? != '' THEN ? ELSE note END
-      WHERE id = ?`)
-      .run(now, lat, lng, venue_id || null, role_id || null,
-        mileage != null ? Math.max(0, Number(mileage) || 0) : null,
-        String(note || '').slice(0, 500), String(note || '').slice(0, 500), open.id);
-    action = 'out';
-  } else {
-    db.prepare(`INSERT INTO time_entries (user_id, shift_id, venue_id, role_id, clock_in, in_lat, in_lng, note) VALUES (?, ?, ?, ?, ?, ?, ?, 'kiosk')`)
-      .run(user.id, shift_id || null, venue_id || null, role_id || null, now, lat, lng);
-    action = 'in';
-  }
-  events.broadcast('time', {});
-  res.json({ name: user.name, action, at: now });
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', `attachment; filename="paychex-spi-${from.slice(0, 10)}.csv"`);
+  // Paychex expects CRLF line endings in the import file.
+  res.send(rows.map((r) => r.map(csvEsc).join(',')).join('\r\n') + '\r\n');
 });
 
 /* ---------------------------------- roles ----------------------------------- */
