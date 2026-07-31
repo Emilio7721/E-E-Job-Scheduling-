@@ -1,6 +1,6 @@
 /* Service worker: offline shell cache + push notifications. */
 
-const CACHE = 'ee-shell-v3';
+const CACHE = 'ee-shell-v4';
 const SHELL = ['/', '/styles.css', '/app.js', '/manifest.webmanifest', '/icons/icon-192.png', '/brand/logo.png'];
 
 self.addEventListener('install', (event) => {
@@ -18,7 +18,7 @@ self.addEventListener('activate', (event) => {
 // Network-first for everything; fall back to the cached shell when offline.
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
-  if (event.request.method !== 'GET' || url.pathname.startsWith('/api/')) return;
+  if (event.request.method !== 'GET' || url.pathname.startsWith('/api/') || url.pathname.startsWith('/vendor/')) return;
   event.respondWith(
     fetch(event.request)
       .then((res) => {
