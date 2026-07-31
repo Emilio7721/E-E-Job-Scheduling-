@@ -232,6 +232,13 @@ ensureColumn('forms', 'doc_pages', 'doc_pages INTEGER');
 ensureColumn('form_submissions', 'signed_path', 'signed_path TEXT');
 
 db.exec(`
+  CREATE TABLE IF NOT EXISTS worker_id_roster (
+    name_key     TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    worker_id    TEXT NOT NULL,
+    imported_at  TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
   CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL

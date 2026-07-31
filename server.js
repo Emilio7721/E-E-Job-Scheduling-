@@ -69,6 +69,7 @@ app.post('/api/auth/register', (req, res) => {
 
   const general = db.prepare(`SELECT id FROM channels WHERE kind = 'group' AND name = 'General'`).get();
   db.prepare('INSERT OR IGNORE INTO channel_members (channel_id, user_id) VALUES (?, ?)').run(general.id, userId);
+  claimWorkerId(userId, name.trim());
 
   setAuthCookie(res, userId);
   res.json({ user: publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(userId)), pin });
@@ -92,6 +93,98 @@ app.post('/api/auth/logout', (req, res) => {
 app.get('/api/me', requireAuth, (req, res) => {
   const { pin } = db.prepare('SELECT pin FROM users WHERE id = ?').get(req.user.id);
   res.json({ user: { ...req.user, pin }, vapidPublicKey: push.publicKey });
+});
+
+/* ----------------------- payroll worker id matching ------------------------ */
+
+// Paychex lists people as "Last, First Middle" while the app knows them as
+// "First Last". Reduce both to the same key: first and last significant word,
+// accent- and punctuation-free, so middle names and initials do not matter.
+function nameKey(raw) {
+  let text = String(raw || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  if (text.includes(',')) {
+    const [last, rest] = text.split(',');
+    text = `${rest || ''} ${last}`;
+  }
+  const words = text.toLowerCase().replace(/[^a-z\s]/g, ' ').split(/\s+/).filter((w) => w.length > 1);
+  if (!words.length) return '';
+  return [words[0], words[words.length - 1]].sort().join('|');
+}
+
+// Called after a new signup: if payroll already listed this person, give them
+// their Worker ID automatically.
+function claimWorkerId(userId, name) {
+  const key = nameKey(name);
+  if (!key) return null;
+  const row = db.prepare('SELECT worker_id FROM worker_id_roster WHERE name_key = ?').get(key);
+  if (!row) return null;
+  const taken = db.prepare('SELECT id FROM users WHERE worker_id = ? AND id != ?').get(row.worker_id, userId);
+  if (taken) return null;
+  db.prepare('UPDATE users SET worker_id = ? WHERE id = ?').run(row.worker_id, userId);
+  return row.worker_id;
+}
+
+// Bulk import of a payroll roster: assigns Worker IDs to matching team members
+// and remembers the rest for whoever signs up later.
+app.post('/api/users/worker-ids/import', requireAuth, requireAdmin, (req, res) => {
+  const rows = Array.isArray(req.body?.entries) ? req.body.entries : null;
+  if (!rows) return res.status(400).json({ error: 'Nothing to import' });
+  if (rows.length > 2000) return res.status(400).json({ error: 'That list is too long' });
+
+  const users = db.prepare('SELECT id, name, worker_id FROM users').all();
+  const byKey = new Map();
+  for (const u of users) {
+    const key = nameKey(u.name);
+    if (!key) continue;
+    if (byKey.has(key)) byKey.get(key).push(u); else byKey.set(key, [u]);
+  }
+
+  const remember = db.prepare(`
+    INSERT INTO worker_id_roster (name_key, display_name, worker_id) VALUES (?, ?, ?)
+    ON CONFLICT(name_key) DO UPDATE SET display_name = excluded.display_name, worker_id = excluded.worker_id
+  `);
+  const assign = db.prepare('UPDATE users SET worker_id = ? WHERE id = ?');
+
+  const assigned = [];
+  const pending = [];
+  const ambiguous = [];
+  const skipped = [];
+  const seenIds = new Set(users.filter((u) => u.worker_id).map((u) => u.worker_id));
+
+  for (const row of rows) {
+    const name = String(row?.name || '').trim();
+    const workerId = String(row?.worker_id || '').trim();
+    if (!name || !/^[a-z0-9]{1,10}$/i.test(workerId)) {
+      skipped.push({ name, worker_id: workerId, reason: 'invalid' });
+      continue;
+    }
+    const key = nameKey(name);
+    if (!key) { skipped.push({ name, worker_id: workerId, reason: 'invalid' }); continue; }
+    remember.run(key, name, workerId);
+
+    const matches = byKey.get(key) || [];
+    if (matches.length > 1) { ambiguous.push({ name, worker_id: workerId }); continue; }
+    if (!matches.length) { pending.push({ name, worker_id: workerId }); continue; }
+
+    const user = matches[0];
+    if (user.worker_id === workerId) { assigned.push({ name: user.name, worker_id: workerId }); continue; }
+    if (seenIds.has(workerId) && user.worker_id !== workerId) {
+      skipped.push({ name, worker_id: workerId, reason: 'already used by someone else' });
+      continue;
+    }
+    assign.run(workerId, user.id);
+    seenIds.add(workerId);
+    assigned.push({ name: user.name, worker_id: workerId });
+  }
+
+  events.broadcast('users', {});
+  res.json({
+    assigned, pending, ambiguous, skipped,
+    counts: {
+      assigned: assigned.length, pending: pending.length,
+      ambiguous: ambiguous.length, skipped: skipped.length,
+    },
+  });
 });
 
 /* -------------------------------- settings --------------------------------- */

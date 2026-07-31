@@ -1052,6 +1052,7 @@ function renderTeam() {
         <span class="role-tag">${esc(state.positions.find((r) => r.id === u.position_id)?.name || (u.role === 'admin' ? 'Admin' : 'Member'))}</span>
         ${isAdmin ? `<button class="icon-btn" data-edit-user="${u.id}" title="Edit">✏️</button>` : ''}
       </div>`).join('')}
+    ${isAdmin ? `<button class="btn secondary" id="import-worker-ids" style="margin-bottom:14px">📋 Import Paychex Worker IDs</button>` : ''}
     <div class="card">
       <div style="font-weight:700;margin-bottom:6px">Invite your team</div>
       <p class="hint">Share this app's link with your team — they sign up with their email and instantly appear here, in chat, and in the schedule.</p>
@@ -1060,6 +1061,99 @@ function renderTeam() {
   document.querySelectorAll('[data-edit-user]').forEach((b) => {
     b.onclick = () => openUserModal(state.users.find((u) => u.id === Number(b.dataset.editUser)));
   });
+  const importBtn = document.getElementById('import-worker-ids');
+  if (importBtn) importBtn.onclick = openWorkerIdImport;
+}
+
+// Accepts a pasted Paychex roster. Handles the "All Active Employees" export
+// layout (a name line followed by "ID 120") as well as plain "Name, 120" lines.
+function parseWorkerRoster(text) {
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const entries = [];
+  const isNoise = (l) => (
+    /^--\s*\d+\s*of\s*\d+\s*--$/i.test(l)
+    || /^[A-Z]{1,3}$/.test(l)
+    || l.includes('@')
+    || /^E&E Management/i.test(l)
+    || /^All Active Employees/i.test(l)
+    || !/[a-z]/i.test(l)
+  );
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // "Name, 120" or "Name<tab>120"
+    const inline = line.match(/^(.+?)[,\t;]\s*(?:ID\s*)?([A-Za-z0-9]{1,10})$/i);
+    if (inline && /[a-z]/i.test(inline[1]) && !/^ID$/i.test(inline[1].trim())) {
+      // Guard against "Last, First" being read as a name/id pair.
+      if (!/^[A-Za-z]+$/.test(inline[2]) || /\d/.test(inline[2])) {
+        entries.push({ name: inline[1].trim(), worker_id: inline[2] });
+        continue;
+      }
+    }
+
+    // The PDF layout: a standalone "ID 120" line preceded by the name.
+    const idLine = line.match(/^ID\s+([A-Za-z0-9]{1,10})$/i);
+    if (!idLine) continue;
+    for (let j = i - 1; j >= 0 && j >= i - 4; j--) {
+      if (isNoise(lines[j])) continue;
+      entries.push({ name: lines[j], worker_id: idLine[1] });
+      break;
+    }
+  }
+  return entries;
+}
+
+function openWorkerIdImport() {
+  const modal = openModal(`
+    <h3>Import Paychex Worker IDs</h3>
+    <p class="sub">Open your Paychex <b>All Active Employees</b> list, select all and copy, then paste it below. Lines like <b>Name, 120</b> work too.</p>
+    <textarea id="roster-text" rows="7" placeholder="Acosta, Damian&#10;ID 120&#10;Adamzadeh, David&#10;ID 151"></textarea>
+    <div id="roster-preview" class="sub" style="margin-top:10px"></div>
+    <div class="actions">
+      <button type="button" class="btn secondary" id="roster-cancel">Cancel</button>
+      <button type="button" class="btn" id="roster-import" disabled>Import</button>
+    </div>
+  `);
+  const textarea = modal.querySelector('#roster-text');
+  const preview = modal.querySelector('#roster-preview');
+  const importBtn = modal.querySelector('#roster-import');
+  let entries = [];
+
+  textarea.oninput = () => {
+    entries = parseWorkerRoster(textarea.value);
+    importBtn.disabled = entries.length === 0;
+    preview.innerHTML = entries.length
+      ? `Found <b>${entries.length}</b> employee${entries.length === 1 ? '' : 's'} — e.g. ${esc(entries[0].name)} → ${esc(entries[0].worker_id)}`
+      : (textarea.value.trim() ? 'No employees found in that text yet.' : '');
+  };
+
+  modal.querySelector('#roster-cancel').onclick = closeModal;
+  importBtn.onclick = async () => {
+    importBtn.disabled = true; importBtn.textContent = 'Importing…';
+    try {
+      const r = await api('/api/users/worker-ids/import', { method: 'POST', body: { entries } });
+      state.users = (await api('/api/users')).users;
+      showRosterResult(r);
+    } catch (err) {
+      toast(err.message);
+      importBtn.disabled = false; importBtn.textContent = 'Import';
+    }
+  };
+}
+
+function showRosterResult(r) {
+  const { counts, ambiguous, skipped } = r;
+  openModal(`
+    <h3>Worker IDs imported</h3>
+    <div class="detail-rows" style="margin-top:10px">
+      <div class="detail-row"><span class="detail-ico">✅</span><span><b>${counts.assigned}</b> matched to people already in the app</span></div>
+      <div class="detail-row"><span class="detail-ico">⏳</span><span><b>${counts.pending}</b> saved for later — they get their ID automatically when they sign up</span></div>
+      ${counts.ambiguous ? `<div class="detail-row"><span class="detail-ico">⚠️</span><span><b>${counts.ambiguous}</b> matched more than one team member, so they were left alone:<div class="sub">${ambiguous.slice(0, 8).map((a) => esc(a.name)).join(', ')}</div></span></div>` : ''}
+      ${counts.skipped ? `<div class="detail-row"><span class="detail-ico">🚫</span><span><b>${counts.skipped}</b> skipped:<div class="sub">${skipped.slice(0, 8).map((x) => `${esc(x.name || '?')} (${esc(x.reason)})`).join(', ')}</div></span></div>` : ''}
+    </div>
+    <div class="actions"><button class="btn" id="roster-done">Done</button></div>
+  `).querySelector('#roster-done').onclick = () => { closeModal(); render(); };
 }
 
 async function removeTeamMember(user) {
