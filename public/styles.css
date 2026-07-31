@@ -481,6 +481,21 @@ select:disabled { opacity: .55; background: var(--bg); }
 }
 .doc-card-ico { font-size: 34px; }
 
+/* ---------- preference toggles ---------- */
+.toggle {
+  width: 50px; height: 30px; border-radius: 999px; flex-shrink: 0;
+  background: var(--line); position: relative; transition: background .15s;
+}
+.toggle .knob {
+  position: absolute; top: 3px; left: 3px;
+  width: 24px; height: 24px; border-radius: 50%;
+  background: var(--card); box-shadow: 0 1px 3px rgba(0,0,0,.3);
+  transition: transform .15s;
+}
+.toggle.on { background: var(--brand); }
+.toggle.on .knob { transform: translateX(20px); }
+.settings-row .grow { flex: 1; font-size: 14.5px; }
+
 /* ---------- timesheet review ---------- */
 .review-banner {
   background: var(--amber-soft); color: var(--amber);

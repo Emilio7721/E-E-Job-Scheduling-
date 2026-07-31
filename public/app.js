@@ -184,11 +184,13 @@ function updateBadges() {
     else if (n && chatBadge) chatBadge.textContent = n;
     else chatBadge?.remove();
   }
-  const dot = document.querySelector('#notif-btn .badge-dot');
-  const btn = document.querySelector('#notif-btn');
-  if (btn) {
-    if (unreadNotifCount() && !dot) btn.insertAdjacentHTML('beforeend', '<span class="badge-dot"></span>');
-    else if (!unreadNotifCount()) dot?.remove();
+  const updatesBtn = document.querySelector('[data-tab="updates"]');
+  if (updatesBtn) {
+    const badge = updatesBtn.querySelector('.tab-badge');
+    const n = unreadNotifCount();
+    if (n && !badge) updatesBtn.insertAdjacentHTML('beforeend', `<span class="tab-badge">${n}</span>`);
+    else if (n && badge) badge.textContent = n;
+    else badge?.remove();
   }
 }
 
@@ -503,13 +505,12 @@ const TABS = [
   { id: 'schedule', icon: '📅', label: 'Schedule' },
   { id: 'chat', icon: '💬', label: 'Chat' },
   { id: 'clock', icon: '⏱️', label: 'Clock' },
-  { id: 'attire', icon: '👔', label: 'Attire' },
   { id: 'updates', icon: '📢', label: 'Updates' },
   { id: 'more', icon: '☰', label: 'More' },
 ];
 
 // Views that live under the "More" hub still highlight the More tab.
-const MORE_VIEWS = ['more', 'venues', 'team', 'forms', 'signed', 'place', 'timesheets', 'settings', 'notifications', 'hours', 'roles', 'positions'];
+const MORE_VIEWS = ['more', 'venues', 'team', 'forms', 'signed', 'place', 'timesheets', 'settings', 'notifications', 'hours', 'roles', 'positions', 'attire'];
 
 function tabbarHTML(active, extraClass = '') {
   return `
@@ -544,7 +545,6 @@ function shell(title, contentHTML, { back = null, fab = null } = {}) {
     <header class="topbar">
       ${back ? `<button class="icon-btn" id="back-btn">←</button>` : ''}
       <h2>${esc(title)}</h2>
-      <button class="icon-btn" id="notif-btn">🔔</button>
       <button class="icon-btn" id="signout-btn" title="Sign out">⏻</button>
     </header>` : ''}
     <div class="main" id="main">${contentHTML}</div>
@@ -553,8 +553,6 @@ function shell(title, contentHTML, { back = null, fab = null } = {}) {
   bindTabbar();
   const backBtn = document.getElementById('back-btn');
   if (backBtn) backBtn.onclick = back;
-  const notifBtn = document.getElementById('notif-btn');
-  if (notifBtn) notifBtn.onclick = () => { location.hash = '#/notifications'; };
   const signoutBtn = document.getElementById('signout-btn');
   if (signoutBtn) signoutBtn.onclick = signOut;
   updateBadges();
@@ -1296,50 +1294,45 @@ function openUserModal(user) {
 /* ------------------------------ notifications ------------------------------ */
 
 async function renderNotifications() {
-  const { notifications } = await api('/api/notifications');
-  state.notifications = notifications;
+  const { categories, prefs } = await api('/api/me/notification-prefs');
+  const enabled = await pushEnabled();
+
   shell('Notifications', `
-    ${notifications.length ? `
-      <div style="display:flex;justify-content:flex-end;margin-bottom:8px">
-        <button class="btn small secondary" id="clear-notifs">Clear all</button>
-      </div>
-      ${notifications.map((n) => `
-      <div class="card notif ${n.read ? '' : 'unread'}">
-        <div class="row">
-          <span class="grow" data-notif-url="${esc(n.url)}">
-            <div class="title">${esc(n.title)}</div>
-            ${n.body ? `<div class="body">${esc(n.body)}</div>` : ''}
-            <div class="when">${fmtWhen(n.created_at)}</div>
-          </span>
-          <button class="icon-btn" data-del-notif="${n.id}" title="Remove">✕</button>
+    <div class="card">
+      <div class="settings-row">
+        <div>
+          <div style="font-weight:700">Push notifications</div>
+          <div class="sub">${enabled ? 'On for this device' : 'Off — turn on to receive any of these'}</div>
         </div>
-      </div>`).join('')}` : `
-      <div class="empty"><div class="big">🔔</div>Nothing here yet.<br>Job assignments and updates will show up here.</div>`}
-  `, { back: () => history.back() });
-  document.querySelectorAll('[data-notif-url]').forEach((el) => {
-    el.onclick = () => { location.href = el.dataset.notifUrl; };
-  });
-  document.querySelectorAll('[data-del-notif]').forEach((b) => {
-    b.onclick = async (e) => {
-      e.stopPropagation();
-      await api(`/api/notifications/${b.dataset.delNotif}`, { method: 'DELETE' });
-      state.notifications = state.notifications.filter((n) => n.id !== Number(b.dataset.delNotif));
-      render();
-    };
-  });
-  const clearBtn = document.getElementById('clear-notifs');
-  if (clearBtn) clearBtn.onclick = async () => {
-    if (!confirm('Clear all notifications?')) return;
-    await api('/api/notifications', { method: 'DELETE' });
-    state.notifications = [];
+        <button class="btn small ${enabled ? 'secondary' : ''}" id="pref-push-toggle">${enabled ? 'Disable' : 'Enable'}</button>
+      </div>
+    </div>
+
+    <div class="section-title">Send me a push for</div>
+    ${Object.entries(categories).map(([key, label]) => `
+      <div class="card settings-row">
+        <div class="grow">${esc(label)}</div>
+        <button class="toggle ${prefs[key] ? 'on' : ''}" data-pref="${key}" role="switch" aria-checked="${!!prefs[key]}">
+          <span class="knob"></span>
+        </button>
+      </div>`).join('')}
+    <p class="hint">Turning one off only stops the phone alert — it still appears under Updates → My activity.</p>
+  `, { back: () => { location.hash = '#/more'; } });
+
+  document.getElementById('pref-push-toggle').onclick = async () => {
+    try { enabled ? await disablePush() : await enablePush(); } catch (err) { toast(err.message); }
     render();
   };
-  if (notifications.some((n) => !n.read)) {
-    api('/api/notifications/read', { method: 'POST' }).then(() => {
-      state.notifications = state.notifications.map((n) => ({ ...n, read: 1 }));
-      updateBadges();
-    });
-  }
+  document.querySelectorAll('[data-pref]').forEach((b) => {
+    b.onclick = async () => {
+      const key = b.dataset.pref;
+      const next = !b.classList.contains('on');
+      b.classList.toggle('on', next);
+      b.setAttribute('aria-checked', String(next));
+      try { await api('/api/me/notification-prefs', { method: 'PUT', body: { prefs: { [key]: next } } }); }
+      catch (err) { toast(err.message); b.classList.toggle('on', !next); }
+    };
+  });
 }
 
 /* -------------------------------- settings --------------------------------- */
@@ -1392,6 +1385,7 @@ async function renderSettings() {
       </div>` : ''}
       ${Notification.permission === 'denied' ? `<p class="hint">⚠️ Notifications are blocked for this app in your device settings. Allow them there, then come back and tap Enable.</p>` : ''}
       ${!standalone ? `<button class="btn secondary" id="show-install-help" style="margin-top:12px">📲 How to install on your phone</button>` : ''}
+      <button class="btn secondary" id="goto-notif-prefs" style="margin-top:8px">Choose which notifications you get</button>
     </div>
 
     <div class="section-title">Account</div>
@@ -1410,6 +1404,7 @@ async function renderSettings() {
   if (test) test.onclick = () => api('/api/push/test', { method: 'POST' }).then(() => toast('Test sent — check your notifications'));
   const installHelp = document.getElementById('show-install-help');
   if (installHelp) installHelp.onclick = () => showInstallModal();
+  document.getElementById('goto-notif-prefs').onclick = () => { location.hash = '#/notifications'; };
   document.getElementById('logout').onclick = signOut;
 }
 
@@ -1977,6 +1972,7 @@ async function renderPositions() {
 /* ---------------------------------- attire ---------------------------------- */
 
 async function renderAttire() {
+  if (state.me.role !== 'admin') { location.hash = '#/schedule'; return; }
   const { attire } = await api('/api/attire');
   state.attire = attire;
   const isAdmin = state.me.role === 'admin';
@@ -2287,24 +2283,83 @@ function renderKiosk() {
 /* ------------------------------- updates feed ------------------------------- */
 
 async function renderUpdates() {
-  const { posts } = await api('/api/posts');
   const isAdmin = state.me.role === 'admin';
+  const tab = state.updatesTab || 'activity';
+  const [{ posts }, { notifications }] = await Promise.all([api('/api/posts'), api('/api/notifications')]);
+  state.notifications = notifications;
+  const unread = notifications.filter((n) => !n.read).length;
+
+  const activity = notifications.length ? notifications.map((n) => `
+    <div class="card notif ${n.read ? '' : 'unread'}">
+      <div class="row">
+        <span class="grow" data-notif-url="${esc(n.url)}">
+          <div class="title">${esc(n.title)}</div>
+          ${n.body ? `<div class="body">${esc(n.body)}</div>` : ''}
+          <div class="when">${fmtWhen(n.created_at)}</div>
+        </span>
+        <button class="icon-btn" data-del-notif="${n.id}" title="Remove">✕</button>
+      </div>
+    </div>`).join('') + `
+    <button class="btn secondary" id="clear-notifs" style="margin-top:6px">Clear all</button>`
+    : `<div class="empty"><div class="big">🔔</div>Nothing yet.<br>Jobs you're added to, schedule changes and shift reminders show up here.</div>`;
+
+  const announcements = posts.length ? posts.map((p) => `
+    <div class="card">
+      <div class="row" style="margin-bottom:8px">
+        <span class="avatar lg" style="background:${esc(p.user_color || '#888')}">${esc(initials(p.user_name || '?'))}</span>
+        <span class="grow">
+          <div style="font-weight:700">${esc(p.user_name || 'Removed user')}</div>
+          <div class="sub">${fmtWhen(p.created_at)}</div>
+        </span>
+        ${isAdmin ? `<button class="icon-btn" data-del-post="${p.id}">🗑️</button>` : ''}
+      </div>
+      ${p.title ? `<div style="font-weight:700;font-size:16px;margin-bottom:4px">${esc(p.title)}</div>` : ''}
+      <div style="white-space:pre-wrap">${esc(p.body)}</div>
+      <button class="like-btn ${p.liked ? 'on' : ''}" data-like="${p.id}">👍 ${p.likes || ''}</button>
+    </div>`).join('')
+    : `<div class="empty"><div class="big">📢</div>No company updates yet${isAdmin ? '<br>Tap ＋ to post one' : ''}</div>`;
+
   shell('Updates', `
-    ${posts.length ? posts.map((p) => `
-      <div class="card">
-        <div class="row" style="margin-bottom:8px">
-          <span class="avatar lg" style="background:${esc(p.user_color || '#888')}">${esc(initials(p.user_name || '?'))}</span>
-          <span class="grow">
-            <div style="font-weight:700">${esc(p.user_name || 'Removed user')}</div>
-            <div class="sub">${fmtWhen(p.created_at)}</div>
-          </span>
-          ${isAdmin ? `<button class="icon-btn" data-del-post="${p.id}">🗑️</button>` : ''}
-        </div>
-        ${p.title ? `<div style="font-weight:700;font-size:16px;margin-bottom:4px">${esc(p.title)}</div>` : ''}
-        <div style="white-space:pre-wrap">${esc(p.body)}</div>
-        <button class="like-btn ${p.liked ? 'on' : ''}" data-like="${p.id}">👍 ${p.likes || ''}</button>
-      </div>`).join('') : `<div class="empty"><div class="big">📢</div>No updates yet${isAdmin ? '<br>Tap ＋ to post a company update' : ''}</div>`}
-  `, { fab: isAdmin });
+    <div class="filter-row">
+      <button class="pill ${tab === 'activity' ? 'active' : ''}" data-utab="activity">
+        My activity${unread ? ` (${unread})` : ''}
+      </button>
+      <button class="pill ${tab === 'posts' ? 'active' : ''}" data-utab="posts">Company updates</button>
+    </div>
+    ${tab === 'activity' ? activity : announcements}
+  `, { fab: isAdmin && tab === 'posts' });
+
+  document.querySelectorAll('[data-utab]').forEach((b) => {
+    b.onclick = () => { state.updatesTab = b.dataset.utab; render(); };
+  });
+
+  if (tab === 'activity') {
+    document.querySelectorAll('[data-notif-url]').forEach((el) => {
+      el.onclick = () => { location.href = el.dataset.notifUrl; };
+    });
+    document.querySelectorAll('[data-del-notif]').forEach((b) => {
+      b.onclick = async (e) => {
+        e.stopPropagation();
+        await api(`/api/notifications/${b.dataset.delNotif}`, { method: 'DELETE' });
+        state.notifications = state.notifications.filter((n) => n.id !== Number(b.dataset.delNotif));
+        render();
+      };
+    });
+    const clearBtn = document.getElementById('clear-notifs');
+    if (clearBtn) clearBtn.onclick = async () => {
+      if (!confirm('Clear all activity?')) return;
+      await api('/api/notifications', { method: 'DELETE' });
+      state.notifications = [];
+      render();
+    };
+    if (unread) {
+      api('/api/notifications/read', { method: 'POST' }).then(() => {
+        state.notifications = state.notifications.map((n) => ({ ...n, read: 1 }));
+        updateBadges();
+      });
+    }
+    return;
+  }
 
   if (isAdmin) {
     document.getElementById('fab').onclick = () => {
@@ -2345,6 +2400,7 @@ function renderMore() {
     { href: '#/hours', icon: '🕐', label: 'Hours Requests', sub: 'Submit worked hours for approval' },
     { href: '#/forms', icon: '📄', label: 'Documents', sub: 'Read & sign uploaded documents' },
     ...(isAdmin ? [
+      { href: '#/attire', icon: '👔', label: 'Attire', sub: 'What the team wears on each job' },
       { href: '#/timesheets', icon: '🧾', label: 'Timesheets', sub: 'Review, approve & export to Paychex' },
       { href: '#/kiosk', icon: '🔢', label: 'Kiosk Mode', sub: 'Lock this device into a PIN punch clock' },
       { href: '#/signed', icon: '📁', label: 'Signed Documents', sub: 'Who signed what & download copies' },
@@ -2353,7 +2409,7 @@ function renderMore() {
     ] : []),
     { href: '#/venues', icon: '📍', label: 'Venues', sub: 'Work locations' },
     { href: '#/team', icon: '👥', label: 'Team', sub: 'People & roles' },
-    { href: '#/notifications', icon: '🔔', label: 'Notifications', sub: 'Your activity feed' },
+    { href: '#/notifications', icon: '🔔', label: 'Notifications', sub: 'Choose what reaches your phone' },
     { href: '#/settings', icon: '⚙️', label: 'Settings', sub: 'Notifications & account' },
   ];
   shell('More', `

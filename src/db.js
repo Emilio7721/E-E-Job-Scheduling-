@@ -216,6 +216,7 @@ ensureColumn('users', 'phone', 'phone TEXT');
 ensureColumn('users', 'role_id', 'role_id INTEGER');
 ensureColumn('users', 'position_id', 'position_id INTEGER');
 ensureColumn('users', 'worker_id', 'worker_id TEXT');
+ensureColumn('users', 'notif_prefs', 'notif_prefs TEXT');
 ensureColumn('roles', 'is_admin', 'is_admin INTEGER NOT NULL DEFAULT 0');
 ensureColumn('shifts', 'role_id', 'role_id INTEGER');
 ensureColumn('shifts', 'reminded_at', 'reminded_at TEXT');
