@@ -18,7 +18,6 @@ const state = {
   weekStart: startOfWeek(new Date()),
   selectedDay: dateKey(new Date()),
   scheduleFilter: 'all', // 'all' | 'mine'
-  scheduleView: 'day',   // 'day' | 'week'
   shifts: [],
   chatChannel: null,
   chatMessages: [],
@@ -697,63 +696,56 @@ function renderSchedule() {
   });
   const byDay = {};
   for (const s of state.shifts) (byDay[dateKey(new Date(s.starts_at))] ||= []).push(s);
-  const todayKey = dateKey(new Date());
-  const dayShifts = byDay[state.selectedDay] || [];
   const isAdmin = state.me.role === 'admin';
+
+  // New jobs default to today when the visible week contains it.
+  const todayKey = dateKey(new Date());
+  state.selectedDay = byDay[todayKey] !== undefined || days.some((d) => dateKey(d) === todayKey)
+    ? todayKey : dateKey(days[0]);
 
   const rangeLabel = `${days[0].toLocaleDateString([], { month: 'short', day: 'numeric' })} – ${days[6].toLocaleDateString([], { month: 'short', day: 'numeric' })}`;
 
   shell('Schedule', `
     <div class="week-nav">
       <button class="icon-btn" id="prev-week">‹</button>
-      <div class="range">${rangeLabel}</div>
+      <div class="range">${rangeLabel}
+        <div class="sub" style="font-weight:500">${days[0].toLocaleDateString([], { year: 'numeric' })}</div>
+      </div>
       <button class="icon-btn" id="next-week">›</button>
     </div>
-    <div class="day-strip">
-      ${days.map((d) => {
-        const k = dateKey(d);
-        return `<button data-day="${k}" class="${k === state.selectedDay ? 'active' : ''} ${k === todayKey ? 'today' : ''}">
-          ${d.toLocaleDateString([], { weekday: 'narrow' })}<span class="num">${d.getDate()}</span>
-          ${byDay[k]?.length ? '<span class="dot"></span>' : '<span style="height:5px"></span>'}
-        </button>`;
-      }).join('')}
-    </div>
-    <div class="filter-row">
-      ${isAdmin ? `
+    ${isAdmin ? `
+      <div class="filter-row">
         <button class="pill ${state.scheduleFilter === 'all' ? 'active' : ''}" data-filter="all">Everyone</button>
-        <button class="pill ${state.scheduleFilter === 'mine' ? 'active' : ''}" data-filter="mine">My jobs</button>` : ''}
-      <span style="flex:1"></span>
-      <button class="pill ${state.scheduleView === 'week' ? 'active' : ''}" id="view-toggle">${state.scheduleView === 'week' ? '📅 Week' : '📋 Day'}</button>
-    </div>
-    ${state.scheduleView === 'week' ? weekGridHTML(days, byDay) : (dayShifts.length ? dayShifts.map(shiftCardHTML).join('') : `
-      <div class="empty"><div class="big">🗓️</div>No jobs scheduled for this day${isAdmin ? '<br>Tap ＋ to add one' : ''}</div>`)}
+        <button class="pill ${state.scheduleFilter === 'mine' ? 'active' : ''}" data-filter="mine">My jobs</button>
+      </div>` : ''}
+    ${weekCalendarHTML(days, byDay)}
   `, { fab: isAdmin });
 
-  document.getElementById('view-toggle').onclick = () => {
-    state.scheduleView = state.scheduleView === 'week' ? 'day' : 'week';
-    render();
+  document.getElementById('prev-week').onclick = () => {
+    state.weekStart.setDate(state.weekStart.getDate() - 7);
+    loadShifts().then(render);
   };
-
-  document.getElementById('prev-week').onclick = () => { state.weekStart.setDate(state.weekStart.getDate() - 7); state.selectedDay = dateKey(state.weekStart); loadShifts().then(render); };
-  document.getElementById('next-week').onclick = () => { state.weekStart.setDate(state.weekStart.getDate() + 7); state.selectedDay = dateKey(state.weekStart); loadShifts().then(render); };
-  document.querySelectorAll('[data-day]').forEach((b) => { b.onclick = () => { state.selectedDay = b.dataset.day; render(); }; });
-  document.querySelectorAll('[data-filter]').forEach((b) => { b.onclick = () => { state.scheduleFilter = b.dataset.filter; loadShifts().then(render); }; });
+  document.getElementById('next-week').onclick = () => {
+    state.weekStart.setDate(state.weekStart.getDate() + 7);
+    loadShifts().then(render);
+  };
+  document.querySelectorAll('[data-filter]').forEach((b) => {
+    b.onclick = () => { state.scheduleFilter = b.dataset.filter; loadShifts().then(render); };
+  });
   const fab = document.getElementById('fab');
   if (fab) fab.onclick = () => openShiftModal();
   document.querySelectorAll('[data-shift]').forEach((el) => {
-    el.onclick = (e) => {
-      if (e.target.closest('[data-respond]')) return;
-      openShiftDetail(state.shifts.find((s) => s.id === Number(el.dataset.shift)));
-    };
+    el.onclick = () => openShiftDetail(state.shifts.find((s) => s.id === Number(el.dataset.shift)));
   });
-  state.shiftsIndex = state.shifts;
-  document.querySelectorAll('[data-respond]').forEach((b) => {
-    b.onclick = async () => {
-      await api(`/api/shifts/${b.dataset.shiftId}/respond`, { method: 'POST', body: { status: b.dataset.respond } });
-      toast(b.dataset.respond === 'accepted' ? 'Job accepted ✅' : 'Job declined');
-      loadShifts().then(render);
-    };
-  });
+
+  // Scroll so the working part of the day is what you land on.
+  const body = document.querySelector('.cal-scroll');
+  if (body) {
+    const marker = document.querySelector('.cal-now');
+    const firstShift = document.querySelector('.grid-shift');
+    const target = marker || firstShift;
+    if (target) body.scrollTop = Math.max(0, target.offsetTop - 90);
+  }
 }
 
 // Members only see who else is working when they share that venue that day.
@@ -768,64 +760,119 @@ function canSeeCrew(shift, dayKeyValue, allShifts) {
   ));
 }
 
-// Week timetable: a column per day, an hour per row, jobs placed by time.
-function weekGridHTML(days, byDay) {
+// Apple-Calendar-style week view: a column per day, hours down the side,
+// jobs drawn as tinted blocks in their real time slots.
+const CAL_PX_PER_HOUR = 52;
+
+function hexToRgba(hex, alpha) {
+  const clean = String(hex || '').replace('#', '');
+  if (clean.length !== 6) return `rgba(168,134,44,${alpha})`;
+  const [r, g, b] = [0, 2, 4].map((i) => parseInt(clean.slice(i, i + 2), 16));
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+function hourLabel(h) {
+  if (h === 0) return '12 AM';
+  if (h === 12) return 'noon';
+  return h < 12 ? `${h} AM` : `${h - 12} PM`;
+}
+
+function weekCalendarHTML(days, byDay) {
   const all = state.shifts;
-  let earliest = 24 * 60, latest = 0;
+  let earliest = 9 * 60, latest = 18 * 60;
   for (const s of all) {
     const st = new Date(s.starts_at), en = new Date(s.ends_at);
     earliest = Math.min(earliest, st.getHours() * 60 + st.getMinutes());
     latest = Math.max(latest, dateKey(en) === dateKey(st) ? en.getHours() * 60 + en.getMinutes() : 24 * 60);
   }
-  if (!all.length) { earliest = 8 * 60; latest = 18 * 60; }
   const startHour = Math.max(0, Math.floor(earliest / 60) - 1);
   const endHour = Math.min(24, Math.ceil(latest / 60) + 1);
-  const hours = Math.max(4, endHour - startHour);
-  const PX_PER_HOUR = 58;
+  const hours = Math.max(6, endHour - startHour);
+  const height = hours * CAL_PX_PER_HOUR;
+  const todayKey = dateKey(new Date());
 
-  const columns = days.map((d) => {
-    const key = dateKey(d);
-    const items = (byDay[key] || []).map((s) => {
-      const st = new Date(s.starts_at), en = new Date(s.ends_at);
-      const fromMin = st.getHours() * 60 + st.getMinutes();
-      const toMin = dateKey(en) === key ? en.getHours() * 60 + en.getMinutes() : 24 * 60;
-      const top = ((fromMin - startHour * 60) / 60) * PX_PER_HOUR;
-      const height = Math.max(30, ((toMin - fromMin) / 60) * PX_PER_HOUR);
-      const mine = s.assignees.some((a) => a.id === state.me.id);
-      const showCrew = canSeeCrew(s, key, all);
-      return `
-        <div class="grid-shift ${mine ? 'mine' : ''}" data-shift="${s.id}"
-             style="top:${top}px;height:${height}px;border-left-color:${esc(s.venue_color || 'var(--brand)')}">
-          <div class="gs-time">${fmtTime(s.starts_at)}</div>
-          <div class="gs-title">${esc(s.title)}</div>
-          ${s.venue_name ? `<div class="gs-venue">${esc(s.venue_name)}</div>` : ''}
-          ${showCrew
-            ? (s.assignees.length ? `<div class="gs-people">${s.assignees.map((a) => esc(a.name.split(' ')[0])).join(', ')}</div>` : '')
-            : `<div class="gs-people muted">${s.assignees.length} scheduled</div>`}
-        </div>`;
-    }).join('');
-    const isToday = key === dateKey(new Date());
+  const header = days.map((d) => {
+    const isToday = dateKey(d) === todayKey;
     return `
-      <div class="grid-col">
-        <div class="grid-head ${isToday ? 'today' : ''}">
-          <div>${d.toLocaleDateString([], { weekday: 'short' })}</div>
-          <div class="gh-num">${d.getDate()}</div>
-        </div>
-        <div class="grid-body" style="height:${hours * PX_PER_HOUR}px">${items}</div>
+      <div class="cal-day ${isToday ? 'today' : ''}">
+        <div class="cal-dow">${d.toLocaleDateString([], { weekday: 'short' }).toUpperCase()}</div>
+        <div class="cal-date">${d.getDate()}</div>
       </div>`;
   }).join('');
 
-  const labels = [...Array(hours)].map((_, i) => `
-    <div class="grid-hour" style="height:${PX_PER_HOUR}px">${minToLabel((startHour + i) * 60)}</div>`).join('');
+  const gutter = [...Array(hours)].map((_, i) => `
+    <div class="cal-hour" style="height:${CAL_PX_PER_HOUR}px"><span>${hourLabel((startHour + i) % 24)}</span></div>`).join('');
 
+  const columns = days.map((d) => {
+    const key = dateKey(d);
+    const items = (byDay[key] || []).slice().sort((a, b) => a.starts_at.localeCompare(b.starts_at));
+
+    // Side-by-side lanes when jobs overlap.
+    const lanes = [];
+    const placed = items.map((s) => {
+      const st = new Date(s.starts_at), en = new Date(s.ends_at);
+      const fromMin = st.getHours() * 60 + st.getMinutes();
+      const toMin = dateKey(en) === key ? en.getHours() * 60 + en.getMinutes() : 24 * 60;
+      let lane = lanes.findIndex((end) => end <= fromMin);
+      if (lane === -1) { lane = lanes.length; lanes.push(toMin); } else lanes[lane] = toMin;
+      return { s, fromMin, toMin, lane };
+    });
+    const laneCount = Math.max(1, lanes.length);
+
+    const blocks = placed.map(({ s, fromMin, toMin, lane }) => {
+      const top = ((fromMin - startHour * 60) / 60) * CAL_PX_PER_HOUR;
+      const h = Math.max(26, ((toMin - fromMin) / 60) * CAL_PX_PER_HOUR - 2);
+      const color = s.venue_color || '#a8862c';
+      const width = 100 / laneCount;
+      const showCrew = canSeeCrew(s, key, all);
+      const compact = h < 52;
+      return `
+        <div class="grid-shift" data-shift="${s.id}"
+             style="top:${top}px;height:${h}px;left:calc(${lane * width}% + 2px);width:calc(${width}% - 4px);
+                    background:${hexToRgba(color, 0.18)};border-left-color:${esc(color)}">
+          <div class="gs-time">${fmtTime(s.starts_at)}${compact ? '' : ` – ${fmtTime(s.ends_at)}`}</div>
+          <div class="gs-title">${esc(s.title)}</div>
+          ${!compact && s.venue_name ? `<div class="gs-venue">${esc(s.venue_name)}</div>` : ''}
+          ${!compact && showCrew && s.assignees.length
+            ? `<div class="gs-people">${s.assignees.map((a) => esc(a.name.split(' ')[0])).join(', ')}</div>`
+            : (!compact && s.assignees.length ? `<div class="gs-people muted">${s.assignees.length} scheduled</div>` : '')}
+        </div>`;
+    }).join('');
+
+    const lines = [...Array(hours)].map((_, i) => `
+      <div class="cal-line" style="top:${i * CAL_PX_PER_HOUR}px"></div>`).join('');
+
+    return `<div class="cal-col ${key === todayKey ? 'today' : ''}">${lines}${blocks}</div>`;
+  }).join('');
+
+  // Red "now" line, like the reference calendar.
+  const now = new Date();
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+  const showNow = days.some((d) => dateKey(d) === todayKey)
+    && nowMin >= startHour * 60 && nowMin <= endHour * 60;
+  const nowTop = ((nowMin - startHour * 60) / 60) * CAL_PX_PER_HOUR;
+
+  // One scroller for both axes: the hour gutter pins left and the day header
+  // pins top, so a phone can scroll across the week and keep its bearings.
   return `
-    <div class="week-grid-wrap">
-      <div class="week-grid">
-        <div class="grid-col grid-times">
-          <div class="grid-head"></div>
-          <div class="grid-body" style="height:${hours * PX_PER_HOUR}px">${labels}</div>
+    <div class="cal">
+      <div class="cal-scroll">
+        <div class="cal-inner">
+          <div class="cal-header">
+            <div class="cal-gutter-head"></div>
+            <div class="cal-days">${header}</div>
+          </div>
+          <div class="cal-body" style="height:${height}px">
+            <div class="cal-gutter">${gutter}</div>
+            <div class="cal-cols">
+              ${columns}
+              ${showNow ? `
+                <div class="cal-now" style="top:${nowTop}px">
+                  <span class="cal-now-label">${fmtTime(now.toISOString())}</span>
+                </div>` : ''}
+            </div>
+          </div>
         </div>
-        ${columns}
       </div>
     </div>`;
 }
@@ -2085,7 +2132,7 @@ async function renderPositions() {
   const { positions } = await api('/api/positions');
   state.positions = positions;
   shell('Positions', `
-    <p class="hint" style="margin-bottom:12px">Team positions you assign in <b>Team</b>. A position with <b>admin permission</b> automatically makes everyone holding it an admin.</p>
+    <p class="hint" style="margin-bottom:12px">Team positions you assign in <b>Team</b>. New positions are <b>member</b> level — tap the Member button to grant admin permission, which promotes everyone holding it.</p>
     ${positions.length ? positions.map((r) => `
       <div class="card row">
         <span class="grow">
@@ -2101,8 +2148,9 @@ async function renderPositions() {
   document.getElementById('fab').onclick = async () => {
     const name = prompt('New position name (e.g. Operations Manager, Shift Lead):');
     if (!name?.trim()) return;
-    const is_admin = confirm('Should this position have ADMIN permission?\n\nAdmins can manage the schedule, venues, payroll, and approvals.\n\nOK = admin · Cancel = member');
-    await api('/api/positions', { method: 'POST', body: { name, is_admin } });
+    // New positions are member-level; grant admin from the list when needed.
+    await api('/api/positions', { method: 'POST', body: { name, is_admin: false } });
+    toast('Position added as member level');
     render();
   };
   document.querySelectorAll('[data-adm-pos]').forEach((b) => {
@@ -2961,7 +3009,7 @@ async function renderPositions() {
   const { positions } = await api('/api/positions');
   state.positions = positions;
   shell('Positions', `
-    <p class="hint" style="margin-bottom:12px">Team positions you assign in <b>Team</b>. A position with <b>admin permission</b> automatically makes everyone holding it an admin.</p>
+    <p class="hint" style="margin-bottom:12px">Team positions you assign in <b>Team</b>. New positions are <b>member</b> level — tap the Member button to grant admin permission, which promotes everyone holding it.</p>
     ${positions.length ? positions.map((r) => `
       <div class="card row">
         <span class="grow">
@@ -2977,8 +3025,9 @@ async function renderPositions() {
   document.getElementById('fab').onclick = async () => {
     const name = prompt('New position name (e.g. Operations Manager, Shift Lead):');
     if (!name?.trim()) return;
-    const is_admin = confirm('Should this position have ADMIN permission?\n\nAdmins can manage the schedule, venues, payroll, and approvals.\n\nOK = admin · Cancel = member');
-    await api('/api/positions', { method: 'POST', body: { name, is_admin } });
+    // New positions are member-level; grant admin from the list when needed.
+    await api('/api/positions', { method: 'POST', body: { name, is_admin: false } });
+    toast('Position added as member level');
     render();
   };
   document.querySelectorAll('[data-adm-pos]').forEach((b) => {

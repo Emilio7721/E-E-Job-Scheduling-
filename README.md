@@ -4,7 +4,7 @@ A Connecteam-style workforce app for E&E: **job scheduling**, **venues**, **team
 
 ## Features
 
-- **📅 Job scheduling** — day list or a full **week timetable** (days across, hours down) showing every job with its crew; members see teammates' names only for venues they work that day. Admin edits are recorded, so staff can open a job and see exactly what changed. Week-view schedule; admins create jobs with a title, venue, start/end time, notes, and assigned team members. Employees see their jobs and **accept or decline** with one tap (admins are notified of the response).
+- **📅 Job scheduling** — a **week calendar** (days across, hours down, current-time line) showing every job in its real time slot with venue and crew; members see teammates' names only for venues they work that day. Admin edits are recorded, so staff can open a job and see exactly what changed. admins create jobs with a title, venue, start/end time, notes, and assigned team members. Employees see their jobs and **accept or decline** with one tap (admins are notified of the response).
 - **📗 Availability** — staff mark the times they *can't* work (all day or a time range, with a note), optionally repeating weekly for a chosen number of weeks. The schedule refuses to book anyone during their unavailability.
 - **🚫 Conflict protection** — nobody can be scheduled at two venues at once, or into a time they marked unavailable; the clash is spelled out before the job can be saved.
 - **📍 Venues** — manage your venue list (name, address, notes, color). Jobs link to venues, and addresses open directly in Google Maps.
