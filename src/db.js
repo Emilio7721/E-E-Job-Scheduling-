@@ -234,6 +234,28 @@ ensureColumn('forms', 'doc_pages', 'doc_pages INTEGER');
 ensureColumn('form_submissions', 'signed_path', 'signed_path TEXT');
 
 db.exec(`
+  CREATE TABLE IF NOT EXISTS unavailability (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    date       TEXT NOT NULL,               -- YYYY-MM-DD, local to APP_TZ
+    all_day    INTEGER NOT NULL DEFAULT 0,
+    start_min  INTEGER NOT NULL DEFAULT 0,  -- minutes from midnight
+    end_min    INTEGER NOT NULL DEFAULT 1440,
+    note       TEXT NOT NULL DEFAULT '',
+    series_id  TEXT,                        -- set when it repeats weekly
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_unavail_user ON unavailability(user_id, date);
+
+  CREATE TABLE IF NOT EXISTS shift_changes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    shift_id   INTEGER NOT NULL REFERENCES shifts(id) ON DELETE CASCADE,
+    user_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    summary    TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_shift_changes ON shift_changes(shift_id, id);
+
   CREATE TABLE IF NOT EXISTS attire (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT NOT NULL,
