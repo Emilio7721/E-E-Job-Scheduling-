@@ -389,6 +389,144 @@ app.delete('/api/venues/:id', requireAuth, requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
+/* ------------------------------- availability ------------------------------- */
+
+const TZ = process.env.APP_TZ || 'America/New_York';
+
+// A shift is stored in UTC but unavailability is a local wall-clock thing, so
+// convert to the company's timezone before comparing.
+function localParts(iso) {
+  const d = new Date(iso);
+  const date = d.toLocaleDateString('en-CA', { timeZone: TZ });
+  const [h, m] = d.toLocaleTimeString('en-GB', {
+    timeZone: TZ, hour: '2-digit', minute: '2-digit', hour12: false,
+  }).split(':').map(Number);
+  return { date, min: h * 60 + m };
+}
+
+// Every local day a shift touches, with the minute range it occupies that day.
+function shiftDaySlices(startsAt, endsAt) {
+  const start = localParts(startsAt);
+  const end = localParts(endsAt);
+  if (start.date === end.date) return [{ date: start.date, from: start.min, to: Math.max(end.min, start.min + 1) }];
+  const slices = [{ date: start.date, from: start.min, to: 1440 }];
+  const cursor = new Date(`${start.date}T12:00:00`);
+  for (;;) {
+    cursor.setDate(cursor.getDate() + 1);
+    const date = cursor.toLocaleDateString('en-CA');
+    if (date >= end.date) break;
+    slices.push({ date, from: 0, to: 1440 });
+    if (slices.length > 14) break;
+  }
+  slices.push({ date: end.date, from: 0, to: Math.max(end.min, 1) });
+  return slices;
+}
+
+// Returns a list of human-readable clashes for the given people.
+function conflictsFor(userIds, startsAt, endsAt, ignoreShiftId = null) {
+  const out = [];
+  const slices = shiftDaySlices(startsAt, endsAt);
+
+  for (const userId of userIds) {
+    const user = db.prepare('SELECT name FROM users WHERE id = ?').get(userId);
+    if (!user) continue;
+
+    // Already working somewhere else at the same time?
+    const clash = db.prepare(`
+      SELECT s.title, s.starts_at, v.name AS venue_name
+      FROM shifts s
+      JOIN shift_assignees a ON a.shift_id = s.id
+      LEFT JOIN venues v ON v.id = s.venue_id
+      WHERE a.user_id = ? AND a.status != 'declined'
+        AND s.id != COALESCE(?, -1)
+        AND s.starts_at < ? AND s.ends_at > ?
+      LIMIT 1
+    `).get(userId, ignoreShiftId, endsAt, startsAt);
+    if (clash) {
+      out.push({
+        user_id: userId, kind: 'shift',
+        message: `${user.name} is already on "${clash.title}"${clash.venue_name ? ` at ${clash.venue_name}` : ''} at that time`,
+      });
+      continue;
+    }
+
+    // Marked unavailable for any part of it?
+    for (const slice of slices) {
+      const block = db.prepare(`
+        SELECT all_day, start_min, end_min FROM unavailability
+        WHERE user_id = ? AND date = ?
+          AND (all_day = 1 OR (start_min < ? AND end_min > ?))
+        LIMIT 1
+      `).get(userId, slice.date, slice.to, slice.from);
+      if (block) {
+        out.push({
+          user_id: userId, kind: 'unavailable',
+          message: `${user.name} marked themselves unavailable on ${slice.date}${block.all_day ? ' (all day)' : ''}`,
+        });
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+app.get('/api/availability', requireAuth, (req, res) => {
+  const { from, to, user_id } = req.query;
+  let sql = `
+    SELECT u.*, usr.name AS user_name, usr.color AS user_color
+    FROM unavailability u JOIN users usr ON usr.id = u.user_id
+    WHERE 1=1`;
+  const params = [];
+  if (req.user.role === 'admin' && user_id) { sql += ' AND u.user_id = ?'; params.push(Number(user_id)); }
+  else if (req.user.role !== 'admin') { sql += ' AND u.user_id = ?'; params.push(req.user.id); }
+  if (from) { sql += ' AND u.date >= ?'; params.push(from); }
+  if (to) { sql += ' AND u.date <= ?'; params.push(to); }
+  sql += ' ORDER BY u.date, u.start_min LIMIT 500';
+  res.json({ unavailability: db.prepare(sql).all(...params) });
+});
+
+app.post('/api/availability', requireAuth, (req, res) => {
+  const {
+    date, all_day = false, start_min = 540, end_min = 1020,
+    note = '', repeat_weeks = 0,
+  } = req.body || {};
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date || '')) return res.status(400).json({ error: 'Pick a date' });
+  const from = all_day ? 0 : Math.max(0, Math.min(1439, Number(start_min) || 0));
+  const to = all_day ? 1440 : Math.max(1, Math.min(1440, Number(end_min) || 0));
+  if (!all_day && to <= from) return res.status(400).json({ error: 'End time must be after the start time' });
+
+  const weeks = Math.max(1, Math.min(52, Number(repeat_weeks) || 1));
+  const seriesId = weeks > 1 ? crypto.randomUUID() : null;
+  const insert = db.prepare(
+    'INSERT INTO unavailability (user_id, date, all_day, start_min, end_min, note, series_id) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  );
+
+  const created = [];
+  const cursor = new Date(`${date}T12:00:00`);
+  for (let i = 0; i < weeks; i++) {
+    const day = cursor.toLocaleDateString('en-CA');
+    const info = insert.run(req.user.id, day, all_day ? 1 : 0, from, to, String(note).slice(0, 300), seriesId);
+    created.push(Number(info.lastInsertRowid));
+    cursor.setDate(cursor.getDate() + 7);
+  }
+
+  events.broadcast('availability', {});
+  res.json({ ok: true, created: created.length });
+});
+
+app.delete('/api/availability/:id', requireAuth, (req, res) => {
+  const row = db.prepare('SELECT * FROM unavailability WHERE id = ?').get(Number(req.params.id));
+  if (!row) return res.status(404).json({ error: 'Not found' });
+  if (row.user_id !== req.user.id && req.user.role !== 'admin') return res.status(403).json({ error: 'Not allowed' });
+  if (req.query.series === '1' && row.series_id) {
+    db.prepare('DELETE FROM unavailability WHERE series_id = ? AND date >= ?').run(row.series_id, row.date);
+  } else {
+    db.prepare('DELETE FROM unavailability WHERE id = ?').run(row.id);
+  }
+  events.broadcast('availability', {});
+  res.json({ ok: true });
+});
+
 /* --------------------------------- shifts --------------------------------- */
 
 const SHIFT_QUERY = `
@@ -425,6 +563,22 @@ app.get('/api/shifts', requireAuth, (req, res) => {
   res.json({ shifts });
 });
 
+app.get('/api/shifts/:id/changes', requireAuth, (req, res) => {
+  const changes = db.prepare(`
+    SELECT c.summary, c.created_at, u.name AS user_name
+    FROM shift_changes c LEFT JOIN users u ON u.id = c.user_id
+    WHERE c.shift_id = ? ORDER BY c.id DESC LIMIT 50
+  `).all(Number(req.params.id));
+  res.json({ changes });
+});
+
+// Lets the schedule form warn before anyone tries to save a clashing job.
+app.post('/api/shifts/check-conflicts', requireAuth, requireAdmin, (req, res) => {
+  const { assignee_ids = [], starts_at, ends_at, shift_id = null } = req.body || {};
+  if (!starts_at || !ends_at) return res.json({ conflicts: [] });
+  res.json({ conflicts: conflictsFor(assignee_ids, starts_at, ends_at, shift_id) });
+});
+
 function fmtShiftTime(iso) {
   return new Date(iso).toLocaleString('en-US', {
     weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
@@ -438,6 +592,9 @@ app.post('/api/shifts', requireAuth, requireAdmin, (req, res) => {
   if (!starts_at || !ends_at || new Date(ends_at) <= new Date(starts_at)) {
     return res.status(400).json({ error: 'Valid start and end times are required' });
   }
+  const clashes = conflictsFor(assignee_ids, starts_at, ends_at);
+  if (clashes.length) return res.status(409).json({ error: 'Scheduling conflict', conflicts: clashes });
+
   const info = db.prepare('INSERT INTO shifts (title, venue_id, role_id, attire_id, starts_at, ends_at, notes, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
     .run(title.trim(), venue_id, role_id, attire_id, starts_at, ends_at, notes.trim(), req.user.id);
   const shiftId = Number(info.lastInsertRowid);
@@ -466,12 +623,19 @@ app.patch('/api/shifts/:id', requireAuth, requireAdmin, (req, res) => {
   if (!title?.trim()) return res.status(400).json({ error: 'Job title is required' });
   if (new Date(ends_at) <= new Date(starts_at)) return res.status(400).json({ error: 'End time must be after start time' });
 
+  // Only re-check people who are newly added, or everyone if the time moved.
+  const before = db.prepare('SELECT user_id FROM shift_assignees WHERE shift_id = ?').all(shift.id).map((r) => r.user_id);
+  const timeMoved = starts_at !== shift.starts_at || ends_at !== shift.ends_at;
+  const nextAssignees = Array.isArray(assignee_ids) ? assignee_ids : before;
+  const toCheck = timeMoved ? nextAssignees : nextAssignees.filter((id) => !before.includes(id));
+  const clashes = conflictsFor(toCheck, starts_at, ends_at, shift.id);
+  if (clashes.length) return res.status(409).json({ error: 'Scheduling conflict', conflicts: clashes });
+
   db.prepare(`UPDATE shifts SET title = ?, venue_id = ?, role_id = ?, attire_id = ?, starts_at = ?, ends_at = ?, notes = ?,
       reminded_at = CASE WHEN starts_at != ? THEN NULL ELSE reminded_at END,
       updated_at = datetime('now') WHERE id = ?`)
     .run(title.trim(), venue_id, role_id, attire_id, starts_at, ends_at, notes.trim(), starts_at, shift.id);
 
-  const before = db.prepare('SELECT user_id FROM shift_assignees WHERE shift_id = ?').all(shift.id).map((r) => r.user_id);
   let added = [];
   let removed = [];
   if (Array.isArray(assignee_ids)) {
@@ -483,6 +647,21 @@ app.patch('/api/shifts/:id', requireAuth, requireAdmin, (req, res) => {
   }
 
   const updated = shiftWithAssignees(db.prepare(SHIFT_QUERY + ' WHERE s.id = ?').get(shift.id));
+
+  // Keep a plain-language history so staff can see what an admin changed.
+  const history = [];
+  if (shift.title !== updated.title) history.push(`Title changed to "${updated.title}"`);
+  if (timeMoved) history.push(`Time changed to ${fmtShiftTime(updated.starts_at)} – ${fmtShiftTime(updated.ends_at)}`);
+  if (shift.venue_id !== updated.venue_id) history.push(`Venue changed to ${updated.venue_name || 'none'}`);
+  if (shift.role_id !== updated.role_id) history.push(`Job changed to ${updated.role_name || 'none'}`);
+  if (shift.attire_id !== updated.attire_id) history.push(`Attire changed to ${updated.attire_name || 'none'}`);
+  if (shift.notes !== updated.notes) history.push('Notes updated');
+  const nameOf = (id) => db.prepare('SELECT name FROM users WHERE id = ?').get(id)?.name || 'someone';
+  for (const id of added) history.push(`${nameOf(id)} added to the job`);
+  for (const id of removed) history.push(`${nameOf(id)} removed from the job`);
+  const logChange = db.prepare('INSERT INTO shift_changes (shift_id, user_id, summary) VALUES (?, ?, ?)');
+  for (const line of history) logChange.run(shift.id, req.user.id, line);
+
   events.broadcast('shifts', {});
   const kept = Array.isArray(assignee_ids) ? assignee_ids.filter((id) => before.includes(id)) : before;
 

@@ -18,6 +18,7 @@ const state = {
   weekStart: startOfWeek(new Date()),
   selectedDay: dateKey(new Date()),
   scheduleFilter: 'all', // 'all' | 'mine'
+  scheduleView: 'day',   // 'day' | 'week'
   shifts: [],
   chatChannel: null,
   chatMessages: [],
@@ -70,7 +71,11 @@ async function api(path, opts = {}) {
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  if (!res.ok) {
+    const err = new Error(data.error || `Request failed (${res.status})`);
+    Object.assign(err, data);
+    throw err;
+  }
   return data;
 }
 
@@ -137,7 +142,7 @@ function connectEvents() {
   for (const [event, views] of Object.entries({
     time: ['clock', 'timesheets'], forms: ['forms'], posts: ['updates'],
     hours: ['hours'], roles: ['roles'], positions: ['positions', 'team'], users: ['team'], settings: ['timesheets'],
-    attire: ['attire', 'schedule'],
+    attire: ['attire', 'schedule'], availability: ['availability', 'schedule'],
   })) {
     es.addEventListener(event, () => { if (views.includes(route().view)) render(); });
   }
@@ -504,6 +509,7 @@ function showPinReveal(pin, isAdmin) {
 const TABS = [
   { id: 'schedule', icon: '📅', label: 'Schedule' },
   { id: 'chat', icon: '💬', label: 'Chat' },
+  { id: 'availability', icon: '📗', label: 'Availability' },
   { id: 'clock', icon: '⏱️', label: 'Clock' },
   { id: 'updates', icon: '📢', label: 'Updates' },
   { id: 'more', icon: '☰', label: 'More' },
@@ -690,10 +696,17 @@ function renderSchedule() {
     <div class="filter-row">
       <button class="pill ${state.scheduleFilter === 'all' ? 'active' : ''}" data-filter="all">Everyone</button>
       <button class="pill ${state.scheduleFilter === 'mine' ? 'active' : ''}" data-filter="mine">My jobs</button>
+      <span style="flex:1"></span>
+      <button class="pill ${state.scheduleView === 'week' ? 'active' : ''}" id="view-toggle">${state.scheduleView === 'week' ? '📅 Week' : '📋 Day'}</button>
     </div>
-    ${dayShifts.length ? dayShifts.map(shiftCardHTML).join('') : `
-      <div class="empty"><div class="big">🗓️</div>No jobs scheduled for this day${isAdmin ? '<br>Tap ＋ to add one' : ''}</div>`}
+    ${state.scheduleView === 'week' ? weekGridHTML(days, byDay) : (dayShifts.length ? dayShifts.map(shiftCardHTML).join('') : `
+      <div class="empty"><div class="big">🗓️</div>No jobs scheduled for this day${isAdmin ? '<br>Tap ＋ to add one' : ''}</div>`)}
   `, { fab: isAdmin });
+
+  document.getElementById('view-toggle').onclick = () => {
+    state.scheduleView = state.scheduleView === 'week' ? 'day' : 'week';
+    render();
+  };
 
   document.getElementById('prev-week').onclick = () => { state.weekStart.setDate(state.weekStart.getDate() - 7); state.selectedDay = dateKey(state.weekStart); loadShifts().then(render); };
   document.getElementById('next-week').onclick = () => { state.weekStart.setDate(state.weekStart.getDate() + 7); state.selectedDay = dateKey(state.weekStart); loadShifts().then(render); };
@@ -707,6 +720,7 @@ function renderSchedule() {
       openShiftDetail(state.shifts.find((s) => s.id === Number(el.dataset.shift)));
     };
   });
+  state.shiftsIndex = state.shifts;
   document.querySelectorAll('[data-respond]').forEach((b) => {
     b.onclick = async () => {
       await api(`/api/shifts/${b.dataset.shiftId}/respond`, { method: 'POST', body: { status: b.dataset.respond } });
@@ -714,6 +728,80 @@ function renderSchedule() {
       loadShifts().then(render);
     };
   });
+}
+
+// Members only see who else is working when they share that venue that day.
+function canSeeCrew(shift, dayKeyValue, allShifts) {
+  if (state.me.role === 'admin') return true;
+  if (shift.assignees.some((a) => a.id === state.me.id)) return true;
+  if (!shift.venue_id) return false;
+  return allShifts.some((other) => (
+    other.venue_id === shift.venue_id
+    && dateKey(new Date(other.starts_at)) === dayKeyValue
+    && other.assignees.some((a) => a.id === state.me.id)
+  ));
+}
+
+// Week timetable: a column per day, an hour per row, jobs placed by time.
+function weekGridHTML(days, byDay) {
+  const all = state.shifts;
+  let earliest = 24 * 60, latest = 0;
+  for (const s of all) {
+    const st = new Date(s.starts_at), en = new Date(s.ends_at);
+    earliest = Math.min(earliest, st.getHours() * 60 + st.getMinutes());
+    latest = Math.max(latest, dateKey(en) === dateKey(st) ? en.getHours() * 60 + en.getMinutes() : 24 * 60);
+  }
+  if (!all.length) { earliest = 8 * 60; latest = 18 * 60; }
+  const startHour = Math.max(0, Math.floor(earliest / 60) - 1);
+  const endHour = Math.min(24, Math.ceil(latest / 60) + 1);
+  const hours = Math.max(4, endHour - startHour);
+  const PX_PER_HOUR = 58;
+
+  const columns = days.map((d) => {
+    const key = dateKey(d);
+    const items = (byDay[key] || []).map((s) => {
+      const st = new Date(s.starts_at), en = new Date(s.ends_at);
+      const fromMin = st.getHours() * 60 + st.getMinutes();
+      const toMin = dateKey(en) === key ? en.getHours() * 60 + en.getMinutes() : 24 * 60;
+      const top = ((fromMin - startHour * 60) / 60) * PX_PER_HOUR;
+      const height = Math.max(30, ((toMin - fromMin) / 60) * PX_PER_HOUR);
+      const mine = s.assignees.some((a) => a.id === state.me.id);
+      const showCrew = canSeeCrew(s, key, all);
+      return `
+        <div class="grid-shift ${mine ? 'mine' : ''}" data-shift="${s.id}"
+             style="top:${top}px;height:${height}px;border-left-color:${esc(s.venue_color || 'var(--brand)')}">
+          <div class="gs-time">${fmtTime(s.starts_at)}</div>
+          <div class="gs-title">${esc(s.title)}</div>
+          ${s.venue_name ? `<div class="gs-venue">${esc(s.venue_name)}</div>` : ''}
+          ${showCrew
+            ? (s.assignees.length ? `<div class="gs-people">${s.assignees.map((a) => esc(a.name.split(' ')[0])).join(', ')}</div>` : '')
+            : `<div class="gs-people muted">${s.assignees.length} scheduled</div>`}
+        </div>`;
+    }).join('');
+    const isToday = key === dateKey(new Date());
+    return `
+      <div class="grid-col">
+        <div class="grid-head ${isToday ? 'today' : ''}">
+          <div>${d.toLocaleDateString([], { weekday: 'short' })}</div>
+          <div class="gh-num">${d.getDate()}</div>
+        </div>
+        <div class="grid-body" style="height:${hours * PX_PER_HOUR}px">${items}</div>
+      </div>`;
+  }).join('');
+
+  const labels = [...Array(hours)].map((_, i) => `
+    <div class="grid-hour" style="height:${PX_PER_HOUR}px">${minToLabel((startHour + i) * 60)}</div>`).join('');
+
+  return `
+    <div class="week-grid-wrap">
+      <div class="week-grid">
+        <div class="grid-col grid-times">
+          <div class="grid-head"></div>
+          <div class="grid-body" style="height:${hours * PX_PER_HOUR}px">${labels}</div>
+        </div>
+        ${columns}
+      </div>
+    </div>`;
 }
 
 function shiftCardHTML(s) {
@@ -729,11 +817,11 @@ function shiftCardHTML(s) {
         ${s.role_name ? `<div class="shift-venue">🧑‍🍳 ${esc(s.role_name)}</div>` : ''}
         ${s.attire_name ? `<div class="shift-venue">👔 ${esc(s.attire_name)}</div>` : ''}
         ${s.notes ? `<div class="shift-notes">${esc(s.notes)}</div>` : ''}
-        ${s.assignees.length ? `<div class="shift-people">
+        ${s.assignees.length ? (canSeeCrew(s, dateKey(new Date(s.starts_at)), state.shifts) ? `<div class="shift-people">
           ${s.assignees.map((a) => `<span class="chip ${a.status}">
             <span class="avatar" style="background:${esc(a.color)}">${esc(initials(a.name))}</span>
             ${esc(a.name)}<span class="st">${statusIcon[a.status] || ''}</span></span>`).join('')}
-        </div>` : ''}
+        </div>` : `<div class="sub" style="margin-top:8px">${s.assignees.length} scheduled</div>`) : ''}
         ${mine && mine.status === 'pending' ? `
         <div class="shift-actions">
           <button class="btn small" data-respond="accepted" data-shift-id="${s.id}">Accept</button>
@@ -785,7 +873,9 @@ function openShiftDetail(s) {
     </div>
 
     <div class="section-title" style="margin-top:16px">Team on this job (${s.assignees.length})</div>
-    ${s.assignees.length ? `<div class="detail-people">
+    ${!canSeeCrew(s, dateKey(new Date(s.starts_at)), state.shifts)
+      ? `<p class="sub">${s.assignees.length} scheduled. You only see names for jobs at a venue you're working that day.</p>`
+      : s.assignees.length ? `<div class="detail-people">
       ${s.assignees.map((a) => `
         <div class="row detail-person">
           <span class="avatar lg" style="background:${esc(a.color)}">${esc(initials(a.name))}</span>
@@ -795,6 +885,7 @@ function openShiftDetail(s) {
           </span>
         </div>`).join('')}
     </div>` : '<p class="sub">Nobody assigned yet.</p>'}
+    <div id="detail-changes"></div>
 
     ${mine && mine.status === 'pending' ? `
       <div class="actions">
@@ -808,6 +899,24 @@ function openShiftDetail(s) {
   `);
 
   modal.querySelector('#detail-close').onclick = closeModal;
+
+  // Any edits an admin made since the job was created.
+  api(`/api/shifts/${s.id}/changes`).then(({ changes }) => {
+    const box = modal.querySelector('#detail-changes');
+    if (!box || !changes.length) return;
+    box.innerHTML = `
+      <div class="section-title" style="margin-top:16px">Changes</div>
+      <div class="detail-people">
+        ${changes.map((c) => `
+          <div class="detail-person change-row">
+            <span class="detail-ico">✏️</span>
+            <span class="grow">
+              <div>${esc(c.summary)}</div>
+              <div class="sub">${esc(c.user_name || 'An admin')} · ${fmtWhen(c.created_at)}</div>
+            </span>
+          </div>`).join('')}
+      </div>`;
+  }).catch(() => {});
   const attireBtn = modal.querySelector('[data-attire-detail]');
   if (attireBtn) attireBtn.onclick = () => {
     closeModal();
@@ -889,8 +998,26 @@ function openShiftModal(shift = null) {
       await api(shift ? `/api/shifts/${shift.id}` : '/api/shifts', { method: shift ? 'PATCH' : 'POST', body });
       closeModal(); toast(shift ? 'Job updated — team notified' : 'Job created — team notified');
       loadShifts().then(render);
-    } catch (err) { toast(err.message); }
+    } catch (err) {
+      if (err.conflicts?.length) showConflicts(err.conflicts);
+      else toast(err.message);
+    }
   };
+}
+
+function showConflicts(conflicts) {
+  openModal(`
+    <h3>⚠️ Scheduling conflict</h3>
+    <p class="sub">This job can't be saved until these are resolved:</p>
+    <div class="detail-people" style="margin-top:10px">
+      ${conflicts.map((c) => `
+        <div class="detail-person">
+          <span class="detail-ico">${c.kind === 'unavailable' ? '📗' : '📅'}</span>
+          <span class="grow">${esc(c.message)}</span>
+        </div>`).join('')}
+    </div>
+    <div class="actions"><button class="btn" onclick="document.querySelector('.modal-backdrop').remove()">Got it</button></div>
+  `);
 }
 
 function toLocalInput(iso) {
@@ -1969,6 +2096,145 @@ async function renderPositions() {
   });
 }
 
+/* ------------------------------- availability ------------------------------- */
+
+function minToLabel(min) {
+  const h = Math.floor(min / 60), m = min % 60;
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:${String(m).padStart(2, '0')} ${ampm}`;
+}
+
+function minToInput(min) {
+  return `${String(Math.floor(min / 60)).padStart(2, '0')}:${String(min % 60).padStart(2, '0')}`;
+}
+
+function inputToMin(value) {
+  const [h, m] = String(value || '0:0').split(':').map(Number);
+  return (h * 60) + (m || 0);
+}
+
+async function renderAvailability() {
+  const from = dateKey(new Date());
+  const to = new Date(); to.setDate(to.getDate() + 120);
+  const { unavailability } = await api(`/api/availability?from=${from}&to=${dateKey(to)}`);
+
+  // Group by date so a day with several blocks reads as one row.
+  const byDate = new Map();
+  for (const u of unavailability) {
+    if (!byDate.has(u.date)) byDate.set(u.date, []);
+    byDate.get(u.date).push(u);
+  }
+
+  shell('Availability', `
+    <p class="hint" style="margin-bottom:14px">Mark the times you <b>can't</b> work. Admins can't schedule you during them.</p>
+    ${byDate.size ? [...byDate.entries()].map(([date, items]) => `
+      <div class="card">
+        <div style="font-weight:700;margin-bottom:6px">${fmtDay(`${date}T12:00:00`)}</div>
+        ${items.map((u) => `
+          <div class="row unavail-row">
+            <span class="grow">
+              <div class="unavail-chip">Unavailable · ${u.all_day ? 'All day' : `${minToLabel(u.start_min)} – ${minToLabel(u.end_min)}`}</div>
+              ${u.note ? `<div class="sub" style="margin-top:4px">${esc(u.note)}</div>` : ''}
+              ${u.series_id ? '<div class="sub">🔁 Part of a weekly repeat</div>' : ''}
+            </span>
+            <button class="icon-btn" data-del-unavail="${u.id}" data-series="${u.series_id ? 1 : 0}">🗑️</button>
+          </div>`).join('')}
+      </div>`).join('')
+      : '<div class="empty"><div class="big">📗</div>You have no unavailability set.<br>Tap ＋ to add a day or time you can\'t work.</div>'}
+  `, { fab: true });
+
+  document.getElementById('fab').onclick = () => openUnavailModal();
+  document.querySelectorAll('[data-del-unavail]').forEach((b) => {
+    b.onclick = async () => {
+      const isSeries = b.dataset.series === '1';
+      let series = false;
+      if (isSeries) {
+        series = confirm('This repeats weekly.\n\nOK = remove this one and all later repeats\nCancel = remove just this day');
+      } else if (!confirm('Remove this unavailability?')) return;
+      await api(`/api/availability/${b.dataset.delUnavail}${series ? '?series=1' : ''}`, { method: 'DELETE' });
+      render();
+    };
+  });
+}
+
+function openUnavailModal() {
+  const modal = openModal(`
+    <h3>Declare unavailability</h3>
+    <form id="unavail-form">
+      <div class="settings-row" style="margin-top:12px">
+        <div style="font-weight:600">All day</div>
+        <button type="button" class="toggle" id="ua-allday" role="switch" aria-checked="false"><span class="knob"></span></button>
+      </div>
+      <label>Date</label><input name="date" type="date" required value="${dateKey(new Date())}">
+      <div id="ua-times">
+        <div style="display:flex;gap:10px;align-items:flex-end">
+          <span style="flex:1"><label>From</label><input name="start" type="time" value="09:00"></span>
+          <span style="flex:1"><label>To</label><input name="end" type="time" value="17:00"></span>
+        </div>
+      </div>
+      <label>Note (optional)</label>
+      <textarea name="note" rows="2" placeholder="Class, second job, appointment…"></textarea>
+
+      <div class="settings-row" style="margin-top:16px">
+        <div style="font-weight:600">🔁 Repeat every week</div>
+        <button type="button" class="toggle" id="ua-repeat" role="switch" aria-checked="false"><span class="knob"></span></button>
+      </div>
+      <div id="ua-repeat-weeks" hidden>
+        <label>Repeat for how many weeks?</label>
+        <input name="weeks" type="number" min="2" max="52" value="8">
+        <p class="hint">Counts this week as the first one.</p>
+      </div>
+
+      <div class="actions">
+        <button type="button" class="btn secondary" id="ua-cancel">Cancel</button>
+        <button type="submit" class="btn">Confirm</button>
+      </div>
+    </form>
+  `);
+
+  const allDay = modal.querySelector('#ua-allday');
+  const times = modal.querySelector('#ua-times');
+  allDay.onclick = () => {
+    const on = !allDay.classList.contains('on');
+    allDay.classList.toggle('on', on);
+    allDay.setAttribute('aria-checked', String(on));
+    times.hidden = on;
+  };
+
+  const repeat = modal.querySelector('#ua-repeat');
+  const weeksBox = modal.querySelector('#ua-repeat-weeks');
+  repeat.onclick = () => {
+    const on = !repeat.classList.contains('on');
+    repeat.classList.toggle('on', on);
+    repeat.setAttribute('aria-checked', String(on));
+    weeksBox.hidden = !on;
+  };
+
+  modal.querySelector('#ua-cancel').onclick = closeModal;
+  modal.querySelector('#unavail-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const isAllDay = allDay.classList.contains('on');
+    try {
+      const { created } = await api('/api/availability', {
+        method: 'POST',
+        body: {
+          date: fd.get('date'),
+          all_day: isAllDay,
+          start_min: inputToMin(fd.get('start')),
+          end_min: inputToMin(fd.get('end')),
+          note: fd.get('note') || '',
+          repeat_weeks: repeat.classList.contains('on') ? Number(fd.get('weeks')) || 1 : 1,
+        },
+      });
+      closeModal();
+      toast(created > 1 ? `Saved for ${created} weeks` : 'Unavailability saved');
+      render();
+    } catch (err) { toast(err.message); }
+  };
+}
+
 /* ---------------------------------- attire ---------------------------------- */
 
 async function renderAttire() {
@@ -2456,6 +2722,7 @@ async function render() {
     else if (view === 'positions') await renderPositions();
     else if (view === 'timesheets') await renderTimesheets();
     else if (view === 'forms') await renderForms();
+    else if (view === 'availability') await renderAvailability();
     else if (view === 'attire') await renderAttire();
     else if (view === 'signed') await renderSignedDocs();
     else if (view === 'place' && arg) await renderFieldPlacer(Number(arg));

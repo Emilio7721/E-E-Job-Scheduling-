@@ -481,6 +481,44 @@ select:disabled { opacity: .55; background: var(--bg); }
 }
 .doc-card-ico { font-size: 34px; }
 
+/* ---------- week grid ---------- */
+.week-grid-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; padding-bottom: 8px; }
+.week-grid { display: flex; min-width: 660px; }
+.grid-col { flex: 1 0 92px; border-left: 1px solid var(--line); }
+.grid-col.grid-times { flex: 0 0 62px; border-left: none; }
+.grid-head {
+  height: 46px; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  font-size: 11.5px; font-weight: 700; color: var(--muted);
+  border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 2;
+}
+.grid-head .gh-num { font-size: 16px; color: var(--text); }
+.grid-head.today { color: var(--accent); }
+.grid-head.today .gh-num { color: var(--accent); }
+.grid-body { position: relative; }
+.grid-times .grid-hour {
+  font-size: 10.5px; color: var(--muted); text-align: right;
+  padding-right: 6px; border-top: 1px solid var(--line);
+}
+.grid-shift {
+  position: absolute; left: 3px; right: 3px; overflow: hidden;
+  background: var(--card); border-radius: 7px; border-left: 4px solid var(--brand);
+  box-shadow: var(--shadow); padding: 5px 6px; text-align: left; font-size: 11px;
+}
+.grid-shift.mine { background: var(--brand-soft); }
+.gs-time { font-weight: 700; color: var(--accent); font-size: 10.5px; }
+.gs-title { font-weight: 700; line-height: 1.2; }
+.gs-venue, .gs-people { color: var(--muted); line-height: 1.25; }
+.gs-people.muted { font-style: italic; }
+
+/* ---------- availability ---------- */
+.unavail-row { padding: 6px 0; }
+.unavail-chip {
+  background: var(--red-soft); color: var(--red);
+  border-radius: 8px; padding: 7px 12px; font-weight: 600; font-size: 14px;
+  display: inline-block;
+}
+.change-row .detail-ico { font-size: 15px; width: 20px; }
+
 /* ---------- preference toggles ---------- */
 .toggle {
   width: 50px; height: 30px; border-radius: 999px; flex-shrink: 0;
