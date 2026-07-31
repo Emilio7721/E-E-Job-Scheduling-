@@ -219,6 +219,7 @@ ensureColumn('users', 'worker_id', 'worker_id TEXT');
 ensureColumn('roles', 'is_admin', 'is_admin INTEGER NOT NULL DEFAULT 0');
 ensureColumn('shifts', 'role_id', 'role_id INTEGER');
 ensureColumn('shifts', 'reminded_at', 'reminded_at TEXT');
+ensureColumn('shifts', 'attire_id', 'attire_id INTEGER');
 ensureColumn('time_entries', 'venue_id', 'venue_id INTEGER');
 ensureColumn('time_entries', 'role_id', 'role_id INTEGER');
 ensureColumn('time_entries', 'mileage', 'mileage REAL NOT NULL DEFAULT 0');
@@ -232,6 +233,16 @@ ensureColumn('forms', 'doc_pages', 'doc_pages INTEGER');
 ensureColumn('form_submissions', 'signed_path', 'signed_path TEXT');
 
 db.exec(`
+  CREATE TABLE IF NOT EXISTS attire (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    color       TEXT NOT NULL DEFAULT '#a8862c',
+    photo_path  TEXT,
+    archived    INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
   CREATE TABLE IF NOT EXISTS worker_id_roster (
     name_key     TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,

@@ -10,6 +10,7 @@ const state = {
   venues: [],
   roles: [],
   positions: [],
+  attire: [],
   settings: {},
   channels: [],
   notifications: [],
@@ -136,6 +137,7 @@ function connectEvents() {
   for (const [event, views] of Object.entries({
     time: ['clock', 'timesheets'], forms: ['forms'], posts: ['updates'],
     hours: ['hours'], roles: ['roles'], positions: ['positions', 'team'], users: ['team'], settings: ['timesheets'],
+    attire: ['attire', 'schedule'],
   })) {
     es.addEventListener(event, () => { if (views.includes(route().view)) render(); });
   }
@@ -436,12 +438,13 @@ function renderAuth() {
       e.preventDefault();
       const fd = new FormData(e.target);
       try {
-        const { user, pin } = await api('/api/auth/register', {
+        const { user, pin, payroll_match: match } = await api('/api/auth/register', {
           method: 'POST',
           body: { name: fd.get('name'), phone: fd.get('phone') },
         });
         state.me = user;
-        showPinReveal(pin, user.role === 'admin');
+        if (match) showPayrollConfirm(match, pin, user);
+        else showPinReveal(pin, user.role === 'admin');
       } catch (err) {
         document.getElementById('auth-error').textContent = err.message;
       }
@@ -453,6 +456,31 @@ function renderAuth() {
       await bootstrap();
     });
   }
+}
+
+// Payroll already lists someone with this name — make the new account confirm
+// it before their Paychex Worker ID is attached.
+function showPayrollConfirm(match, pin, user) {
+  $app.innerHTML = `
+    <div class="auth-wrap">
+      <div class="auth-card" style="text-align:center">
+        <img class="auth-brand" src="/brand/logo.png" alt="E&amp;E Management">
+        <div style="font-size:40px;margin:6px 0 2px">🧾</div>
+        <h3>Is this you?</h3>
+        <p class="auth-sub">Our payroll records list an employee as</p>
+        <div class="payroll-name">${esc(match.display_name)}</div>
+        <p class="auth-sub">Confirm only if that is you, so your hours reach the right payroll record.</p>
+        <button class="btn" id="payroll-yes">Yes, that's me</button>
+        <button class="btn secondary" id="payroll-no" style="margin-top:10px">No, that's someone else</button>
+      </div>
+    </div>`;
+  const finish = async (confirm) => {
+    try { await api('/api/me/payroll-match', { method: 'POST', body: { confirm } }); }
+    catch { /* the admin can always set the Worker ID by hand */ }
+    showPinReveal(pin, user.role === 'admin');
+  };
+  document.getElementById('payroll-yes').onclick = () => finish(true);
+  document.getElementById('payroll-no').onclick = () => finish(false);
 }
 
 function showPinReveal(pin, isAdmin) {
@@ -475,12 +503,29 @@ const TABS = [
   { id: 'schedule', icon: '📅', label: 'Schedule' },
   { id: 'chat', icon: '💬', label: 'Chat' },
   { id: 'clock', icon: '⏱️', label: 'Clock' },
+  { id: 'attire', icon: '👔', label: 'Attire' },
   { id: 'updates', icon: '📢', label: 'Updates' },
   { id: 'more', icon: '☰', label: 'More' },
 ];
 
 // Views that live under the "More" hub still highlight the More tab.
 const MORE_VIEWS = ['more', 'venues', 'team', 'forms', 'signed', 'place', 'timesheets', 'settings', 'notifications', 'hours', 'roles', 'positions'];
+
+function tabbarHTML(active, extraClass = '') {
+  return `
+    <nav class="tabbar ${extraClass}">
+      ${TABS.map((t) => `
+        <button data-tab="${t.id}" class="${active === t.id ? 'active' : ''}">
+          <span class="tab-icon">${t.icon}</span>${t.label}
+        </button>`).join('')}
+    </nav>`;
+}
+
+function bindTabbar() {
+  document.querySelectorAll('[data-tab]').forEach((b) => {
+    b.onclick = () => { location.hash = `#/${b.dataset.tab}`; };
+  });
+}
 
 async function signOut() {
   if (!confirm('Sign out of E&E?')) return;
@@ -504,15 +549,8 @@ function shell(title, contentHTML, { back = null, fab = null } = {}) {
     </header>` : ''}
     <div class="main" id="main">${contentHTML}</div>
     ${fab ? `<button class="fab" id="fab">＋</button>` : ''}
-    <nav class="tabbar">
-      ${TABS.map((t) => `
-        <button data-tab="${t.id}" class="${view === t.id ? 'active' : ''}">
-          <span class="tab-icon">${t.icon}</span>${t.label}
-        </button>`).join('')}
-    </nav>`;
-  document.querySelectorAll('[data-tab]').forEach((b) => {
-    b.onclick = () => { location.hash = `#/${b.dataset.tab}`; };
-  });
+    ${tabbarHTML(view)}`;
+  bindTabbar();
   const backBtn = document.getElementById('back-btn');
   if (backBtn) backBtn.onclick = back;
   const notifBtn = document.getElementById('notif-btn');
@@ -691,6 +729,7 @@ function shiftCardHTML(s) {
         <div class="shift-title">${esc(s.title)}</div>
         ${s.venue_name ? `<div class="shift-venue">📍 ${esc(s.venue_name)}${s.venue_address ? ` · ${esc(s.venue_address)}` : ''}</div>` : ''}
         ${s.role_name ? `<div class="shift-venue">🧑‍🍳 ${esc(s.role_name)}</div>` : ''}
+        ${s.attire_name ? `<div class="shift-venue">👔 ${esc(s.attire_name)}</div>` : ''}
         ${s.notes ? `<div class="shift-notes">${esc(s.notes)}</div>` : ''}
         ${s.assignees.length ? `<div class="shift-people">
           ${s.assignees.map((a) => `<span class="chip ${a.status}">
@@ -734,6 +773,12 @@ function openShiftDetail(s) {
         <span class="detail-ico">🧑‍🍳</span>
         <span><b>${esc(s.role_name)}</b><div class="sub">Job</div></span>
       </div>` : ''}
+      ${s.attire_name ? `
+      <div class="detail-row">
+        <span class="detail-ico">👔</span>
+        <span><b>${esc(s.attire_name)}</b><div class="sub">${esc(s.attire_description || 'Attire')}</div></span>
+        ${s.attire_id ? `<button class="btn small secondary" data-attire-detail="${s.attire_id}">View</button>` : ''}
+      </div>` : ''}
       ${s.notes ? `
       <div class="detail-row">
         <span class="detail-ico">📝</span>
@@ -765,6 +810,11 @@ function openShiftDetail(s) {
   `);
 
   modal.querySelector('#detail-close').onclick = closeModal;
+  const attireBtn = modal.querySelector('[data-attire-detail]');
+  if (attireBtn) attireBtn.onclick = () => {
+    closeModal();
+    openAttireDetail(state.attire.find((a) => a.id === Number(attireBtn.dataset.attireDetail)));
+  };
   const mapBtn = modal.querySelector('[data-map-detail]');
   if (mapBtn) mapBtn.onclick = () => window.open(`https://maps.google.com/?q=${mapBtn.dataset.mapDetail}`, '_blank');
   const editBtn = modal.querySelector('#detail-edit');
@@ -799,6 +849,11 @@ function openShiftModal(shift = null) {
         <option value="">No job</option>
         ${state.roles.map((r) => `<option value="${r.id}" ${shift?.role_id === r.id ? 'selected' : ''}>${esc(r.name)}</option>`).join('')}
       </select>
+      <label>Attire (optional)</label>
+      <select name="attire_id">
+        <option value="">No attire specified</option>
+        ${state.attire.map((a) => `<option value="${a.id}" ${shift?.attire_id === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}
+      </select>
       <label>Starts</label><input name="starts_at" type="datetime-local" required value="${startVal}">
       <label>Ends</label><input name="ends_at" type="datetime-local" required value="${endVal}">
       <label>Notes</label><textarea name="notes" rows="2" placeholder="Instructions, dress code, contact…">${esc(shift?.notes || '')}</textarea>
@@ -826,6 +881,7 @@ function openShiftModal(shift = null) {
       title: fd.get('title'),
       venue_id: fd.get('venue_id') ? Number(fd.get('venue_id')) : null,
       role_id: fd.get('role_id') ? Number(fd.get('role_id')) : null,
+      attire_id: fd.get('attire_id') ? Number(fd.get('attire_id')) : null,
       starts_at: new Date(fd.get('starts_at')).toISOString(),
       ends_at: new Date(fd.get('ends_at')).toISOString(),
       notes: fd.get('notes') || '',
@@ -929,7 +985,9 @@ async function renderChat(channelId) {
         <input id="chat-text" placeholder="Message ${esc(channel.name)}…" autocomplete="off">
         <button class="send" type="submit">➤</button>
       </form>
-    </div>`;
+    </div>
+    ${tabbarHTML('chat', 'chat-nav')}`;
+  bindTabbar();
   document.getElementById('back-btn').onclick = () => { location.hash = '#/chat'; };
   renderChatMessages();
   document.getElementById('chat-form').onsubmit = async (e) => {
@@ -1916,6 +1974,135 @@ async function renderPositions() {
   });
 }
 
+/* ---------------------------------- attire ---------------------------------- */
+
+async function renderAttire() {
+  const { attire } = await api('/api/attire');
+  state.attire = attire;
+  const isAdmin = state.me.role === 'admin';
+
+  // What the signed-in person is expected to wear next.
+  const now = Date.now();
+  const upcoming = state.shifts
+    .filter((sh) => sh.attire_name && new Date(sh.ends_at) > now
+      && sh.assignees.some((a) => a.id === state.me.id))
+    .sort((a, b) => a.starts_at.localeCompare(b.starts_at))[0];
+
+  shell('Attire', `
+    ${upcoming ? `
+      <div class="card next-attire">
+        <div class="sub">For your next job · ${fmtDay(upcoming.starts_at)}</div>
+        <div style="font-weight:800;font-size:17px;margin:3px 0">👔 ${esc(upcoming.attire_name)}</div>
+        <div class="sub">${esc(upcoming.title)}${upcoming.venue_name ? ` · ${esc(upcoming.venue_name)}` : ''}</div>
+      </div>` : ''}
+    ${attire.length ? `<div class="attire-grid">${attire.map((a) => `
+      <button class="attire-card" data-attire="${a.id}">
+        ${a.has_photo
+          ? `<img src="/api/attire/${a.id}/photo" alt="${esc(a.name)}" loading="lazy">`
+          : `<span class="attire-swatch" style="background:${esc(a.color)}">👔</span>`}
+        <span class="attire-name">${esc(a.name)}</span>
+        ${a.description ? `<span class="sub attire-desc">${esc(a.description)}</span>` : ''}
+      </button>`).join('')}</div>`
+      : `<div class="empty"><div class="big">👔</div>No attire set up yet${isAdmin ? '<br>Tap ＋ to add one (e.g. Black Formal, Banquet Whites)' : ''}</div>`}
+  `, { fab: isAdmin });
+
+  if (isAdmin) document.getElementById('fab').onclick = () => openAttireModal();
+  document.querySelectorAll('[data-attire]').forEach((b) => {
+    b.onclick = () => openAttireDetail(attire.find((a) => a.id === Number(b.dataset.attire)));
+  });
+}
+
+function openAttireDetail(item) {
+  if (!item) return;
+  const isAdmin = state.me.role === 'admin';
+  const modal = openModal(`
+    <h3>${esc(item.name)}</h3>
+    ${item.has_photo ? `<img class="attire-full" src="/api/attire/${item.id}/photo" alt="${esc(item.name)}">` : ''}
+    ${item.description ? `<p style="margin-top:12px;white-space:pre-wrap">${esc(item.description)}</p>` : '<p class="sub" style="margin-top:12px">No extra details.</p>'}
+    <div class="actions">
+      ${isAdmin ? '<button class="btn secondary" id="attire-edit">Edit</button>' : ''}
+      <button class="btn ${isAdmin ? 'secondary' : ''}" id="attire-close">Close</button>
+    </div>
+  `);
+  modal.querySelector('#attire-close').onclick = closeModal;
+  const edit = modal.querySelector('#attire-edit');
+  if (edit) edit.onclick = () => { closeModal(); openAttireModal(item); };
+}
+
+function openAttireModal(item = null) {
+  const colors = ['#a8862c', '#1f2937', '#0ea5e9', '#059669', '#dc2626', '#7c3aed', '#db2777'];
+  let color = item?.color || colors[0];
+  let photo;  // undefined = unchanged, null = cleared, string = new data URL
+
+  const modal = openModal(`
+    <h3>${item ? 'Edit attire' : 'New attire'}</h3>
+    <form id="attire-form">
+      <label>Name</label>
+      <input name="name" required placeholder="e.g. Black Formal" value="${esc(item?.name || '')}">
+      <label>What to wear</label>
+      <textarea name="description" rows="3" placeholder="Black button-up, black slacks, black non-slip shoes, no visible logos…">${esc(item?.description || '')}</textarea>
+      <label>Photo (optional)</label>
+      <input type="file" id="attire-photo" accept="image/jpeg,image/png">
+      <div id="attire-photo-preview">
+        ${item?.has_photo ? `<img class="attire-full" src="/api/attire/${item.id}/photo" alt=""><button type="button" class="btn small danger" id="attire-photo-clear" style="margin-top:8px">Remove photo</button>` : ''}
+      </div>
+      <label>Color</label>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        ${colors.map((c) => `<button type="button" data-color="${c}" style="width:34px;height:34px;border-radius:50%;background:${c};outline:${color === c ? '3px solid var(--text)' : 'none'};outline-offset:2px"></button>`).join('')}
+      </div>
+      <div class="actions">
+        ${item ? '<button type="button" class="btn danger" id="attire-delete">Delete</button>' : ''}
+        <button type="submit" class="btn">${item ? 'Save' : 'Add attire'}</button>
+      </div>
+    </form>
+  `);
+
+  modal.querySelectorAll('[data-color]').forEach((b) => {
+    b.onclick = () => {
+      color = b.dataset.color;
+      modal.querySelectorAll('[data-color]').forEach((x) => { x.style.outline = 'none'; });
+      b.style.outline = '3px solid var(--text)'; b.style.outlineOffset = '2px';
+    };
+  });
+
+  const fileInput = modal.querySelector('#attire-photo');
+  const preview = modal.querySelector('#attire-photo-preview');
+  fileInput.onchange = async () => {
+    const file = fileInput.files[0];
+    if (!file) return;
+    if (file.size > 4 * 1024 * 1024) { toast('Photos must be under 4 MB'); fileInput.value = ''; return; }
+    photo = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error('Could not read that photo'));
+      reader.readAsDataURL(file);
+    });
+    preview.innerHTML = `<img class="attire-full" src="${photo}" alt="">`;
+  };
+  const clearBtn = modal.querySelector('#attire-photo-clear');
+  if (clearBtn) clearBtn.onclick = () => { photo = null; preview.innerHTML = '<p class="sub">Photo removed on save.</p>'; };
+
+  const del = modal.querySelector('#attire-delete');
+  if (del) del.onclick = async () => {
+    if (!confirm('Delete this attire? Jobs already using it keep their label.')) return;
+    await api(`/api/attire/${item.id}`, { method: 'DELETE' });
+    closeModal(); render();
+  };
+
+  modal.querySelector('#attire-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const body = { name: fd.get('name'), description: fd.get('description') || '', color };
+    if (photo !== undefined) body.photo = photo;
+    try {
+      await api(item ? `/api/attire/${item.id}` : '/api/attire', { method: item ? 'PATCH' : 'POST', body });
+      state.attire = (await api('/api/attire')).attire;
+      closeModal(); toast(item ? 'Attire updated' : 'Attire added');
+      render();
+    } catch (err) { toast(err.message); }
+  };
+}
+
 /* ---------------------------------- kiosk ----------------------------------- */
 
 // Armed kiosk but no valid session (cookie expired / cleared): admin PIN re-activates.
@@ -2213,6 +2400,7 @@ async function render() {
     else if (view === 'positions') await renderPositions();
     else if (view === 'timesheets') await renderTimesheets();
     else if (view === 'forms') await renderForms();
+    else if (view === 'attire') await renderAttire();
     else if (view === 'signed') await renderSignedDocs();
     else if (view === 'place' && arg) await renderFieldPlacer(Number(arg));
     else if (view === 'updates') await renderUpdates();
@@ -2231,9 +2419,9 @@ async function render() {
 /* -------------------------------- bootstrap -------------------------------- */
 
 async function bootstrap() {
-  const [me, users, venues, roles, positions, settings, channels, notifs] = await Promise.all([
+  const [me, users, venues, roles, positions, attire, settings, channels, notifs] = await Promise.all([
     api('/api/me'), api('/api/users'), api('/api/venues'), api('/api/roles'), api('/api/positions'),
-    api('/api/settings'), api('/api/channels'), api('/api/notifications'),
+    api('/api/attire'), api('/api/settings'), api('/api/channels'), api('/api/notifications'),
   ]);
   state.me = me.user;
   state.vapidPublicKey = me.vapidPublicKey;
@@ -2241,6 +2429,7 @@ async function bootstrap() {
   state.venues = venues.venues;
   state.roles = roles.roles;
   state.positions = positions.positions;
+  state.attire = attire.attire;
   state.settings = settings.settings;
   state.channels = channels.channels;
   state.notifications = notifs.notifications;

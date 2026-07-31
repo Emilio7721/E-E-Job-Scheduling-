@@ -10,12 +10,13 @@ A Connecteam-style workforce app for E&E: **job scheduling**, **venues**, **team
 - **⏱️ Time clock** — one-tap clock in/out, optionally linked to the day's job, with **GPS location recorded at punch time** (when the employee allows it). Employees see their weekly hours at a glance.
 - **🧾 Timesheets & Paychex export** — **bi-weekly pay periods**; admins open each person to review their punches, edit times, venue, job, mileage and read shift notes, then approve individually or all at once. Export produces a **Paychex SPI import CSV** (flexible layout, CRLF) containing **only approved hours** — no rates, so Paychex applies each worker's configured rate.
 - **📄 Documents & e-signatures** — admins upload a PDF (handbook, waiver, policy); the team reads it on their phone and signs with a typed name plus a drawn signature. Admins can **place signature, date and printed-name fields anywhere on the document** — tap the page where each stamp belongs — and every signer's handwriting is burned into those exact spots, with an audit signature page appended as well. Admins get a **Signed Documents** screen showing who has and hasn't signed, with per-person and bulk downloads.
+- **👔 Attire** — admins define what to wear (name, description, photo, colour); each scheduled job can specify the attire, and the Attire tab shows everyone the outfit for their next job.
 - **📢 Updates feed** — company announcements posted by admins, pushed to every phone, with likes.
 - **🔔 Notifications on your phone** — real web push notifications (banner + lock screen) for job assignments, schedule changes, cancellations, chat messages, tasks, time-off decisions, new forms, and announcements — even when the app is closed. Plus an in-app notification feed.
 - **🔑 PIN sign-in** — no passwords: new team members sign up with their **name and phone number** and get a unique **5-digit PIN** used to sign in and clock in. The **first account created becomes the admin**.
 - **🔢 Kiosk mode** — an admin PIN locks any device into a full-screen punch clock (it stays locked across restarts until an admin PIN is entered again). Members clock in/out **only at the kiosk**, in person; admins can also punch from their own phone.
 - **👥 Team** — everyone who signs up appears in the team list; admins manage roles, hourly rates, and PINs.
-- **📱 Installable app** — add it to your home screen and it runs full-screen with its own icon, like a native app.
+- **📱 Installable app** — add it to your home screen and it runs full-screen with its own icon, like a native app. On desktop it lays out as a proper web app with a branded sidebar.
 
 ## Quick start
 

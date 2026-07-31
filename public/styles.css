@@ -565,10 +565,94 @@ select:disabled { opacity: .55; background: var(--bg); }
 }
 .like-btn.on { background: var(--brand-soft); color: var(--accent); }
 
-.desktop-note { display: none; }
+/* ---------- attire ---------- */
+.next-attire { border-left: 4px solid var(--brand); }
+.attire-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px;
+}
+.attire-card {
+  background: var(--card); border-radius: var(--radius); box-shadow: var(--shadow);
+  padding: 10px; display: flex; flex-direction: column; gap: 6px; text-align: left;
+}
+.attire-card img {
+  width: 100%; aspect-ratio: 3 / 4; object-fit: cover;
+  border-radius: 10px; background: var(--bg);
+}
+.attire-swatch {
+  width: 100%; aspect-ratio: 3 / 4; border-radius: 10px;
+  display: flex; align-items: center; justify-content: center; font-size: 40px;
+}
+.attire-name { font-weight: 700; font-size: 14.5px; }
+.attire-desc {
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.attire-full {
+  width: 100%; max-height: 340px; object-fit: contain;
+  border-radius: 12px; background: var(--bg); margin-top: 12px;
+}
+.payroll-name {
+  font-size: 22px; font-weight: 800; color: var(--accent);
+  background: var(--brand-soft); border-radius: 12px;
+  padding: 12px 16px; margin: 10px 0 14px;
+}
+
+/* The conversation view is full-screen on phones; the sidebar stays on desktop. */
+@media (max-width: 899px) { .tabbar.chat-nav { display: none; } }
+
+/* ---------- desktop layout ---------- */
 @media (min-width: 900px) {
-  #app { max-width: 480px; margin: 0 auto; box-shadow: 0 0 40px rgba(0,0,0,.25); }
-  .tabbar, .fab { max-width: 480px; margin: 0 auto; }
-  .tabbar { left: 50%; transform: translateX(-50%); width: 100%; }
-  .fab { right: calc(50% - 222px); }
+  #app {
+    display: grid;
+    grid-template-columns: 248px minmax(0, 1fr);
+    grid-template-rows: 100%;
+    height: 100%;
+  }
+
+  /* bottom tab bar becomes a real sidebar */
+  .tabbar {
+    position: relative; inset: auto;
+    grid-row: 1; grid-column: 1;
+    flex-direction: column; justify-content: flex-start;
+    border-top: none; border-right: 1px solid var(--line);
+    padding: 20px 12px; gap: 4px; overflow-y: auto;
+  }
+  .tabbar::before {
+    content: ''; display: block; height: 46px; margin: 0 8px 18px;
+    background: url('/brand/logo.png') left center / contain no-repeat;
+  }
+  .tabbar button {
+    flex: 0 0 auto; flex-direction: row; justify-content: flex-start;
+    gap: 12px; padding: 11px 14px; border-radius: 10px; font-size: 14.5px;
+  }
+  .tabbar button:hover { background: var(--bg); }
+  .tabbar button.active { background: var(--brand-soft); }
+  .tabbar .tab-icon { font-size: 18px; }
+  .tabbar .tab-badge { position: static; margin-left: auto; }
+
+  .topbar {
+    grid-column: 2; grid-row: 1; align-self: start;
+    padding: 18px 32px; z-index: 5;
+  }
+  .topbar h2 { font-size: 22px; }
+
+  .main {
+    grid-column: 2; grid-row: 1;
+    padding: 86px 32px 40px;   /* clears the sticky topbar */
+    max-width: 980px;
+  }
+  /* screens that render without a topbar (kiosk, field placer) */
+  #fp-pages, .kiosk-wrap { grid-column: 2; grid-row: 1; }
+  .fp-bar, .fp-hint { grid-column: 2; }
+
+  .fab { right: 40px; bottom: 32px; }
+
+  /* roomier cards and two-up lists where it reads better */
+  .card { padding: 18px; }
+  .day-strip button { padding: 12px 0; }
+  .attire-grid { grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); }
+  .chat-screen { grid-column: 2; grid-row: 1; padding-top: 64px; }
+}
+
+@media (min-width: 1280px) {
+  .main { max-width: 1120px; }
 }

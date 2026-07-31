@@ -69,10 +69,14 @@ app.post('/api/auth/register', (req, res) => {
 
   const general = db.prepare(`SELECT id FROM channels WHERE kind = 'group' AND name = 'General'`).get();
   db.prepare('INSERT OR IGNORE INTO channel_members (channel_id, user_id) VALUES (?, ?)').run(general.id, userId);
-  claimWorkerId(userId, name.trim());
+  const match = payrollMatchFor(userId, name.trim());
 
   setAuthCookie(res, userId);
-  res.json({ user: publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(userId)), pin });
+  res.json({
+    user: publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(userId)),
+    pin,
+    payroll_match: match ? { display_name: match.display_name } : null,
+  });
 });
 
 // Sign in with a 5-digit PIN.
@@ -113,16 +117,29 @@ function nameKey(raw) {
 
 // Called after a new signup: if payroll already listed this person, give them
 // their Worker ID automatically.
-function claimWorkerId(userId, name) {
+// Looks up the payroll roster for a name without assigning anything — the new
+// account confirms it is really them before the Worker ID is attached.
+function payrollMatchFor(userId, name) {
   const key = nameKey(name);
   if (!key) return null;
-  const row = db.prepare('SELECT worker_id FROM worker_id_roster WHERE name_key = ?').get(key);
+  const row = db.prepare('SELECT display_name, worker_id FROM worker_id_roster WHERE name_key = ?').get(key);
   if (!row) return null;
   const taken = db.prepare('SELECT id FROM users WHERE worker_id = ? AND id != ?').get(row.worker_id, userId);
   if (taken) return null;
-  db.prepare('UPDATE users SET worker_id = ? WHERE id = ?').run(row.worker_id, userId);
-  return row.worker_id;
+  return row;
 }
+
+// The signed-in user accepts (or rejects) the payroll record we matched them to.
+app.post('/api/me/payroll-match', requireAuth, (req, res) => {
+  const me = db.prepare('SELECT id, name, worker_id FROM users WHERE id = ?').get(req.user.id);
+  if (me.worker_id) return res.json({ ok: true, worker_id: me.worker_id });
+  if (!req.body?.confirm) return res.json({ ok: true, worker_id: null });
+  const match = payrollMatchFor(me.id, me.name);
+  if (!match) return res.status(404).json({ error: 'No payroll record matches your name' });
+  db.prepare('UPDATE users SET worker_id = ? WHERE id = ?').run(match.worker_id, me.id);
+  events.broadcast('users', {});
+  res.json({ ok: true, worker_id: match.worker_id });
+});
 
 // Bulk import of a payroll roster: assigns Worker IDs to matching team members
 // and remembers the rest for whoever signs up later.
@@ -336,10 +353,12 @@ app.delete('/api/venues/:id', requireAuth, requireAdmin, (req, res) => {
 
 const SHIFT_QUERY = `
   SELECT s.*, v.name AS venue_name, v.address AS venue_address, v.color AS venue_color,
-         r.name AS role_name
+         r.name AS role_name, a.name AS attire_name, a.color AS attire_color,
+         a.description AS attire_description
   FROM shifts s
   LEFT JOIN venues v ON v.id = s.venue_id
   LEFT JOIN roles r ON r.id = s.role_id
+  LEFT JOIN attire a ON a.id = s.attire_id
 `;
 
 function shiftWithAssignees(shift) {
@@ -374,13 +393,13 @@ function fmtShiftTime(iso) {
 }
 
 app.post('/api/shifts', requireAuth, requireAdmin, (req, res) => {
-  const { title, venue_id = null, role_id = null, starts_at, ends_at, notes = '', assignee_ids = [] } = req.body || {};
+  const { title, venue_id = null, role_id = null, attire_id = null, starts_at, ends_at, notes = '', assignee_ids = [] } = req.body || {};
   if (!title?.trim()) return res.status(400).json({ error: 'Job title is required' });
   if (!starts_at || !ends_at || new Date(ends_at) <= new Date(starts_at)) {
     return res.status(400).json({ error: 'Valid start and end times are required' });
   }
-  const info = db.prepare('INSERT INTO shifts (title, venue_id, role_id, starts_at, ends_at, notes, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(title.trim(), venue_id, role_id, starts_at, ends_at, notes.trim(), req.user.id);
+  const info = db.prepare('INSERT INTO shifts (title, venue_id, role_id, attire_id, starts_at, ends_at, notes, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(title.trim(), venue_id, role_id, attire_id, starts_at, ends_at, notes.trim(), req.user.id);
   const shiftId = Number(info.lastInsertRowid);
   const addAssignee = db.prepare('INSERT OR IGNORE INTO shift_assignees (shift_id, user_id) VALUES (?, ?)');
   for (const uid of assignee_ids) addAssignee.run(shiftId, uid);
@@ -400,15 +419,16 @@ app.patch('/api/shifts/:id', requireAuth, requireAdmin, (req, res) => {
   if (!shift) return res.status(404).json({ error: 'Job not found' });
   const {
     title = shift.title, venue_id = shift.venue_id, role_id = shift.role_id,
+    attire_id = shift.attire_id,
     starts_at = shift.starts_at, ends_at = shift.ends_at, notes = shift.notes, assignee_ids,
   } = req.body || {};
   if (!title?.trim()) return res.status(400).json({ error: 'Job title is required' });
   if (new Date(ends_at) <= new Date(starts_at)) return res.status(400).json({ error: 'End time must be after start time' });
 
-  db.prepare(`UPDATE shifts SET title = ?, venue_id = ?, role_id = ?, starts_at = ?, ends_at = ?, notes = ?,
+  db.prepare(`UPDATE shifts SET title = ?, venue_id = ?, role_id = ?, attire_id = ?, starts_at = ?, ends_at = ?, notes = ?,
       reminded_at = CASE WHEN starts_at != ? THEN NULL ELSE reminded_at END,
       updated_at = datetime('now') WHERE id = ?`)
-    .run(title.trim(), venue_id, role_id, starts_at, ends_at, notes.trim(), starts_at, shift.id);
+    .run(title.trim(), venue_id, role_id, attire_id, starts_at, ends_at, notes.trim(), starts_at, shift.id);
 
   const before = db.prepare('SELECT user_id FROM shift_assignees WHERE shift_id = ?').all(shift.id).map((r) => r.user_id);
   let added = [];
@@ -431,6 +451,7 @@ app.patch('/api/shifts/:id', requireAuth, requireAdmin, (req, res) => {
   if (shift.starts_at !== updated.starts_at || shift.ends_at !== updated.ends_at) changes.push('time');
   if (shift.venue_id !== updated.venue_id) changes.push('venue');
   if (shift.role_id !== updated.role_id) changes.push('job');
+  if (shift.attire_id !== updated.attire_id) changes.push('attire');
   if (shift.notes !== updated.notes) changes.push('notes');
 
   notify(added.filter((id) => id !== req.user.id), {
@@ -898,6 +919,71 @@ app.get('/api/time/export', requireAuth, requireAdmin, (req, res) => {
   // Paychex expects CRLF line endings in the import file.
   res.send(rows.map((r) => r.map(csvEsc).join(',')).join('\r\n') + '\r\n');
 });
+
+/* ---------------------------------- attire ---------------------------------- */
+
+app.get('/api/attire', requireAuth, (req, res) => {
+  const attire = db.prepare('SELECT id, name, description, color, photo_path IS NOT NULL AS has_photo FROM attire WHERE archived = 0 ORDER BY name').all();
+  res.json({ attire });
+});
+
+app.post('/api/attire', requireAuth, requireAdmin, (req, res) => {
+  const { name, description = '', color = '#a8862c', photo = null } = req.body || {};
+  if (!name?.trim()) return res.status(400).json({ error: 'Attire name is required' });
+  const photoPath = savedAttirePhoto(photo, res);
+  if (photoPath === false) return;
+  const info = db.prepare('INSERT INTO attire (name, description, color, photo_path) VALUES (?, ?, ?, ?)')
+    .run(name.trim(), String(description).trim().slice(0, 500), color, photoPath);
+  events.broadcast('attire', {});
+  res.json({ attire: db.prepare('SELECT * FROM attire WHERE id = ?').get(Number(info.lastInsertRowid)) });
+});
+
+app.patch('/api/attire/:id', requireAuth, requireAdmin, (req, res) => {
+  const item = db.prepare('SELECT * FROM attire WHERE id = ?').get(Number(req.params.id));
+  if (!item) return res.status(404).json({ error: 'Attire not found' });
+  const { name = item.name, description = item.description, color = item.color, photo } = req.body || {};
+  if (!name?.trim()) return res.status(400).json({ error: 'Attire name is required' });
+  let photoPath = item.photo_path;
+  if (photo !== undefined) {
+    const saved = savedAttirePhoto(photo, res);
+    if (saved === false) return;
+    photoPath = saved;
+  }
+  db.prepare('UPDATE attire SET name = ?, description = ?, color = ?, photo_path = ? WHERE id = ?')
+    .run(name.trim(), String(description).trim().slice(0, 500), color, photoPath, item.id);
+  events.broadcast('attire', {});
+  res.json({ ok: true });
+});
+
+app.delete('/api/attire/:id', requireAuth, requireAdmin, (req, res) => {
+  db.prepare('UPDATE attire SET archived = 1 WHERE id = ?').run(Number(req.params.id));
+  events.broadcast('attire', {});
+  res.json({ ok: true });
+});
+
+app.get('/api/attire/:id/photo', requireAuth, (req, res) => {
+  const item = db.prepare('SELECT photo_path FROM attire WHERE id = ?').get(Number(req.params.id));
+  if (!item?.photo_path || !fs.existsSync(item.photo_path)) return res.status(404).end();
+  res.setHeader('Content-Type', 'image/jpeg');
+  res.setHeader('Cache-Control', 'private, max-age=86400');
+  fs.createReadStream(item.photo_path).pipe(res);
+});
+
+// Accepts a data-URL photo, returns the stored path, null to clear, or false
+// after already sending an error response.
+function savedAttirePhoto(photo, res) {
+  if (!photo) return null;
+  const base64 = String(photo).includes(',') ? String(photo).split(',').pop() : String(photo);
+  let bytes;
+  try { bytes = Buffer.from(base64, 'base64'); } catch { res.status(400).json({ error: 'That photo could not be read' }); return false; }
+  if (bytes.length > 4 * 1024 * 1024) { res.status(400).json({ error: 'Photos must be under 4 MB' }); return false; }
+  const isJpeg = bytes[0] === 0xff && bytes[1] === 0xd8;
+  const isPng = bytes.subarray(0, 8).toString('hex') === '89504e470d0a1a0a';
+  if (!isJpeg && !isPng) { res.status(400).json({ error: 'Photos must be JPG or PNG' }); return false; }
+  const out = path.join(UPLOAD_DIR, `attire-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`);
+  fs.writeFileSync(out, bytes);
+  return out;
+}
 
 /* ---------------------------------- roles ----------------------------------- */
 
