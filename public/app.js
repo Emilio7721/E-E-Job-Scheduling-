@@ -576,10 +576,33 @@ function peoplePickerHTML(people, selected, { id = 'picker', placeholder = 'Sear
         <button type="button" class="opt ${selected.has(u.id) ? 'on' : ''}" data-user="${u.id}" data-name="${esc(u.name.toLowerCase())}">
           <span class="avatar" style="background:${esc(u.color)}">${esc(initials(u.name))}</span>
           <span class="grow">${esc(u.name)}</span>
+          <span class="opt-note"></span>
           <span class="check">✓</span>
         </button>`).join('')}
     </div>
     <div class="picker-empty" id="${id}-empty" hidden>No one matches that search.</div>`;
+}
+
+// Greys out anyone who can't work the times currently in the form.
+async function markPickerConflicts(root, { id = 'picker', starts_at, ends_at, shift_id = null }) {
+  const options = [...root.querySelectorAll(`#${id}-list [data-user]`)];
+  if (!starts_at || !ends_at || new Date(ends_at) <= new Date(starts_at)) return;
+  let conflicts = [];
+  try {
+    ({ conflicts } = await api('/api/shifts/check-conflicts', {
+      method: 'POST',
+      body: { assignee_ids: options.map((o) => Number(o.dataset.user)), starts_at, ends_at, shift_id },
+    }));
+  } catch { return; }
+
+  const byUser = new Map(conflicts.map((c) => [c.user_id, c]));
+  for (const opt of options) {
+    const clash = byUser.get(Number(opt.dataset.user));
+    const note = opt.querySelector('.opt-note');
+    opt.classList.toggle('unavailable', !!clash);
+    opt.title = clash ? clash.message : '';
+    note.textContent = clash ? (clash.kind === 'unavailable' ? 'Unavailable' : 'Already booked') : '';
+  }
 }
 
 function bindPeoplePicker(root, selected, { id = 'picker' } = {}) {
@@ -661,7 +684,9 @@ function openPinPad(title, onComplete) {
 async function loadShifts() {
   const from = new Date(state.weekStart);
   const to = new Date(state.weekStart); to.setDate(to.getDate() + 7);
-  const { shifts } = await api(`/api/shifts?from=${from.toISOString()}&to=${to.toISOString()}${state.scheduleFilter === 'mine' ? '&mine=1' : ''}`);
+  // Members only ever see their own jobs; admins choose.
+  const mine = state.me?.role !== 'admin' || state.scheduleFilter === 'mine';
+  const { shifts } = await api(`/api/shifts?from=${from.toISOString()}&to=${to.toISOString()}${mine ? '&mine=1' : ''}`);
   state.shifts = shifts;
 }
 
@@ -694,8 +719,9 @@ function renderSchedule() {
       }).join('')}
     </div>
     <div class="filter-row">
-      <button class="pill ${state.scheduleFilter === 'all' ? 'active' : ''}" data-filter="all">Everyone</button>
-      <button class="pill ${state.scheduleFilter === 'mine' ? 'active' : ''}" data-filter="mine">My jobs</button>
+      ${isAdmin ? `
+        <button class="pill ${state.scheduleFilter === 'all' ? 'active' : ''}" data-filter="all">Everyone</button>
+        <button class="pill ${state.scheduleFilter === 'mine' ? 'active' : ''}" data-filter="mine">My jobs</button>` : ''}
       <span style="flex:1"></span>
       <button class="pill ${state.scheduleView === 'week' ? 'active' : ''}" id="view-toggle">${state.scheduleView === 'week' ? '📅 Week' : '📋 Day'}</button>
     </div>
@@ -974,6 +1000,23 @@ function openShiftModal(shift = null) {
   `);
 
   bindPeoplePicker(modal, selected, { id: 'shift-picker' });
+
+  // Keep the availability markers in step with whatever times are chosen.
+  const refreshConflicts = () => {
+    const fd = new FormData(modal.querySelector('#shift-form'));
+    const from = fd.get('starts_at'), to = fd.get('ends_at');
+    if (!from || !to) return;
+    markPickerConflicts(modal, {
+      id: 'shift-picker',
+      starts_at: new Date(from).toISOString(),
+      ends_at: new Date(to).toISOString(),
+      shift_id: shift?.id || null,
+    });
+  };
+  modal.querySelector('[name=starts_at]').addEventListener('change', refreshConflicts);
+  modal.querySelector('[name=ends_at]').addEventListener('change', refreshConflicts);
+  refreshConflicts();
+
   const del = modal.querySelector('#delete-shift');
   if (del) del.onclick = async () => {
     if (!confirm('Delete this job? Assigned team members will be notified.')) return;
@@ -1164,7 +1207,7 @@ function renderVenues() {
         ${v.address ? `<button class="icon-btn" data-map="${encodeURIComponent(v.address)}" title="Open in Maps">🗺️</button>` : ''}
       </div>`).join('') : `
       <div class="empty"><div class="big">📍</div>No venues yet${isAdmin ? '<br>Tap ＋ to add your first venue' : ''}</div>`}
-  `, { fab: isAdmin });
+  `, { fab: isAdmin, back: () => { location.hash = '#/more'; } });
 
   document.querySelectorAll('[data-map]').forEach((b) => {
     b.onclick = (e) => { e.stopPropagation(); window.open(`https://maps.google.com/?q=${b.dataset.map}`, '_blank'); };
@@ -1240,7 +1283,7 @@ function renderTeam() {
       <div style="font-weight:700;margin-bottom:6px">Invite your team</div>
       <p class="hint">Share this app's link with your team — they sign up with their email and instantly appear here, in chat, and in the schedule.</p>
     </div>
-  `);
+  `, { back: () => { location.hash = '#/more'; } });
   document.querySelectorAll('[data-edit-user]').forEach((b) => {
     b.onclick = () => openUserModal(state.users.find((u) => u.id === Number(b.dataset.editUser)));
   });
@@ -1519,7 +1562,7 @@ async function renderSettings() {
     <div class="card">
       <button class="btn danger" id="logout">Sign out</button>
     </div>
-  `);
+  `, { back: () => { location.hash = '#/more'; } });
   document.querySelectorAll('[data-theme-opt]').forEach((b) => {
     b.onclick = () => { applyTheme(b.dataset.themeOpt); renderSettings(); };
   });
@@ -2116,46 +2159,111 @@ function inputToMin(value) {
 
 async function renderAvailability() {
   const from = dateKey(new Date());
-  const to = new Date(); to.setDate(to.getDate() + 120);
+  const to = new Date(); to.setDate(to.getDate() + 180);
   const { unavailability } = await api(`/api/availability?from=${from}&to=${dateKey(to)}`);
 
-  // Group by date so a day with several blocks reads as one row.
-  const byDate = new Map();
+  // A weekly repeat collapses into a single box; one-offs stay per date.
+  const series = new Map();
+  const singles = new Map();
   for (const u of unavailability) {
-    if (!byDate.has(u.date)) byDate.set(u.date, []);
-    byDate.get(u.date).push(u);
+    if (u.series_id) {
+      if (!series.has(u.series_id)) series.set(u.series_id, []);
+      series.get(u.series_id).push(u);
+    } else {
+      if (!singles.has(u.date)) singles.set(u.date, []);
+      singles.get(u.date).push(u);
+    }
   }
+
+  const timeLabel = (u) => (u.all_day ? 'All day' : `${minToLabel(u.start_min)} – ${minToLabel(u.end_min)}`);
+
+  const seriesCards = [...series.entries()].map(([id, items]) => {
+    items.sort((a, b) => a.date.localeCompare(b.date));
+    const first = items[0];
+    const weekday = new Date(`${first.date}T12:00:00`).toLocaleDateString([], { weekday: 'long' });
+    return `
+      <button class="card avail-card" data-series="${esc(id)}">
+        <div class="row">
+          <span class="grow">
+            <div style="font-weight:700">🔁 Every ${weekday}</div>
+            <div class="unavail-chip" style="margin-top:6px">Unavailable · ${timeLabel(first)}</div>
+            <div class="sub" style="margin-top:6px">${items.length} week${items.length === 1 ? '' : 's'} · ${fmtDay(`${first.date}T12:00:00`)} → ${fmtDay(`${items[items.length - 1].date}T12:00:00`)}</div>
+            ${first.note ? `<div class="sub">${esc(first.note)}</div>` : ''}
+          </span>
+          <span class="sub">›</span>
+        </div>
+      </button>`;
+  }).join('');
+
+  const singleCards = [...singles.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([date, items]) => `
+    <div class="card">
+      <div style="font-weight:700;margin-bottom:6px">${fmtDay(`${date}T12:00:00`)}</div>
+      ${items.map((u) => `
+        <div class="row unavail-row">
+          <span class="grow">
+            <div class="unavail-chip">Unavailable · ${timeLabel(u)}</div>
+            ${u.note ? `<div class="sub" style="margin-top:4px">${esc(u.note)}</div>` : ''}
+          </span>
+          <button class="icon-btn" data-del-unavail="${u.id}">🗑️</button>
+        </div>`).join('')}
+    </div>`).join('');
 
   shell('Availability', `
     <p class="hint" style="margin-bottom:14px">Mark the times you <b>can't</b> work. Admins can't schedule you during them.</p>
-    ${byDate.size ? [...byDate.entries()].map(([date, items]) => `
-      <div class="card">
-        <div style="font-weight:700;margin-bottom:6px">${fmtDay(`${date}T12:00:00`)}</div>
-        ${items.map((u) => `
-          <div class="row unavail-row">
-            <span class="grow">
-              <div class="unavail-chip">Unavailable · ${u.all_day ? 'All day' : `${minToLabel(u.start_min)} – ${minToLabel(u.end_min)}`}</div>
-              ${u.note ? `<div class="sub" style="margin-top:4px">${esc(u.note)}</div>` : ''}
-              ${u.series_id ? '<div class="sub">🔁 Part of a weekly repeat</div>' : ''}
-            </span>
-            <button class="icon-btn" data-del-unavail="${u.id}" data-series="${u.series_id ? 1 : 0}">🗑️</button>
-          </div>`).join('')}
-      </div>`).join('')
-      : '<div class="empty"><div class="big">📗</div>You have no unavailability set.<br>Tap ＋ to add a day or time you can\'t work.</div>'}
+    ${series.size ? `<div class="section-title">Repeating</div>${seriesCards}` : ''}
+    ${singles.size ? `<div class="section-title">One-off</div>${singleCards}` : ''}
+    ${!series.size && !singles.size
+      ? '<div class="empty"><div class="big">📗</div>You have no unavailability set.<br>Tap ＋ to add a day or time you can\'t work.</div>' : ''}
   `, { fab: true });
 
   document.getElementById('fab').onclick = () => openUnavailModal();
   document.querySelectorAll('[data-del-unavail]').forEach((b) => {
     b.onclick = async () => {
-      const isSeries = b.dataset.series === '1';
-      let series = false;
-      if (isSeries) {
-        series = confirm('This repeats weekly.\n\nOK = remove this one and all later repeats\nCancel = remove just this day');
-      } else if (!confirm('Remove this unavailability?')) return;
-      await api(`/api/availability/${b.dataset.delUnavail}${series ? '?series=1' : ''}`, { method: 'DELETE' });
+      if (!confirm('Remove this unavailability?')) return;
+      await api(`/api/availability/${b.dataset.delUnavail}`, { method: 'DELETE' });
       render();
     };
   });
+  document.querySelectorAll('[data-series]').forEach((b) => {
+    b.onclick = () => openSeriesDetail(series.get(b.dataset.series));
+  });
+}
+
+// Full breakdown of a weekly repeat: every date, with per-date removal.
+function openSeriesDetail(items) {
+  if (!items?.length) return;
+  const first = items[0];
+  const weekday = new Date(`${first.date}T12:00:00`).toLocaleDateString([], { weekday: 'long' });
+  const timeLabel = first.all_day ? 'All day' : `${minToLabel(first.start_min)} – ${minToLabel(first.end_min)}`;
+  const modal = openModal(`
+    <h3>🔁 Every ${weekday}</h3>
+    <div class="unavail-chip" style="margin-top:8px">Unavailable · ${timeLabel}</div>
+    ${first.note ? `<p class="sub" style="margin-top:10px">${esc(first.note)}</p>` : ''}
+    <div class="section-title" style="margin-top:16px">Repeats on ${items.length} date${items.length === 1 ? '' : 's'}</div>
+    <div class="detail-people">
+      ${items.map((u) => `
+        <div class="row detail-person">
+          <span class="grow">${fmtDay(`${u.date}T12:00:00`)}</span>
+          <button class="btn small danger" data-drop="${u.id}">Remove</button>
+        </div>`).join('')}
+    </div>
+    <div class="actions">
+      <button class="btn secondary" id="series-close">Close</button>
+      <button class="btn danger" id="series-drop-all">Remove all</button>
+    </div>
+  `);
+  modal.querySelector('#series-close').onclick = closeModal;
+  modal.querySelectorAll('[data-drop]').forEach((b) => {
+    b.onclick = async () => {
+      await api(`/api/availability/${b.dataset.drop}`, { method: 'DELETE' });
+      closeModal(); render();
+    };
+  });
+  modal.querySelector('#series-drop-all').onclick = async () => {
+    if (!confirm(`Remove all ${items.length} repeats?`)) return;
+    await api(`/api/availability/${first.id}?series=1`, { method: 'DELETE' });
+    closeModal(); render();
+  };
 }
 
 function openUnavailModal() {
@@ -2235,6 +2343,678 @@ function openUnavailModal() {
   };
 }
 
+/* ---------------------------------- forms ----------------------------------- */
+
+async function renderForms() {
+  const { forms } = await api('/api/forms');
+  const isAdmin = state.me.role === 'admin';
+  shell('Documents', `
+    ${isAdmin ? `<button class="btn secondary" id="goto-signed" style="margin-bottom:14px">📁 Signed documents & who\u2019s completed them</button>` : ''}
+    ${forms.length ? forms.map((f) => `
+      <div class="card">
+        <div class="row">
+          <span class="venue-icon" style="background:var(--brand)">📄</span>
+          <span class="grow">
+            <div style="font-weight:700">${esc(f.title)}</div>
+            ${f.description ? `<div class="sub">${esc(f.description)}</div>` : ''}
+            <div class="sub">
+              ${f.doc_name ? `${esc(f.doc_name)}${f.doc_pages ? ` · ${f.doc_pages} page${f.doc_pages === 1 ? '' : 's'}` : ''}` : 'Document'}
+              ${isAdmin ? `<br><b>${f.signed_count} of ${f.headcount}</b> signed · ${f.field_count ? `${f.field_count} signature field${f.field_count === 1 ? '' : 's'} placed` : 'signature page appended'}` : (f.my_submissions ? '<br>✅ You signed this' : '<br>⏳ Awaiting your signature')}
+            </div>
+          </span>
+        </div>
+        <div class="shift-actions">
+          <button class="btn small secondary" data-view-doc="${f.id}">Read</button>
+          <button class="btn small" data-fill="${f.id}">${f.my_submissions ? 'Sign again' : 'Sign'}</button>
+          ${isAdmin ? `<button class="btn small secondary" data-place="${f.id}">✍️ Place</button>` : ''}
+          ${isAdmin ? `<button class="btn small secondary" data-subs="${f.id}">Signers</button>` : ''}
+          ${isAdmin ? `<button class="btn small danger" data-del-form="${f.id}">Delete</button>` : ''}
+        </div>
+      </div>`).join('') : `<div class="empty"><div class="big">📄</div>No documents yet${isAdmin ? '<br>Tap ＋ to upload a PDF for the team to sign' : ''}</div>`}
+  `, { back: () => { location.hash = '#/more'; }, fab: isAdmin });
+
+  if (isAdmin) {
+    document.getElementById('fab').onclick = openDocumentUpload;
+    document.getElementById('goto-signed').onclick = () => { location.hash = '#/signed'; };
+  }
+  document.querySelectorAll('[data-view-doc]').forEach((b) => {
+    b.onclick = () => window.open(`/api/forms/${b.dataset.viewDoc}/document`, '_blank');
+  });
+  document.querySelectorAll('[data-fill]').forEach((b) => {
+    b.onclick = () => openSignDocument(forms.find((f) => f.id === Number(b.dataset.fill)));
+  });
+  document.querySelectorAll('[data-subs]').forEach((b) => {
+    b.onclick = () => openFormStatus(Number(b.dataset.subs));
+  });
+  document.querySelectorAll('[data-place]').forEach((b) => {
+    b.onclick = () => { location.hash = `#/place/${b.dataset.place}`; };
+  });
+  document.querySelectorAll('[data-del-form]').forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm('Delete this document? Signed copies already collected stay downloadable.')) return;
+      await api(`/api/forms/${b.dataset.delForm}`, { method: 'DELETE' });
+      render();
+    };
+  });
+}
+
+function openDocumentUpload() {
+  const modal = openModal(`
+    <h3>Upload a document</h3>
+    <p class="sub">The team reads it and signs it as-is. PDF only, up to 12 MB.</p>
+    <form id="doc-form">
+      <label>Title</label><input name="title" required placeholder="e.g. Employee Handbook Acknowledgment">
+      <label>Description (optional)</label><input name="description" placeholder="Shown under the title">
+      <label>PDF file</label>
+      <input name="file" id="doc-file" type="file" accept="application/pdf,.pdf" required>
+      <div class="sub" id="doc-file-note" style="margin-top:6px"></div>
+      <div class="actions"><button type="submit" class="btn" id="doc-submit">Upload & notify team</button></div>
+    </form>
+  `);
+  const fileInput = modal.querySelector('#doc-file');
+  const note = modal.querySelector('#doc-file-note');
+  fileInput.onchange = () => {
+    const f = fileInput.files[0];
+    note.textContent = f ? `${f.name} · ${(f.size / 1024 / 1024).toFixed(1)} MB` : '';
+  };
+  modal.querySelector('#doc-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const file = fileInput.files[0];
+    if (!file) return toast('Choose a PDF first');
+    if (file.size > 12 * 1024 * 1024) return toast('That PDF is over 12 MB');
+    const btn = modal.querySelector('#doc-submit');
+    btn.disabled = true; btn.textContent = 'Uploading…';
+    try {
+      const data = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error('Could not read that file'));
+        reader.readAsDataURL(file);
+      });
+      const fd = new FormData(e.target);
+      await api('/api/forms', {
+        method: 'POST',
+        body: {
+          title: fd.get('title'),
+          description: fd.get('description') || '',
+          file: { name: file.name, data },
+        },
+      });
+      closeModal(); toast('Uploaded — team notified');
+      render();
+    } catch (err) {
+      toast(err.message);
+      btn.disabled = false; btn.textContent = 'Upload & notify team';
+    }
+  };
+}
+
+function openSignDocument(form) {
+  const modal = openModal(`
+    <h3>${esc(form.title)}</h3>
+    ${form.description ? `<p class="sub">${esc(form.description)}</p>` : ''}
+    ${isIOS() ? `
+      <div class="doc-card">
+        <div class="doc-card-ico">📄</div>
+        <div>
+          <div style="font-weight:700">${esc(form.doc_name || 'document.pdf')}</div>
+          <div class="sub">${form.doc_pages ? `${form.doc_pages} page${form.doc_pages === 1 ? '' : 's'} · ` : ''}Tap below to read it</div>
+        </div>
+      </div>` : `
+      <div class="doc-preview">
+        <iframe src="/api/forms/${form.id}/document#view=FitH" title="Document preview"></iframe>
+      </div>`}
+    <button type="button" class="btn secondary" id="open-doc">📄 Open document full screen</button>
+    <form id="sign-form">
+      <label class="check-label"><input type="checkbox" id="read-ack" required style="width:auto"> I have read this document</label>
+      <div class="sign-block">
+        <div class="sign-head">Signature</div>
+        <label>Type your full legal name</label>
+        <input name="signed_name" required autocomplete="name" placeholder="Jane Doe" value="${esc(state.me.name)}">
+        <label>Draw your signature</label>
+        <div class="sign-pad-wrap">
+          <canvas id="sign-pad" class="sign-pad"></canvas>
+          <button type="button" class="sign-clear" id="sign-clear">Clear</button>
+        </div>
+        <p class="hint">By signing you agree this electronic signature is the legal equivalent of your handwritten signature on this document.</p>
+      </div>
+      <div class="actions">
+        <button type="button" class="btn secondary" id="sign-cancel">Cancel</button>
+        <button type="submit" class="btn">Sign document</button>
+      </div>
+    </form>
+  `);
+
+  const pad = initSignaturePad(modal.querySelector('#sign-pad'), modal.querySelector('#sign-clear'));
+  modal.querySelector('#open-doc').onclick = () => window.open(`/api/forms/${form.id}/document`, '_blank');
+  modal.querySelector('#sign-cancel').onclick = closeModal;
+  modal.querySelector('#sign-form').onsubmit = async (e) => {
+    e.preventDefault();
+    if (pad.isEmpty()) return toast('Please draw your signature');
+    try {
+      await api(`/api/forms/${form.id}/submit`, {
+        method: 'POST',
+        body: { signature: pad.toDataURL(), signed_name: e.target.elements.signed_name.value },
+      });
+      closeModal(); toast('Signed ✅');
+      render();
+    } catch (err) { toast(err.message); }
+  };
+}
+
+/* --------------------- signature field placement (admin) -------------------- */
+
+const FIELD_SPECS = {
+  signature: { label: 'Signature', w: 180, h: 50, icon: '✍️' },
+  date: { label: 'Date', w: 110, h: 20, icon: '📅' },
+  name: { label: 'Printed name', w: 150, h: 20, icon: '🔤' },
+};
+
+let pdfjsLib = null;
+async function loadPdfJs() {
+  if (pdfjsLib) return pdfjsLib;
+  pdfjsLib = await import('/vendor/pdf.min.mjs');
+  pdfjsLib.GlobalWorkerOptions.workerSrc = '/vendor/pdf.worker.min.mjs';
+  return pdfjsLib;
+}
+
+// Full-screen editor: renders every page and lets the admin drop, drag and
+// delete stamps. Tap positions are converted to PDF points by pdf.js itself,
+// so placement stays exact on rotated or oddly sized pages.
+async function renderFieldPlacer(formId) {
+  if (state.me.role !== 'admin') { location.hash = '#/forms'; return; }
+  const [{ forms }, { fields }] = await Promise.all([api('/api/forms'), api(`/api/forms/${formId}/fields`)]);
+  const form = forms.find((f) => f.id === formId);
+  if (!form) { location.hash = '#/forms'; return; }
+
+  let placing = 'signature';
+  const placed = fields.map((f) => ({ ...f }));
+
+  $app.innerHTML = `
+    <header class="topbar">
+      <button class="icon-btn" id="fp-back">←</button>
+      <h2>Place signatures</h2>
+      <button class="btn small" id="fp-save">Save</button>
+    </header>
+    <div class="fp-bar">
+      ${Object.entries(FIELD_SPECS).map(([kind, spec]) => `
+        <button class="pill ${kind === 'signature' ? 'active' : ''}" data-kind="${kind}">${spec.icon} ${spec.label}</button>`).join('')}
+    </div>
+    <p class="fp-hint">Tap the page where the <b id="fp-current">signature</b> should go. Drag a stamp to move it, tap ✕ to remove it.</p>
+    <div class="main" id="fp-pages"><div class="empty">Loading document…</div></div>`;
+
+  document.getElementById('fp-back').onclick = () => { location.hash = '#/forms'; };
+  document.querySelectorAll('[data-kind]').forEach((b) => {
+    b.onclick = () => {
+      placing = b.dataset.kind;
+      document.querySelectorAll('[data-kind]').forEach((x) => x.classList.toggle('active', x === b));
+      document.getElementById('fp-current').textContent = FIELD_SPECS[placing].label.toLowerCase();
+    };
+  });
+
+  const pagesEl = document.getElementById('fp-pages');
+  let viewports = [];
+  try {
+    const pdfjs = await loadPdfJs();
+    const doc = await pdfjs.getDocument({ url: `/api/forms/${formId}/document`, withCredentials: true }).promise;
+    pagesEl.innerHTML = '';
+    for (let n = 1; n <= doc.numPages; n++) {
+      const page = await doc.getPage(n);
+      const width = Math.min(pagesEl.clientWidth - 4, 720);
+      const viewport = page.getViewport({ scale: width / page.getViewport({ scale: 1 }).width });
+      viewports[n - 1] = viewport;
+
+      const wrap = document.createElement('div');
+      wrap.className = 'fp-page';
+      wrap.dataset.page = String(n - 1);
+      wrap.style.width = `${viewport.width}px`;
+      wrap.style.height = `${viewport.height}px`;
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.floor(viewport.width * (window.devicePixelRatio || 1));
+      canvas.height = Math.floor(viewport.height * (window.devicePixelRatio || 1));
+      canvas.style.width = `${viewport.width}px`;
+      canvas.style.height = `${viewport.height}px`;
+      wrap.appendChild(canvas);
+      pagesEl.appendChild(wrap);
+
+      const ctx = canvas.getContext('2d');
+      const dpr = window.devicePixelRatio || 1;
+      ctx.scale(dpr, dpr);
+      await page.render({ canvasContext: ctx, viewport }).promise;
+    }
+  } catch (err) {
+    pagesEl.innerHTML = `<div class="empty"><div class="big">⚠️</div>Could not display this document.<br><span class="sub">${esc(err.message)}</span></div>`;
+    return;
+  }
+
+  const drawAll = () => {
+    document.querySelectorAll('.fp-page').forEach((wrap) => {
+      const pageIdx = Number(wrap.dataset.page);
+      wrap.querySelectorAll('.fp-stamp').forEach((el) => el.remove());
+      const vp = viewports[pageIdx];
+      placed.forEach((f, i) => {
+        if (f.page !== pageIdx) return;
+        // PDF points -> screen: y flips because PDF measures from the bottom.
+        const [left, top] = vp.convertToViewportPoint(f.x, f.y + f.h);
+        const [right, bottom] = vp.convertToViewportPoint(f.x + f.w, f.y);
+        const el = document.createElement('div');
+        el.className = `fp-stamp fp-${f.kind}`;
+        el.dataset.index = String(i);
+        el.style.left = `${Math.min(left, right)}px`;
+        el.style.top = `${Math.min(top, bottom)}px`;
+        el.style.width = `${Math.abs(right - left)}px`;
+        el.style.height = `${Math.abs(bottom - top)}px`;
+        el.innerHTML = `<span>${FIELD_SPECS[f.kind].icon} ${FIELD_SPECS[f.kind].label}</span><button type="button" class="fp-del">✕</button>`;
+        wrap.appendChild(el);
+      });
+    });
+    bindStamps();
+  };
+
+  function bindStamps() {
+    document.querySelectorAll('.fp-stamp').forEach((el) => {
+      const idx = Number(el.dataset.index);
+      el.querySelector('.fp-del').onclick = (e) => {
+        e.stopPropagation();
+        placed.splice(idx, 1);
+        drawAll();
+      };
+      const startDrag = (e) => {
+        if (e.target.classList.contains('fp-del')) return;
+        e.preventDefault(); e.stopPropagation();
+        const wrap = el.parentElement;
+        const vp = viewports[Number(wrap.dataset.page)];
+        const point = (ev) => { const t = ev.touches ? ev.touches[0] : ev; return t; };
+        const startRect = el.getBoundingClientRect();
+        const grabX = point(e).clientX - startRect.left;
+        const grabY = point(e).clientY - startRect.top;
+        const onMove = (ev) => {
+          ev.preventDefault();
+          const box = wrap.getBoundingClientRect();
+          const left = Math.max(0, Math.min(box.width - startRect.width, point(ev).clientX - box.left - grabX));
+          const top = Math.max(0, Math.min(box.height - startRect.height, point(ev).clientY - box.top - grabY));
+          el.style.left = `${left}px`;
+          el.style.top = `${top}px`;
+          const [px, py] = vp.convertToPdfPoint(left, top + startRect.height);
+          placed[idx].x = px;
+          placed[idx].y = py;
+        };
+        const onUp = () => {
+          window.removeEventListener('mousemove', onMove);
+          window.removeEventListener('mouseup', onUp);
+          window.removeEventListener('touchmove', onMove);
+          window.removeEventListener('touchend', onUp);
+        };
+        window.addEventListener('mousemove', onMove);
+        window.addEventListener('mouseup', onUp);
+        window.addEventListener('touchmove', onMove, { passive: false });
+        window.addEventListener('touchend', onUp);
+      };
+      el.addEventListener('mousedown', startDrag);
+      el.addEventListener('touchstart', startDrag, { passive: false });
+    });
+  }
+
+  document.querySelectorAll('.fp-page').forEach((wrap) => {
+    wrap.onclick = (e) => {
+      if (e.target.closest('.fp-stamp')) return;
+      const pageIdx = Number(wrap.dataset.page);
+      const vp = viewports[pageIdx];
+      const box = wrap.getBoundingClientRect();
+      const spec = FIELD_SPECS[placing];
+      // Convert the tap to PDF points and centre the new stamp on it.
+      const [px, py] = vp.convertToPdfPoint(e.clientX - box.left, e.clientY - box.top);
+      placed.push({
+        page: pageIdx, kind: placing,
+        x: Math.max(0, px - spec.w / 2),
+        y: Math.max(0, py - spec.h / 2),
+        w: spec.w, h: spec.h,
+      });
+      drawAll();
+    };
+  });
+
+  drawAll();
+  document.getElementById('fp-save').onclick = async () => {
+    try {
+      const { count } = await api(`/api/forms/${formId}/fields`, { method: 'PUT', body: { fields: placed } });
+      toast(count ? `${count} field${count === 1 ? '' : 's'} saved` : 'Fields cleared — signatures append at the end');
+      location.hash = '#/forms';
+    } catch (err) { toast(err.message); }
+  };
+}
+
+// Admin overview: every document, who signed it, and downloads.
+async function renderSignedDocs() {
+  if (state.me.role !== 'admin') { location.hash = '#/forms'; return; }
+  const { forms } = await api('/api/forms/signed-overview');
+  shell('Signed Documents', `
+    ${forms.length ? forms.map((f) => `
+      <div class="card">
+        <div class="row" style="margin-bottom:8px">
+          <span class="grow">
+            <div style="font-weight:700">${esc(f.title)}</div>
+            <div class="sub">${esc(f.doc_name || 'document.pdf')} · <b>${f.signers.length} of ${f.headcount}</b> signed</div>
+          </span>
+          ${f.signers.length ? `<button class="btn small" data-all-form="${f.id}">Download all</button>` : ''}
+        </div>
+        ${f.signers.map((sg) => `
+          <div class="row detail-person">
+            <span class="avatar" style="background:${esc(sg.user_color || '#888')}">${esc(initials(sg.user_name || '?'))}</span>
+            <span class="grow">
+              <div style="font-weight:600">${esc(sg.user_name || 'Removed user')}</div>
+              <div class="sub accepted">✓ Signed ${fmtWhen(sg.signed_at || sg.created_at)}</div>
+            </span>
+            <button class="btn small secondary" data-pdf="${f.id}:${sg.submission_id}">PDF</button>
+          </div>`).join('')}
+        ${f.pending.length ? `<div class="sub" style="margin-top:10px">Still waiting on: ${f.pending.map((p) => esc(p.name)).join(', ')}</div>` : '<div class="sub accepted" style="margin-top:10px">✓ Everyone has signed</div>'}
+      </div>`).join('') : '<div class="empty"><div class="big">📁</div>No documents uploaded yet</div>'}
+  `, { back: () => { location.hash = '#/forms'; } });
+
+  document.querySelectorAll('[data-pdf]').forEach((b) => {
+    const [formId, subId] = b.dataset.pdf.split(':');
+    b.onclick = () => window.open(`/api/forms/${formId}/submissions/${subId}/pdf`, '_blank');
+  });
+  document.querySelectorAll('[data-all-form]').forEach((b) => {
+    b.onclick = () => {
+      const f = forms.find((x) => x.id === Number(b.dataset.allForm));
+      f.signers.forEach((sg, i) => setTimeout(
+        () => window.open(`/api/forms/${f.id}/submissions/${sg.submission_id}/pdf`, '_blank'), i * 400));
+    };
+  });
+}
+
+// Finger/mouse signature capture on a canvas sized to its container.
+function initSignaturePad(canvas, clearBtn) {
+  const ratio = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * ratio;
+  canvas.height = rect.height * ratio;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(ratio, ratio);
+  ctx.lineWidth = 2.2;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.strokeStyle = '#111';
+
+  let drawing = false;
+  let dirty = false;
+  const pos = (e) => {
+    const r = canvas.getBoundingClientRect();
+    const t = e.touches ? e.touches[0] : e;
+    return { x: t.clientX - r.left, y: t.clientY - r.top };
+  };
+  const start = (e) => { e.preventDefault(); drawing = true; const { x, y } = pos(e); ctx.beginPath(); ctx.moveTo(x, y); };
+  const move = (e) => {
+    if (!drawing) return;
+    e.preventDefault();
+    const { x, y } = pos(e);
+    ctx.lineTo(x, y); ctx.stroke();
+    dirty = true;
+  };
+  const end = () => { drawing = false; };
+
+  canvas.addEventListener('mousedown', start);
+  canvas.addEventListener('mousemove', move);
+  window.addEventListener('mouseup', end);
+  canvas.addEventListener('touchstart', start, { passive: false });
+  canvas.addEventListener('touchmove', move, { passive: false });
+  canvas.addEventListener('touchend', end);
+
+  clearBtn.onclick = () => { ctx.clearRect(0, 0, canvas.width, canvas.height); dirty = false; };
+
+  return {
+    isEmpty: () => !dirty,
+    // Flatten onto white so the PNG reads correctly in the PDF.
+    toDataURL: () => {
+      const out = document.createElement('canvas');
+      out.width = canvas.width; out.height = canvas.height;
+      const octx = out.getContext('2d');
+      octx.fillStyle = '#fff';
+      octx.fillRect(0, 0, out.width, out.height);
+      octx.drawImage(canvas, 0, 0);
+      return out.toDataURL('image/png');
+    },
+  };
+}
+
+// Admin view: who has completed a form, with per-person PDF downloads.
+async function openFormStatus(formId) {
+  const { form, people } = await api(`/api/forms/${formId}/status`);
+  const done = people.filter((p) => p.submission_id);
+  const modal = openModal(`
+    <h3>${esc(form.title)}</h3>
+    <p class="sub"><b>${done.length} of ${people.length}</b> completed</p>
+    <div class="detail-people" style="margin-top:12px">
+      ${people.map((p) => `
+        <div class="row detail-person">
+          <span class="avatar lg" style="background:${esc(p.color)}">${esc(initials(p.name))}</span>
+          <span class="grow">
+            <div style="font-weight:700">${esc(p.name)}</div>
+            <div class="sub ${p.submission_id ? 'accepted' : 'pending'}">
+              ${p.submission_id ? `✓ ${p.signed_at ? 'Signed' : 'Submitted'} ${fmtWhen(p.created_at)}` : '• Not completed yet'}
+            </div>
+          </span>
+          ${p.submission_id ? `<button class="btn small secondary" data-pdf="${p.submission_id}">PDF</button>` : ''}
+        </div>`).join('')}
+    </div>
+    <div class="actions">
+      <button class="btn secondary" id="status-close">Close</button>
+      ${done.length ? `<button class="btn" id="download-all">Download all (${done.length})</button>` : ''}
+    </div>
+  `);
+  modal.querySelector('#status-close').onclick = closeModal;
+  modal.querySelectorAll('[data-pdf]').forEach((b) => {
+    b.onclick = () => window.open(`/api/forms/${formId}/submissions/${b.dataset.pdf}/pdf`, '_blank');
+  });
+  const all = modal.querySelector('#download-all');
+  if (all) all.onclick = () => {
+    // Staggered so the browser does not swallow the batch as a popup flood.
+    done.forEach((p, i) => setTimeout(
+      () => window.open(`/api/forms/${formId}/submissions/${p.submission_id}/pdf`, '_blank'), i * 400));
+  };
+}
+
+/* ------------------------------ hours requests ------------------------------ */
+
+function openHourRequestModal() {
+  const today = dateKey(new Date());
+  const modal = openModal(`
+    <h3>Request hours</h3>
+    <p class="sub">For time you worked but didn't clock — sent to a manager for approval.</p>
+    <form id="hours-form">
+      <label>Venue / job</label>
+      <select name="venue_id">
+        <option value="">No venue</option>
+        ${state.venues.map((v) => `<option value="${v.id}">${esc(v.name)}</option>`).join('')}
+      </select>
+      <label>Job</label>
+      <select name="role_id">
+        <option value="">No job</option>
+        ${state.roles.map((r) => `<option value="${r.id}">${esc(r.name)}</option>`).join('')}
+      </select>
+      <label>Date</label><input name="date" type="date" required value="${today}">
+      <div style="display:flex;gap:10px">
+        <span style="flex:1"><label>Starts</label><input name="start" type="time" required value="09:00"></span>
+        <span style="flex:1"><label>Ends</label><input name="end" type="time" required value="17:00"></span>
+      </div>
+      <label>Note (optional)</label><textarea name="note" rows="2" placeholder="Attach a note to your request…"></textarea>
+      <p class="hint">All requests are sent for a manager's approval.</p>
+      <div class="actions"><button type="submit" class="btn">Send for approval</button></div>
+    </form>
+  `);
+  modal.querySelector('#hours-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const starts = new Date(`${fd.get('date')}T${fd.get('start')}`);
+    let ends = new Date(`${fd.get('date')}T${fd.get('end')}`);
+    if (ends <= starts) ends = new Date(ends.getTime() + 24 * 3600000); // overnight shift
+    try {
+      await api('/api/hour-requests', {
+        method: 'POST',
+        body: {
+          venue_id: fd.get('venue_id') ? Number(fd.get('venue_id')) : null,
+          role_id: fd.get('role_id') ? Number(fd.get('role_id')) : null,
+          starts_at: starts.toISOString(),
+          ends_at: ends.toISOString(),
+          note: fd.get('note') || '',
+        },
+      });
+      closeModal(); toast('Sent for approval ✅');
+      if (route().view === 'hours') render();
+    } catch (err) { toast(err.message); }
+  };
+}
+
+async function renderHours() {
+  const { requests } = await api('/api/hour-requests');
+  const isAdmin = state.me.role === 'admin';
+  const pending = requests.filter((r) => r.status === 'pending');
+  const rest = requests.filter((r) => r.status !== 'pending');
+
+  const reqCard = (r) => {
+    const hours = ((new Date(r.ends_at) - new Date(r.starts_at)) / 3600000).toFixed(1);
+    return `
+    <div class="card row">
+      <span style="font-size:24px">🕐</span>
+      <span class="grow">
+        <div style="font-weight:700">${isAdmin ? esc(r.user_name) + ' · ' : ''}${hours}h</div>
+        <div class="sub">${fmtDay(r.starts_at)} · ${fmtTime(r.starts_at)} – ${fmtTime(r.ends_at)}</div>
+        ${r.venue_name || r.role_name ? `<div class="sub">${[r.role_name, r.venue_name].filter(Boolean).map(esc).join(' @ ')}</div>` : ''}
+        ${r.note ? `<div class="sub">${esc(r.note)}</div>` : ''}
+      </span>
+      ${r.status === 'pending' && isAdmin ? `
+        <button class="btn small" data-decide-hours="approved" data-id="${r.id}">✓</button>
+        <button class="btn small danger" data-decide-hours="denied" data-id="${r.id}">✗</button>` : `
+        <span class="status-tag ${r.status}">${r.status}</span>`}
+      ${r.status === 'pending' && !isAdmin && r.user_id === state.me.id ? `<button class="icon-btn" data-cancel-hours="${r.id}" title="Withdraw">🗑️</button>` : ''}
+    </div>`;
+  };
+
+  shell('Hours Requests', `
+    ${pending.length ? `<div class="section-title">Pending${isAdmin ? ' approval' : ''}</div>${pending.map(reqCard).join('')}` : ''}
+    <div class="section-title">History</div>
+    ${rest.length ? rest.map(reqCard).join('') : '<div class="empty"><div class="big">🕐</div>No hours requests yet.<br>Approved requests land straight in the timesheet.</div>'}
+  `, { back: () => { location.hash = '#/more'; }, fab: true });
+
+  document.getElementById('fab').onclick = () => openHourRequestModal();
+  document.querySelectorAll('[data-decide-hours]').forEach((b) => {
+    b.onclick = async () => {
+      await api(`/api/hour-requests/${b.dataset.id}/decide`, { method: 'POST', body: { status: b.dataset.decideHours } });
+      toast(b.dataset.decideHours === 'approved' ? 'Approved — added to the timesheet' : 'Request denied');
+      render();
+    };
+  });
+  document.querySelectorAll('[data-cancel-hours]').forEach((b) => {
+    b.onclick = async () => {
+      await api(`/api/hour-requests/${b.dataset.cancelHours}`, { method: 'DELETE' });
+      render();
+    };
+  });
+}
+
+/* ---------------------------------- roles ----------------------------------- */
+
+async function renderRoles() {
+  if (state.me.role !== 'admin') { location.hash = '#/more'; return; }
+  const { roles } = await api('/api/roles');
+  state.roles = roles;
+  shell('Jobs', `
+    <p class="hint" style="margin-bottom:12px">Jobs your team works (Server, Bar Back, Set Up…). Used when scheduling and when clocking out. Team positions are managed separately in <b>Positions</b>.</p>
+    ${roles.length ? roles.map((r) => `
+      <div class="card row">
+        <span class="venue-icon" style="background:var(--brand-soft);color:var(--text)">🧑‍🍳</span>
+        <span class="grow" style="font-weight:700">${esc(r.name)}</span>
+        <button class="icon-btn" data-edit-role="${r.id}">✏️</button>
+        <button class="icon-btn" data-del-role="${r.id}">🗑️</button>
+      </div>`).join('') : '<div class="empty"><div class="big">🧑‍🍳</div>No jobs yet — tap ＋ to add Server, Bar Back, Set Up…</div>'}
+  `, { back: () => { location.hash = '#/more'; }, fab: true });
+
+  document.getElementById('fab').onclick = async () => {
+    const name = prompt('New job name (e.g. Server, Bar Back):');
+    if (!name?.trim()) return;
+    await api('/api/roles', { method: 'POST', body: { name } });
+    render();
+  };
+  document.querySelectorAll('[data-edit-role]').forEach((b) => {
+    b.onclick = async () => {
+      const role = roles.find((r) => r.id === Number(b.dataset.editRole));
+      const name = prompt('Rename job:', role.name);
+      if (!name?.trim() || name === role.name) return;
+      await api(`/api/roles/${role.id}`, { method: 'PATCH', body: { name } });
+      render();
+    };
+  });
+  document.querySelectorAll('[data-del-role]').forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm('Delete this job? Past timesheet entries keep their label.')) return;
+      await api(`/api/roles/${b.dataset.delRole}`, { method: 'DELETE' });
+      render();
+    };
+  });
+}
+
+/* -------------------------------- positions --------------------------------- */
+
+async function renderPositions() {
+  if (state.me.role !== 'admin') { location.hash = '#/more'; return; }
+  const { positions } = await api('/api/positions');
+  state.positions = positions;
+  shell('Positions', `
+    <p class="hint" style="margin-bottom:12px">Team positions you assign in <b>Team</b>. A position with <b>admin permission</b> automatically makes everyone holding it an admin.</p>
+    ${positions.length ? positions.map((r) => `
+      <div class="card row">
+        <span class="grow">
+          <div style="font-weight:700">${esc(r.name)}</div>
+          <div class="sub">${r.is_admin ? 'Grants admin access' : 'Member access'}</div>
+        </span>
+        <button class="btn small ${r.is_admin ? '' : 'secondary'}" data-adm-pos="${r.id}">${r.is_admin ? 'Admin ✓' : 'Member'}</button>
+        <button class="icon-btn" data-edit-pos="${r.id}">✏️</button>
+        <button class="icon-btn" data-del-pos="${r.id}">🗑️</button>
+      </div>`).join('') : '<div class="empty"><div class="big">👥</div>No positions yet — tap ＋ to add e.g. Operations Manager, Shift Lead…</div>'}
+  `, { back: () => { location.hash = '#/more'; }, fab: true });
+
+  document.getElementById('fab').onclick = async () => {
+    const name = prompt('New position name (e.g. Operations Manager, Shift Lead):');
+    if (!name?.trim()) return;
+    const is_admin = confirm('Should this position have ADMIN permission?\n\nAdmins can manage the schedule, venues, payroll, and approvals.\n\nOK = admin · Cancel = member');
+    await api('/api/positions', { method: 'POST', body: { name, is_admin } });
+    render();
+  };
+  document.querySelectorAll('[data-adm-pos]').forEach((b) => {
+    b.onclick = async () => {
+      const position = positions.find((r) => r.id === Number(b.dataset.admPos));
+      const grant = !position.is_admin;
+      if (!confirm(grant
+        ? `Give ADMIN permission to "${position.name}"? Everyone holding it becomes an admin.`
+        : `Remove admin permission from "${position.name}"? Everyone holding it becomes a regular member.`)) return;
+      try {
+        await api(`/api/positions/${position.id}`, { method: 'PATCH', body: { is_admin: grant } });
+        toast(grant ? 'Position now grants admin access' : 'Position is member-level now');
+      } catch (err) { toast(err.message); }
+      state.users = (await api('/api/users')).users;
+      render();
+    };
+  });
+  document.querySelectorAll('[data-edit-pos]').forEach((b) => {
+    b.onclick = async () => {
+      const position = positions.find((r) => r.id === Number(b.dataset.editPos));
+      const name = prompt('Rename position:', position.name);
+      if (!name?.trim() || name === position.name) return;
+      await api(`/api/positions/${position.id}`, { method: 'PATCH', body: { name } });
+      render();
+    };
+  });
+  document.querySelectorAll('[data-del-pos]').forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm('Delete this position? People holding it keep their current access level.')) return;
+      await api(`/api/positions/${b.dataset.delPos}`, { method: 'DELETE' });
+      state.users = (await api('/api/users')).users;
+      render();
+    };
+  });
+}
+
 /* ---------------------------------- attire ---------------------------------- */
 
 async function renderAttire() {
@@ -2266,7 +3046,7 @@ async function renderAttire() {
         ${a.description ? `<span class="sub attire-desc">${esc(a.description)}</span>` : ''}
       </button>`).join('')}</div>`
       : `<div class="empty"><div class="big">👔</div>No attire set up yet${isAdmin ? '<br>Tap ＋ to add one (e.g. Black Formal, Banquet Whites)' : ''}</div>`}
-  `, { fab: isAdmin });
+  `, { fab: isAdmin, back: () => { location.hash = '#/more'; } });
 
   if (isAdmin) document.getElementById('fab').onclick = () => openAttireModal();
   document.querySelectorAll('[data-attire]').forEach((b) => {
