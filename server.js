@@ -253,8 +253,6 @@ const SETTING_DEFAULTS = {
   period_anchor: '2026-01-05',
   export_per_day: '0',   // one row per employee per day (adds Line Date)
   export_jobs: '0',      // include venue as Job Number / Job Name
-  break_after_hours: '5.5',  // a day reaching this many worked hours...
-  break_minutes: '30',       // ...has this much unpaid break deducted, once
 };
 
 function getSettings() {
@@ -282,12 +280,6 @@ app.put('/api/settings', requireAuth, requireAdmin, (req, res) => {
     }
     if (key === 'period_anchor' && value && !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
       return res.status(400).json({ error: 'Pay period start must be a date' });
-    }
-    if (key === 'break_after_hours' && value && !(Number(value) >= 0 && Number(value) <= 24)) {
-      return res.status(400).json({ error: 'Break threshold must be between 0 and 24 hours' });
-    }
-    if (key === 'break_minutes' && value && !(Number(value) >= 0 && Number(value) <= 240)) {
-      return res.status(400).json({ error: 'Break length must be between 0 and 240 minutes' });
     }
     save.run(key, value);
   }
@@ -977,20 +969,33 @@ app.get('/api/events', (req, res) => {
 
 /* -------------------------------- time clock -------------------------------- */
 
-// Matches the Connecteam rule seen in their exported timesheet: once a
-// person's worked time in a day reaches the threshold, one unpaid break is
-// deducted for that day — never more than one, however long the day runs.
-function breakRule() {
-  const cfg = getSettings();
-  return {
-    thresholdMs: Math.max(0, Number(cfg.break_after_hours) || 0) * 3600000,
-    breakMs: Math.max(0, Number(cfg.break_minutes) || 0) * 60000,
-  };
+/* California meal periods and overtime — fixed by law, deliberately not
+   configurable. Labor Code §512: a workday of more than five hours owes one
+   unpaid 30-minute meal period, and a workday of more than ten hours owes a
+   second. Meal periods are unpaid and are not hours worked, so overtime is
+   figured on the paid time that remains. §510: over 8 hours in a workday pays
+   1.5x and over 12 pays 2x; over 40 straight-time hours in a workweek pays
+   1.5x; the seventh consecutive day of a workweek pays 1.5x for the first
+   eight hours and 2x beyond that. */
+const HOUR_MS = 3600000;
+const CA_MEAL_MS = 30 * 60000;
+const CA_RULE = {
+  firstMealAfterMs: 5 * HOUR_MS,
+  secondMealAfterMs: 10 * HOUR_MS,
+  mealMs: CA_MEAL_MS,
+  dailyOtAfterMs: 8 * HOUR_MS,
+  dailyDoubleAfterMs: 12 * HOUR_MS,
+  weeklyOtAfterMs: 40 * HOUR_MS,
+};
+
+function caMealMs(workedMs) {
+  if (workedMs > CA_RULE.secondMealAfterMs) return 2 * CA_MEAL_MS;
+  if (workedMs > CA_RULE.firstMealAfterMs) return CA_MEAL_MS;
+  return 0;
 }
 
 // Buckets finished entries by { user, local day } with worked/break/paid time.
 function summariseDays(entries) {
-  const { thresholdMs, breakMs } = breakRule();
   const days = new Map();
   for (const e of entries) {
     if (!e.clock_out) continue;
@@ -1002,10 +1007,51 @@ function summariseDays(entries) {
     days.set(key, day);
   }
   for (const day of days.values()) {
-    day.breakMs = thresholdMs > 0 && breakMs > 0 && day.workedMs >= thresholdMs ? breakMs : 0;
+    day.breakMs = caMealMs(day.workedMs);
     day.paidMs = Math.max(0, day.workedMs - day.breakMs);
   }
   return days;
+}
+
+// The Monday that starts the workweek a local date falls in.
+function weekStart(date) {
+  const d = new Date(`${date}T12:00:00`);
+  d.setDate(d.getDate() - ((d.getDay() + 6) % 7));
+  return d.toLocaleDateString('en-CA');
+}
+
+// Splits a person's days into regular / 1.5x / 2x under the California rules
+// above. Days must be for one person; order does not matter.
+function caOvertime(days) {
+  const byWeek = new Map();
+  for (const day of days) {
+    const week = weekStart(day.date);
+    if (!byWeek.has(week)) byWeek.set(week, []);
+    byWeek.get(week).push(day);
+  }
+  const total = { regularMs: 0, ot15Ms: 0, ot20Ms: 0 };
+  for (const week of byWeek.values()) {
+    week.sort((a, b) => a.date.localeCompare(b.date));
+    // A seventh consecutive worked day only exists if all seven were worked.
+    const seventh = week.length === 7 ? week[6].date : null;
+    let regularMs = 0;
+    for (const day of week) {
+      const paid = day.paidMs;
+      if (day.date === seventh) {
+        total.ot15Ms += Math.min(paid, CA_RULE.dailyOtAfterMs);
+        total.ot20Ms += Math.max(0, paid - CA_RULE.dailyOtAfterMs);
+        continue;
+      }
+      total.ot20Ms += Math.max(0, paid - CA_RULE.dailyDoubleAfterMs);
+      total.ot15Ms += Math.max(0, Math.min(paid, CA_RULE.dailyDoubleAfterMs) - CA_RULE.dailyOtAfterMs);
+      regularMs += Math.min(paid, CA_RULE.dailyOtAfterMs);
+    }
+    // Straight-time hours past 40 in the week move to 1.5x.
+    const overWeek = Math.max(0, regularMs - CA_RULE.weeklyOtAfterMs);
+    total.ot15Ms += overWeek;
+    total.regularMs += regularMs - overWeek;
+  }
+  return total;
 }
 
 const TIME_ENTRY_QUERY = `
@@ -1075,7 +1121,7 @@ app.get('/api/time/entries', requireAuth, (req, res) => {
   sql += ' ORDER BY t.clock_in DESC LIMIT 500';
   const entries = db.prepare(sql).all(...params);
   const days = [...summariseDays(entries).values()].map(({ entries: _drop, ...rest }) => rest);
-  res.json({ entries, days, breaks: breakRule() });
+  res.json({ entries, days, breaks: CA_RULE });
 });
 
 app.patch('/api/time/entries/:id', requireAuth, requireAdmin, (req, res) => {
@@ -1192,63 +1238,112 @@ app.get('/api/time/export', requireAuth, requireAdmin, (req, res) => {
   res.send(rows.map((r) => r.map(csvEsc).join(',')).join('\r\n') + '\r\n');
 });
 
-// Detailed timesheet in the same shape as the Connecteam export, for records.
+/* The timesheet overview, column for column as Connecteam exports it: every
+   employee in first-name order, their punches newest first, with the day's
+   automatic unpaid break and total on the first row of each day, the week's
+   total on the first row of each workweek, and the period totals on the
+   person's first row. Employees with no punches still get a name row. */
+const TIMESHEET_COLUMNS = [
+  'First name', 'Last name', 'Type', 'Sub-job', 'Start Date', 'In', 'Start - location',
+  'End Date', 'Out', 'End - location', 'Employee notes', 'Manager notes', 'Shift hours',
+  'Daily Automatic Unpaid Break Hours', 'Daily total hours', 'Daily total pay (USD)',
+  'Weekly total hours', 'Total work hours', 'Total paid time off hours',
+  'Total Unpaid Break Hours', 'Total Paid Hours', 'Total Regular', 'Total Overtime x1.5',
+  'Total Overtime x2.0', 'Total overtime', 'Total pay', 'Total unpaid time off hours',
+];
+
 app.get('/api/time/timesheet.csv', requireAuth, requireAdmin, (req, res) => {
   const { from, to } = req.query;
   if (!from || !to) return res.status(400).json({ error: 'A pay period is required' });
 
   const entries = db.prepare(
-    TIME_ENTRY_QUERY + ' WHERE t.clock_out IS NOT NULL AND t.clock_in >= ? AND t.clock_in < ? ORDER BY u.name, t.clock_in'
+    TIME_ENTRY_QUERY + ' WHERE t.clock_out IS NOT NULL AND t.clock_in >= ? AND t.clock_in < ? ORDER BY t.clock_in DESC'
   ).all(from, to);
   const days = summariseDays(entries);
+  const people = db.prepare('SELECT id, name FROM users').all();
 
-  const hhmm = (iso) => new Date(iso).toLocaleTimeString('en-US', {
+  // "07/15/2026 Wed" and "05:30 PM", matching how the cells display in Excel.
+  const dayCell = (iso) => {
+    const d = new Date(iso);
+    const md = d.toLocaleDateString('en-US', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' });
+    return `${md} ${d.toLocaleDateString('en-US', { timeZone: TZ, weekday: 'short' })}`;
+  };
+  const timeCell = (iso) => new Date(iso).toLocaleTimeString('en-US', {
     timeZone: TZ, hour: '2-digit', minute: '2-digit', hour12: true,
   });
+  const hrs = (ms) => (ms / HOUR_MS).toFixed(2);
+  const hrsOrBlank = (ms) => (ms ? hrs(ms) : '');
+  const place = (lat, lng) => (lat == null || lng == null ? '' : `${lat.toFixed(5)}, ${lng.toFixed(5)}`);
   const csvEsc = (v) => {
     const str = String(v ?? '');
     return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
   };
+  // First name is the first word; everything after it is the last name.
+  const splitName = (name) => {
+    const [first, ...rest] = String(name || '').trim().split(/\s+/);
+    return [first || '', rest.join(' ')];
+  };
 
-  const rows = [[
-    'First name', 'Last name', 'Type', 'Sub-job', 'Start Date', 'In', 'End Date', 'Out',
-    'Employee notes', 'Mileage', 'Shift hours', 'Daily Automatic Unpaid Break Hours',
-    'Daily total hours', 'Approved',
-  ]];
+  const rows = [TIMESHEET_COLUMNS];
+  const sorted = people
+    .map((u) => ({ ...u, parts: splitName(u.name) }))
+    .sort((a, b) => a.parts[0].localeCompare(b.parts[0]) || a.parts[1].localeCompare(b.parts[1]));
 
-  const seen = new Set();
-  for (const e of entries) {
-    const date = localParts(e.clock_in).date;
-    const day = days.get(`${e.user_id}|${date}`);
-    const firstOfDay = !seen.has(`${e.user_id}|${date}`);
-    seen.add(`${e.user_id}|${date}`);
-    const [firstName, ...rest] = String(e.user_name || '').split(' ');
-    rows.push([
-      firstName, rest.join(' '), e.venue_name || '', e.role_name || '',
-      date, hhmm(e.clock_in), localParts(e.clock_out).date, hhmm(e.clock_out),
-      e.note || '', e.mileage ? e.mileage.toFixed(1) : '',
-      ((new Date(e.clock_out) - new Date(e.clock_in)) / 3600000).toFixed(2),
-      firstOfDay && day.breakMs ? (day.breakMs / 3600000).toFixed(2) : '',
-      firstOfDay ? (day.paidMs / 3600000).toFixed(2) : '',
-      e.approved ? 'yes' : 'no',
-    ]);
-  }
+  for (const person of sorted) {
+    const mine = entries.filter((e) => e.user_id === person.id);
+    const myDays = [...days.values()].filter((d) => d.user_id === person.id);
+    const [firstName, lastName] = person.parts;
 
-  const totals = new Map();
-  for (const day of days.values()) {
-    const t = totals.get(day.user_name) || { paid: 0, brk: 0 };
-    t.paid += day.paidMs / 3600000;
-    t.brk += day.breakMs / 3600000;
-    totals.set(day.user_name, t);
-  }
-  rows.push([]);
-  rows.push(['TOTALS', '', '', '', '', '', '', '', '', '', '', 'Total Unpaid Break Hours', 'Total Paid Hours']);
-  for (const [name, t] of [...totals.entries()].sort()) {
-    rows.push([name, '', '', '', '', '', '', '', '', '', '', t.brk.toFixed(2), t.paid.toFixed(2)]);
+    if (!mine.length) {
+      rows.push([firstName, lastName, ...Array(TIMESHEET_COLUMNS.length - 2).fill('')]);
+      continue;
+    }
+
+    const ot = caOvertime(myDays);
+    const workedMs = myDays.reduce((n, d) => n + d.workedMs, 0);
+    const breakMs = myDays.reduce((n, d) => n + d.breakMs, 0);
+    const paidMs = myDays.reduce((n, d) => n + d.paidMs, 0);
+    const weekMs = new Map();
+    for (const d of myDays) weekMs.set(weekStart(d.date), (weekMs.get(weekStart(d.date)) || 0) + d.paidMs);
+
+    const seenDay = new Set();
+    const seenWeek = new Set();
+    mine.forEach((e, i) => {
+      const date = localParts(e.clock_in).date;
+      const week = weekStart(date);
+      const day = days.get(`${person.id}|${date}`);
+      const firstOfDay = !seenDay.has(date);
+      const firstOfWeek = !seenWeek.has(week);
+      seenDay.add(date);
+      seenWeek.add(week);
+      const top = i === 0;
+      rows.push([
+        top ? firstName : '', top ? lastName : '',
+        e.venue_name || '', e.role_name || '',
+        dayCell(e.clock_in), timeCell(e.clock_in), place(e.in_lat, e.in_lng),
+        dayCell(e.clock_out), timeCell(e.clock_out), place(e.out_lat, e.out_lng),
+        e.note || '', '',
+        hrs(new Date(e.clock_out) - new Date(e.clock_in)),
+        firstOfDay ? hrsOrBlank(day.breakMs) : '',
+        firstOfDay ? hrs(day.paidMs) : '',
+        '', // Daily total pay — the app does not hold hourly rates
+        firstOfWeek ? hrs(weekMs.get(week) || 0) : '',
+        top ? hrs(workedMs) : '',
+        '', // Total paid time off hours
+        top ? hrsOrBlank(breakMs) : '',
+        top ? hrs(paidMs) : '',
+        top ? hrs(ot.regularMs) : '',
+        top ? hrsOrBlank(ot.ot15Ms) : '',
+        top ? hrsOrBlank(ot.ot20Ms) : '',
+        top ? hrsOrBlank(ot.ot15Ms + ot.ot20Ms) : '',
+        '', // Total pay — the app does not hold hourly rates
+        '', // Total unpaid time off hours
+      ]);
+    });
   }
 
   res.setHeader('Content-Type', 'text/csv');
-  res.setHeader('Content-Disposition', `attachment; filename="timesheet-${from.slice(0, 10)}.csv"`);
+  res.setHeader('Content-Disposition', `attachment; filename="timesheet-${from.slice(0, 10)}-${to.slice(0, 10)}.csv"`);
   res.send(rows.map((r) => r.map(csvEsc).join(',')).join('\r\n') + '\r\n');
 });
 

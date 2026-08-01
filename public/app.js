@@ -1765,11 +1765,12 @@ function periodRange() {
   return { from, to };
 }
 
-// Mirrors the server's rule: once a person's worked time in a day reaches the
-// threshold, one unpaid break comes off that day — never more than one.
+// Mirrors the server's California meal-period rule: a workday over five hours
+// owes one unpaid 30-minute meal period, over ten hours owes a second.
 function summariseDaysLocal(entries, breaks) {
-  const thresholdMs = breaks?.thresholdMs || 0;
-  const breakMs = breaks?.breakMs || 0;
+  const first = breaks?.firstMealAfterMs ?? 5 * 3600000;
+  const second = breaks?.secondMealAfterMs ?? 10 * 3600000;
+  const mealMs = breaks?.mealMs ?? 1800000;
   const days = new Map();
   for (const e of entries) {
     if (!e.clock_out) continue;
@@ -1781,7 +1782,9 @@ function summariseDaysLocal(entries, breaks) {
     days.set(key, day);
   }
   for (const day of days.values()) {
-    day.breakMs = thresholdMs > 0 && breakMs > 0 && day.workedMs >= thresholdMs ? breakMs : 0;
+    if (day.workedMs > second) day.breakMs = 2 * mealMs;
+    else if (day.workedMs > first) day.breakMs = mealMs;
+    else day.breakMs = 0;
     day.paidMs = Math.max(0, day.workedMs - day.breakMs);
   }
   return days;
@@ -1849,12 +1852,13 @@ async function renderTimesheets() {
         </span>
         <span class="sub">›</span>
       </button>`).join('') : '<div class="empty"><div class="big">🧾</div>No punches in this pay period</div>'}
-    <button class="btn" id="ts-export" style="margin-top:10px">⬇️ Export Paychex CSV</button>
-    <button class="btn secondary" id="ts-detail" style="margin-top:8px">📄 Download detailed timesheet</button>
+    <button class="btn" id="ts-detail" style="margin-top:10px">⬇️ Download timesheet CSV</button>
+    <button class="btn secondary" id="ts-export" style="margin-top:8px">🏦 Paychex payroll import file</button>
     <button class="btn secondary" id="ts-settings" style="margin-top:8px">⚙️ Payroll export settings</button>
     <p class="hint">
-      Only <b>approved</b> hours are exported. Tap a person to review, edit and approve their punches.
-      ${breaks.breakMs ? `A day of <b>${(breaks.thresholdMs / 3600000).toFixed(2).replace(/\.?0+$/, '')} h</b> or more has <b>${Math.round(breaks.breakMs / 60000)} min</b> unpaid break deducted once.` : ''}
+      Tap a person to review, edit and approve their punches. The Paychex file contains
+      <b>approved</b> hours only. Meal periods follow California law: a workday over
+      <b>5 hours</b> loses one unpaid <b>30-minute</b> meal period, and one over <b>10 hours</b> loses a second.
     </p>
   `, { back: () => { location.hash = '#/more'; } });
 
@@ -1884,8 +1888,11 @@ async function renderTimesheets() {
   };
   document.getElementById('ts-export').onclick =
     () => download('/api/time/export', `paychex-spi-${dateKey(from)}.csv`, 'Paychex file downloaded');
-  document.getElementById('ts-detail').onclick =
-    () => download('/api/time/timesheet.csv', `timesheet-${dateKey(from)}.csv`, 'Timesheet downloaded');
+  document.getElementById('ts-detail').onclick = () => download(
+    '/api/time/timesheet.csv',
+    `timeclocktimesheet_overview_${dateKey(from).replace(/-/g, '')}_${dateKey(new Date(to - 1)).replace(/-/g, '')}.csv`,
+    'Timesheet downloaded',
+  );
   document.getElementById('ts-settings').onclick = openPayrollSettings;
 }
 
@@ -2033,11 +2040,7 @@ function openPayrollSettings() {
       <label>First day of a pay period</label>
       <input name="period_anchor" type="date" value="${esc(cfg.period_anchor)}">
       <p class="hint">Periods run 14 days from this date.</p>
-      <label>Unpaid break after (hours worked in a day)</label>
-      <input name="break_after_hours" type="number" min="0" max="24" step="0.25" value="${esc(cfg.break_after_hours)}">
-      <label>Length of that break (minutes)</label>
-      <input name="break_minutes" type="number" min="0" max="240" step="5" value="${esc(cfg.break_minutes)}">
-      <p class="hint">Deducted <b>once per day</b>, however many punches the day has — the same rule Connecteam uses. Set the minutes to 0 to turn it off.</p>
+      <p class="hint">☕ <b>Meal periods follow California law and can't be changed.</b> A workday over 5 hours has one unpaid 30-minute meal period deducted; over 10 hours, a second. Overtime follows California rules too — over 8 hours a day or 40 a week at 1.5×, over 12 a day at 2×, and the 7th straight day of a week at 1.5× then 2×.</p>
       <label class="check-label"><input type="checkbox" name="export_per_day" ${cfg.export_per_day === '1' ? 'checked' : ''} style="width:auto"> One row per day (adds Line Date)</label>
       <label class="check-label"><input type="checkbox" name="export_jobs" ${cfg.export_jobs === '1' ? 'checked' : ''} style="width:auto"> Include venue as Job Number / Job Name</label>
       <p class="hint">Rates are never exported — Paychex applies each worker's own rate. Add each person's Worker ID in Team.</p>
@@ -2054,8 +2057,6 @@ function openPayrollSettings() {
           paychex_company_id: fd.get('paychex_company_id') || '',
           pay_component: fd.get('pay_component') || 'Hourly',
           period_anchor: fd.get('period_anchor') || '',
-          break_after_hours: fd.get('break_after_hours') || '0',
-          break_minutes: fd.get('break_minutes') || '0',
           export_per_day: fd.get('export_per_day') ? '1' : '0',
           export_jobs: fd.get('export_jobs') ? '1' : '0',
         },
