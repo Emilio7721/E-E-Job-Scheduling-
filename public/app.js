@@ -1460,7 +1460,7 @@ function openUserModal(user) {
       </div>
       <label>Paychex Worker ID</label>
       <input name="worker_id" maxlength="10" placeholder="Payroll ID" value="${esc(user.worker_id || '')}">
-      <p class="hint">Required to include this person in the Paychex export.</p>
+      <p class="hint">Matched against your Paychex roster when someone signs up.</p>
       <label>Clock-in PIN</label>
       <div class="row">
         <span class="pin-value" id="pin-view">${esc(user.pin || '—')}</span>
@@ -1799,7 +1799,7 @@ async function renderTimesheets() {
   const { entries, breaks } = await api(`/api/time/entries?from=${from.toISOString()}&to=${to.toISOString()}`);
 
   // The break lands on approved and pending time separately, so the approved
-  // figure on screen matches exactly what the Paychex export will contain.
+  // figure on screen matches exactly what the downloaded timesheet contains.
   const approvedDays = summariseDaysLocal(entries.filter((e) => e.approved), breaks);
   const pendingDays = summariseDaysLocal(entries.filter((e) => !e.approved), breaks);
 
@@ -1836,7 +1836,7 @@ async function renderTimesheets() {
       <div class="range">${label}<div class="sub" style="font-weight:500">Bi-weekly pay period</div></div>
       <button class="icon-btn" id="ts-next">›</button>
     </div>
-    ${needsReview ? `<div class="review-banner">⚠️ <b>${needsReview}</b> punch${needsReview === 1 ? '' : 'es'} still need review before export</div>`
+    ${needsReview ? `<div class="review-banner">⚠️ <b>${needsReview}</b> punch${needsReview === 1 ? ' still needs' : 'es still need'} review before the timesheet can be downloaded</div>`
       : (people.length ? '<div class="review-banner ok">✓ Everything in this period is approved</div>' : '')}
     ${people.length ? people.map((p) => `
       <button class="card row ts-person" data-person="${p.id}">
@@ -1852,13 +1852,16 @@ async function renderTimesheets() {
         </span>
         <span class="sub">›</span>
       </button>`).join('') : '<div class="empty"><div class="big">🧾</div>No punches in this pay period</div>'}
-    <button class="btn" id="ts-detail" style="margin-top:10px">⬇️ Download timesheet CSV</button>
-    <button class="btn secondary" id="ts-export" style="margin-top:8px">🏦 Paychex payroll import file</button>
-    <button class="btn secondary" id="ts-settings" style="margin-top:8px">⚙️ Payroll export settings</button>
+    <button class="btn" id="ts-detail" style="margin-top:10px" ${needsReview || !people.length ? 'disabled' : ''}>
+      ⬇️ Download timesheet CSV
+    </button>
+    <button class="btn secondary" id="ts-settings" style="margin-top:8px">⚙️ Pay period settings</button>
     <p class="hint">
-      Tap a person to review, edit and approve their punches. The Paychex file contains
-      <b>approved</b> hours only. Meal periods follow California law: a workday over
-      <b>5 hours</b> loses one unpaid <b>30-minute</b> meal period, and one over <b>10 hours</b> loses a second.
+      ${needsReview
+        ? `The timesheet can only be downloaded once <b>every punch in the period is approved</b> — ${needsReview} still ${needsReview === 1 ? 'needs' : 'need'} review.`
+        : 'Tap a person to review, edit and approve their punches.'}
+      Meal periods follow California law: a workday over <b>5 hours</b> loses one unpaid
+      <b>30-minute</b> meal period, and one over <b>10 hours</b> loses a second.
     </p>
   `, { back: () => { location.hash = '#/more'; } });
 
@@ -1871,28 +1874,23 @@ async function renderTimesheets() {
   document.querySelectorAll('[data-person]').forEach((b) => {
     b.onclick = () => openPersonTimesheet(people.find((p) => p.id === Number(b.dataset.person)), from, to);
   });
-  const download = async (path, filename, done) => {
+  document.getElementById('ts-detail').onclick = async () => {
+    const stamp = (d) => dateKey(d).replace(/-/g, '');
     try {
-      // Surface setup problems as a message instead of downloading an error page.
-      const res = await fetch(`${path}?from=${from.toISOString()}&to=${to.toISOString()}`);
-      if (!res.ok) return toast((await res.json().catch(() => ({}))).error || 'Export failed');
+      // Show the server's reason (unapproved or still-running punches) instead
+      // of downloading an error page.
+      const res = await fetch(`/api/time/timesheet.csv?from=${from.toISOString()}&to=${to.toISOString()}`);
+      if (!res.ok) return toast((await res.json().catch(() => ({}))).error || 'Download failed');
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = filename;
+      a.download = `timeclocktimesheet_overview_${stamp(from)}_${stamp(new Date(to - 1))}.csv`;
       a.click();
       URL.revokeObjectURL(url);
-      toast(done);
+      toast('Timesheet downloaded');
     } catch (err) { toast(err.message); }
   };
-  document.getElementById('ts-export').onclick =
-    () => download('/api/time/export', `paychex-spi-${dateKey(from)}.csv`, 'Paychex file downloaded');
-  document.getElementById('ts-detail').onclick = () => download(
-    '/api/time/timesheet.csv',
-    `timeclocktimesheet_overview_${dateKey(from).replace(/-/g, '')}_${dateKey(new Date(to - 1)).replace(/-/g, '')}.csv`,
-    'Timesheet downloaded',
-  );
   document.getElementById('ts-settings').onclick = openPayrollSettings;
 }
 
@@ -2029,21 +2027,14 @@ function openTimeEntryModal(entry) {
 function openPayrollSettings() {
   const cfg = state.settings;
   const modal = openModal(`
-    <h3>Payroll export settings</h3>
-    <p class="sub">Used to build the Paychex SPI import file.</p>
+    <h3>Pay period settings</h3>
+    <p class="sub">Sets where the bi-weekly pay periods fall.</p>
     <form id="pay-form">
-      <label>Paychex Company ID</label>
-      <input name="paychex_company_id" maxlength="8" placeholder="e.g. 1234567" value="${esc(cfg.paychex_company_id)}">
-      <label>Pay Component (earning name in Paychex)</label>
-      <input name="pay_component" maxlength="20" placeholder="Hourly" value="${esc(cfg.pay_component)}">
-      <p class="hint">Must match the earning name set up on your Paychex company exactly, including capitals.</p>
       <label>First day of a pay period</label>
       <input name="period_anchor" type="date" value="${esc(cfg.period_anchor)}">
       <p class="hint">Periods run 14 days from this date.</p>
       <p class="hint">☕ <b>Meal periods follow California law and can't be changed.</b> A workday over 5 hours has one unpaid 30-minute meal period deducted; over 10 hours, a second. Overtime follows California rules too — over 8 hours a day or 40 a week at 1.5×, over 12 a day at 2×, and the 7th straight day of a week at 1.5× then 2×.</p>
-      <label class="check-label"><input type="checkbox" name="export_per_day" ${cfg.export_per_day === '1' ? 'checked' : ''} style="width:auto"> One row per day (adds Line Date)</label>
-      <label class="check-label"><input type="checkbox" name="export_jobs" ${cfg.export_jobs === '1' ? 'checked' : ''} style="width:auto"> Include venue as Job Number / Job Name</label>
-      <p class="hint">Rates are never exported — Paychex applies each worker's own rate. Add each person's Worker ID in Team.</p>
+      <p class="hint">The timesheet only downloads once every punch in the period is approved, and it contains approved hours only.</p>
       <div class="actions"><button type="submit" class="btn">Save</button></div>
     </form>
   `);
@@ -2053,13 +2044,7 @@ function openPayrollSettings() {
     try {
       const { settings } = await api('/api/settings', {
         method: 'PUT',
-        body: {
-          paychex_company_id: fd.get('paychex_company_id') || '',
-          pay_component: fd.get('pay_component') || 'Hourly',
-          period_anchor: fd.get('period_anchor') || '',
-          export_per_day: fd.get('export_per_day') ? '1' : '0',
-          export_jobs: fd.get('export_jobs') ? '1' : '0',
-        },
+        body: { period_anchor: fd.get('period_anchor') || '' },
       });
       state.settings = settings;
       state.tsPeriodStart = periodStartFor(new Date(), settings.period_anchor);
@@ -3579,7 +3564,7 @@ function renderMore() {
     { href: '#/forms', icon: '📄', label: 'Documents', sub: 'Read & sign uploaded documents' },
     ...(isAdmin ? [
       { href: '#/attire', icon: '👔', label: 'Attire', sub: 'What the team wears on each job' },
-      { href: '#/timesheets', icon: '🧾', label: 'Timesheets', sub: 'Review, approve & export to Paychex' },
+      { href: '#/timesheets', icon: '🧾', label: 'Timesheets', sub: 'Review, approve & download hours' },
       { href: '#/kiosk', icon: '🔢', label: 'Kiosk Mode', sub: 'Lock this device into a PIN punch clock' },
       { href: '#/signed', icon: '📁', label: 'Signed Documents', sub: 'Who signed what & download copies' },
       { href: '#/roles', icon: '🧑‍🍳', label: 'Jobs', sub: 'Server, Bar Back, Set Up… (clock-outs & scheduling)' },
