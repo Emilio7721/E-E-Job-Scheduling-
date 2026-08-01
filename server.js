@@ -253,6 +253,8 @@ const SETTING_DEFAULTS = {
   period_anchor: '2026-01-05',
   export_per_day: '0',   // one row per employee per day (adds Line Date)
   export_jobs: '0',      // include venue as Job Number / Job Name
+  break_after_hours: '5.5',  // a day reaching this many worked hours...
+  break_minutes: '30',       // ...has this much unpaid break deducted, once
 };
 
 function getSettings() {
@@ -280,6 +282,12 @@ app.put('/api/settings', requireAuth, requireAdmin, (req, res) => {
     }
     if (key === 'period_anchor' && value && !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
       return res.status(400).json({ error: 'Pay period start must be a date' });
+    }
+    if (key === 'break_after_hours' && value && !(Number(value) >= 0 && Number(value) <= 24)) {
+      return res.status(400).json({ error: 'Break threshold must be between 0 and 24 hours' });
+    }
+    if (key === 'break_minutes' && value && !(Number(value) >= 0 && Number(value) <= 240)) {
+      return res.status(400).json({ error: 'Break length must be between 0 and 240 minutes' });
     }
     save.run(key, value);
   }
@@ -969,6 +977,37 @@ app.get('/api/events', (req, res) => {
 
 /* -------------------------------- time clock -------------------------------- */
 
+// Matches the Connecteam rule seen in their exported timesheet: once a
+// person's worked time in a day reaches the threshold, one unpaid break is
+// deducted for that day — never more than one, however long the day runs.
+function breakRule() {
+  const cfg = getSettings();
+  return {
+    thresholdMs: Math.max(0, Number(cfg.break_after_hours) || 0) * 3600000,
+    breakMs: Math.max(0, Number(cfg.break_minutes) || 0) * 60000,
+  };
+}
+
+// Buckets finished entries by { user, local day } with worked/break/paid time.
+function summariseDays(entries) {
+  const { thresholdMs, breakMs } = breakRule();
+  const days = new Map();
+  for (const e of entries) {
+    if (!e.clock_out) continue;
+    const date = localParts(e.clock_in).date;
+    const key = `${e.user_id}|${date}`;
+    const day = days.get(key) || { user_id: e.user_id, user_name: e.user_name, date, workedMs: 0, entries: [] };
+    day.workedMs += new Date(e.clock_out) - new Date(e.clock_in);
+    day.entries.push(e);
+    days.set(key, day);
+  }
+  for (const day of days.values()) {
+    day.breakMs = thresholdMs > 0 && breakMs > 0 && day.workedMs >= thresholdMs ? breakMs : 0;
+    day.paidMs = Math.max(0, day.workedMs - day.breakMs);
+  }
+  return days;
+}
+
 const TIME_ENTRY_QUERY = `
   SELECT t.*, u.name AS user_name, u.color AS user_color,
          s.title AS shift_title, v.name AS venue_name, r.name AS role_name
@@ -1034,7 +1073,9 @@ app.get('/api/time/entries', requireAuth, (req, res) => {
   if (from) { sql += ' AND t.clock_in >= ?'; params.push(from); }
   if (to) { sql += ' AND t.clock_in < ?'; params.push(to); }
   sql += ' ORDER BY t.clock_in DESC LIMIT 500';
-  res.json({ entries: db.prepare(sql).all(...params) });
+  const entries = db.prepare(sql).all(...params);
+  const days = [...summariseDays(entries).values()].map(({ entries: _drop, ...rest }) => rest);
+  res.json({ entries, days, breaks: breakRule() });
 });
 
 app.patch('/api/time/entries/:id', requireAuth, requireAdmin, (req, res) => {
@@ -1077,9 +1118,9 @@ app.delete('/api/time/entries/:id', requireAuth, requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
-// Paychex SPI import file (flexible layout) for a pay period.
-// Only approved, finished punches are exported; rates are deliberately absent
-// so Paychex applies each worker's configured rate.
+// Paychex SPI import file (flexible layout) for a pay period. Only approved,
+// finished punches, with the automatic unpaid break already deducted, and no
+// rates so Paychex applies each worker's own.
 app.get('/api/time/export', requireAuth, requireAdmin, (req, res) => {
   const { from, to } = req.query;
   if (!from || !to) return res.status(400).json({ error: 'A pay period is required' });
@@ -1100,26 +1141,33 @@ app.get('/api/time/export', requireAuth, requireAdmin, (req, res) => {
 
   const perDay = cfg.export_per_day === '1';
   const withJobs = cfg.export_jobs === '1';
-  const tz = process.env.APP_TZ || 'America/New_York';
-  const dayKey = (iso) => new Date(iso).toLocaleDateString('en-CA', { timeZone: tz });       // yyyy-mm-dd
-  const lineDate = (iso) => new Date(iso).toLocaleDateString('en-US', {
-    timeZone: tz, month: '2-digit', day: '2-digit', year: 'numeric',
-  });
+  const lineDate = (date) => { const [y, m, d] = date.split('-'); return `${m}/${d}/${y}`; };
 
-  // Group hours to the level the settings ask for.
+  // Day by day, so the break is deducted once per day, then rolled up.
   const groups = new Map();
-  for (const e of entries) {
-    const hours = (new Date(e.clock_out) - new Date(e.clock_in)) / 3600000;
-    const key = [e.user_id, perDay ? dayKey(e.clock_in) : '', withJobs ? (e.venue_id || '') : ''].join('|');
-    const g = groups.get(key) || {
-      worker: workerIds.get(e.user_id),
-      date: e.clock_in,
-      venueName: e.venue_name || '',
-      venueId: e.venue_id || '',
-      hours: 0,
-    };
-    g.hours += hours;
-    groups.set(key, g);
+  for (const day of summariseDays(entries).values()) {
+    // When job columns are on the day splits by venue; the break comes off the
+    // largest slice so the day is only ever reduced once.
+    const slices = new Map();
+    for (const e of day.entries) {
+      const key = withJobs ? (e.venue_id || '') : '';
+      const slice = slices.get(key) || { venueId: e.venue_id || '', venueName: e.venue_name || '', ms: 0 };
+      slice.ms += new Date(e.clock_out) - new Date(e.clock_in);
+      slices.set(key, slice);
+    }
+    if (day.breakMs) {
+      const biggest = [...slices.values()].sort((a, b) => b.ms - a.ms)[0];
+      if (biggest) biggest.ms = Math.max(0, biggest.ms - day.breakMs);
+    }
+    for (const slice of slices.values()) {
+      const key = [day.user_id, perDay ? day.date : '', withJobs ? slice.venueId : ''].join('|');
+      const g = groups.get(key) || {
+        worker: workerIds.get(day.user_id), date: day.date,
+        venueId: slice.venueId, venueName: slice.venueName, hours: 0,
+      };
+      g.hours += slice.ms / 3600000;
+      groups.set(key, g);
+    }
   }
 
   const header = ['Company ID', 'Worker ID', 'Pay Component', 'Hours'];
@@ -1132,8 +1180,6 @@ app.get('/api/time/export', requireAuth, requireAdmin, (req, res) => {
   };
   const rows = [header];
   for (const g of groups.values()) {
-    // Paychex rejects meaningless zero-hour lines, so drop anything that
-    // rounds away (a punch corrected to the same in/out time, say).
     if (g.hours < 0.005) continue;
     const row = [cfg.paychex_company_id, g.worker, cfg.pay_component, g.hours.toFixed(2)];
     if (perDay) row.push(lineDate(g.date));
@@ -1143,7 +1189,66 @@ app.get('/api/time/export', requireAuth, requireAdmin, (req, res) => {
 
   res.setHeader('Content-Type', 'text/csv');
   res.setHeader('Content-Disposition', `attachment; filename="paychex-spi-${from.slice(0, 10)}.csv"`);
-  // Paychex expects CRLF line endings in the import file.
+  res.send(rows.map((r) => r.map(csvEsc).join(',')).join('\r\n') + '\r\n');
+});
+
+// Detailed timesheet in the same shape as the Connecteam export, for records.
+app.get('/api/time/timesheet.csv', requireAuth, requireAdmin, (req, res) => {
+  const { from, to } = req.query;
+  if (!from || !to) return res.status(400).json({ error: 'A pay period is required' });
+
+  const entries = db.prepare(
+    TIME_ENTRY_QUERY + ' WHERE t.clock_out IS NOT NULL AND t.clock_in >= ? AND t.clock_in < ? ORDER BY u.name, t.clock_in'
+  ).all(from, to);
+  const days = summariseDays(entries);
+
+  const hhmm = (iso) => new Date(iso).toLocaleTimeString('en-US', {
+    timeZone: TZ, hour: '2-digit', minute: '2-digit', hour12: true,
+  });
+  const csvEsc = (v) => {
+    const str = String(v ?? '');
+    return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
+  };
+
+  const rows = [[
+    'First name', 'Last name', 'Type', 'Sub-job', 'Start Date', 'In', 'End Date', 'Out',
+    'Employee notes', 'Mileage', 'Shift hours', 'Daily Automatic Unpaid Break Hours',
+    'Daily total hours', 'Approved',
+  ]];
+
+  const seen = new Set();
+  for (const e of entries) {
+    const date = localParts(e.clock_in).date;
+    const day = days.get(`${e.user_id}|${date}`);
+    const firstOfDay = !seen.has(`${e.user_id}|${date}`);
+    seen.add(`${e.user_id}|${date}`);
+    const [firstName, ...rest] = String(e.user_name || '').split(' ');
+    rows.push([
+      firstName, rest.join(' '), e.venue_name || '', e.role_name || '',
+      date, hhmm(e.clock_in), localParts(e.clock_out).date, hhmm(e.clock_out),
+      e.note || '', e.mileage ? e.mileage.toFixed(1) : '',
+      ((new Date(e.clock_out) - new Date(e.clock_in)) / 3600000).toFixed(2),
+      firstOfDay && day.breakMs ? (day.breakMs / 3600000).toFixed(2) : '',
+      firstOfDay ? (day.paidMs / 3600000).toFixed(2) : '',
+      e.approved ? 'yes' : 'no',
+    ]);
+  }
+
+  const totals = new Map();
+  for (const day of days.values()) {
+    const t = totals.get(day.user_name) || { paid: 0, brk: 0 };
+    t.paid += day.paidMs / 3600000;
+    t.brk += day.breakMs / 3600000;
+    totals.set(day.user_name, t);
+  }
+  rows.push([]);
+  rows.push(['TOTALS', '', '', '', '', '', '', '', '', '', '', 'Total Unpaid Break Hours', 'Total Paid Hours']);
+  for (const [name, t] of [...totals.entries()].sort()) {
+    rows.push([name, '', '', '', '', '', '', '', '', '', '', t.brk.toFixed(2), t.paid.toFixed(2)]);
+  }
+
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', `attachment; filename="timesheet-${from.slice(0, 10)}.csv"`);
   res.send(rows.map((r) => r.map(csvEsc).join(',')).join('\r\n') + '\r\n');
 });
 

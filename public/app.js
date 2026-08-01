@@ -1645,19 +1645,25 @@ function getLocation() {
 }
 
 async function renderClock() {
-  const [{ entry }, weekAgoEntries] = await Promise.all([
+  const [{ entry }, week] = await Promise.all([
     api('/api/time/status'),
     (async () => {
       const from = new Date(startOfWeek(new Date())).toISOString();
-      return (await api(`/api/time/entries?from=${from}`)).entries.filter((e) => e.user_id === state.me.id);
+      const res = await api(`/api/time/entries?from=${from}`);
+      return { entries: res.entries.filter((e) => e.user_id === state.me.id), breaks: res.breaks };
     })(),
   ]);
+  const weekAgoEntries = week.entries;
   const { shifts } = await api(`/api/shifts?from=${new Date(Date.now() - 12 * 3600000).toISOString()}&to=${new Date(Date.now() + 24 * 3600000).toISOString()}&mine=1`);
 
-  const weekMs = weekAgoEntries.reduce((sum, e) => {
-    const end = e.clock_out ? new Date(e.clock_out) : new Date();
-    return sum + (end - new Date(e.clock_in));
-  }, 0);
+  // Finished punches count as paid time after the day's unpaid break; a punch
+  // still running is shown at its raw elapsed time.
+  const weekDays = summariseDaysLocal(weekAgoEntries, week.breaks);
+  let weekMs = 0;
+  for (const day of weekDays.values()) weekMs += day.paidMs;
+  let weekBreakMs = 0;
+  for (const day of weekDays.values()) weekBreakMs += day.breakMs;
+  for (const e of weekAgoEntries) if (!e.clock_out) weekMs += Date.now() - new Date(e.clock_in);
 
   shell('Time Clock', `
     <div class="card clock-card">
@@ -1682,7 +1688,7 @@ async function renderClock() {
     </div>
     <button class="btn secondary" id="request-hours-btn">🕐 Request hours for approval</button>
 
-    <div class="section-title">This week · ${fmtDur(weekMs)} total</div>
+    <div class="section-title">This week · ${fmtDur(weekMs)} paid${weekBreakMs ? ` <span class="sub" style="font-weight:600">(${fmtDur(weekBreakMs)} unpaid break)</span>` : ''}</div>
     ${weekAgoEntries.length ? weekAgoEntries.map((e) => `
       <div class="card row">
         <span class="grow">
@@ -1759,28 +1765,64 @@ function periodRange() {
   return { from, to };
 }
 
+// Mirrors the server's rule: once a person's worked time in a day reaches the
+// threshold, one unpaid break comes off that day — never more than one.
+function summariseDaysLocal(entries, breaks) {
+  const thresholdMs = breaks?.thresholdMs || 0;
+  const breakMs = breaks?.breakMs || 0;
+  const days = new Map();
+  for (const e of entries) {
+    if (!e.clock_out) continue;
+    const date = dateKey(e.clock_in);
+    const key = `${e.user_id}|${date}`;
+    const day = days.get(key) || { user_id: e.user_id, date, workedMs: 0, entries: [] };
+    day.workedMs += new Date(e.clock_out) - new Date(e.clock_in);
+    day.entries.push(e);
+    days.set(key, day);
+  }
+  for (const day of days.values()) {
+    day.breakMs = thresholdMs > 0 && breakMs > 0 && day.workedMs >= thresholdMs ? breakMs : 0;
+    day.paidMs = Math.max(0, day.workedMs - day.breakMs);
+  }
+  return days;
+}
+
 async function renderTimesheets() {
   if (state.me.role !== 'admin') { location.hash = '#/clock'; return; }
   if (!state.tsPeriodStart) {
     state.tsPeriodStart = periodStartFor(new Date(), state.settings.period_anchor);
   }
   const { from, to } = periodRange();
-  const { entries } = await api(`/api/time/entries?from=${from.toISOString()}&to=${to.toISOString()}`);
+  const { entries, breaks } = await api(`/api/time/entries?from=${from.toISOString()}&to=${to.toISOString()}`);
+
+  // The break lands on approved and pending time separately, so the approved
+  // figure on screen matches exactly what the Paychex export will contain.
+  const approvedDays = summariseDaysLocal(entries.filter((e) => e.approved), breaks);
+  const pendingDays = summariseDaysLocal(entries.filter((e) => !e.approved), breaks);
 
   const byUser = new Map();
-  for (const e of entries) {
+  const personOf = (e) => {
     const u = byUser.get(e.user_id) || {
       id: e.user_id, name: e.user_name, color: e.user_color,
-      approvedMs: 0, pendingMs: 0, pending: 0, mileage: 0, venues: new Set(), entries: [],
+      approvedMs: 0, breakMs: 0, pendingMs: 0, pending: 0, mileage: 0,
+      venues: new Set(), entries: [], breaks,
     };
-    const ms = e.clock_out ? new Date(e.clock_out) - new Date(e.clock_in) : 0;
-    if (e.approved) u.approvedMs += ms; else u.pendingMs += ms;
+    byUser.set(e.user_id, u);
+    return u;
+  };
+  for (const e of entries) {
+    const u = personOf(e);
     if (!e.approved) u.pending++;
     u.mileage += e.mileage || 0;
     if (e.venue_name) u.venues.add(e.venue_name);
     u.entries.push(e);
-    byUser.set(e.user_id, u);
   }
+  for (const day of approvedDays.values()) {
+    const u = byUser.get(day.user_id);
+    u.approvedMs += day.paidMs;
+    u.breakMs += day.breakMs;
+  }
+  for (const day of pendingDays.values()) byUser.get(day.user_id).pendingMs += day.paidMs;
   const people = [...byUser.values()].sort((a, b) => a.name.localeCompare(b.name));
   const needsReview = people.reduce((n, p) => n + p.pending, 0);
   const label = `${from.toLocaleDateString([], { month: 'short', day: 'numeric' })} – ${new Date(to - 1).toLocaleDateString([], { month: 'short', day: 'numeric' })}`;
@@ -1800,6 +1842,7 @@ async function renderTimesheets() {
           <div style="font-weight:700">${esc(p.name)}</div>
           <div class="sub">
             <b>${fmtDur(p.approvedMs)}</b> approved${p.pending ? ` · <span class="pending-tag">${fmtDur(p.pendingMs)} pending</span>` : ''}
+            ${p.breakMs ? ` · ☕ ${fmtDur(p.breakMs)} unpaid break` : ''}
             ${p.mileage ? ` · 🚗 ${p.mileage.toFixed(1)} mi` : ''}
           </div>
           <div class="sub">${p.venues.size ? esc([...p.venues].join(', ')) : 'No venue recorded'}</div>
@@ -1807,8 +1850,12 @@ async function renderTimesheets() {
         <span class="sub">›</span>
       </button>`).join('') : '<div class="empty"><div class="big">🧾</div>No punches in this pay period</div>'}
     <button class="btn" id="ts-export" style="margin-top:10px">⬇️ Export Paychex CSV</button>
+    <button class="btn secondary" id="ts-detail" style="margin-top:8px">📄 Download detailed timesheet</button>
     <button class="btn secondary" id="ts-settings" style="margin-top:8px">⚙️ Payroll export settings</button>
-    <p class="hint">Only <b>approved</b> hours are exported. Tap a person to review, edit and approve their punches.</p>
+    <p class="hint">
+      Only <b>approved</b> hours are exported. Tap a person to review, edit and approve their punches.
+      ${breaks.breakMs ? `A day of <b>${(breaks.thresholdMs / 3600000).toFixed(2).replace(/\.?0+$/, '')} h</b> or more has <b>${Math.round(breaks.breakMs / 60000)} min</b> unpaid break deducted once.` : ''}
+    </p>
   `, { back: () => { location.hash = '#/more'; } });
 
   document.getElementById('ts-prev').onclick = () => {
@@ -1820,44 +1867,72 @@ async function renderTimesheets() {
   document.querySelectorAll('[data-person]').forEach((b) => {
     b.onclick = () => openPersonTimesheet(people.find((p) => p.id === Number(b.dataset.person)), from, to);
   });
-  document.getElementById('ts-export').onclick = async () => {
+  const download = async (path, filename, done) => {
     try {
       // Surface setup problems as a message instead of downloading an error page.
-      const res = await fetch(`/api/time/export?from=${from.toISOString()}&to=${to.toISOString()}`);
+      const res = await fetch(`${path}?from=${from.toISOString()}&to=${to.toISOString()}`);
       if (!res.ok) return toast((await res.json().catch(() => ({}))).error || 'Export failed');
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `paychex-spi-${dateKey(from)}.csv`;
+      a.download = filename;
       a.click();
       URL.revokeObjectURL(url);
-      toast('Paychex file downloaded');
+      toast(done);
     } catch (err) { toast(err.message); }
   };
+  document.getElementById('ts-export').onclick =
+    () => download('/api/time/export', `paychex-spi-${dateKey(from)}.csv`, 'Paychex file downloaded');
+  document.getElementById('ts-detail').onclick =
+    () => download('/api/time/timesheet.csv', `timesheet-${dateKey(from)}.csv`, 'Timesheet downloaded');
   document.getElementById('ts-settings').onclick = openPayrollSettings;
 }
 
 function openPersonTimesheet(person, from, to) {
   const rows = person.entries.slice().sort((a, b) => a.clock_in.localeCompare(b.clock_in));
+
+  // Days are shown as blocks so the once-a-day unpaid break is visible where it
+  // is actually applied, rather than buried in a running total.
+  const dayTotals = summariseDaysLocal(rows, person.breaks);
+  const dates = [...new Set(rows.map((e) => dateKey(e.clock_in)))];
+
+  const entryHTML = (e) => `
+    <button class="ts-row ${e.approved ? 'approved' : ''}" data-entry="${e.id}">
+      <span class="grow">
+        <div style="font-weight:700">${fmtTime(e.clock_in)} – ${e.clock_out ? fmtTime(e.clock_out) : 'still open'}</div>
+        <div class="sub">
+          ${e.clock_out ? `<b>${fmtDur(new Date(e.clock_out) - new Date(e.clock_in))}</b>` : 'open punch'}
+          ${e.venue_name ? ` · 📍 ${esc(e.venue_name)}` : ' · no venue'}
+          ${e.role_name ? ` · ${esc(e.role_name)}` : ''}
+          ${e.mileage ? ` · 🚗 ${e.mileage} mi` : ''}
+        </div>
+        ${e.note ? `<div class="sub note-line">📝 ${esc(e.note)}</div>` : ''}
+      </span>
+      <span class="ts-state">${e.approved ? '✓ Approved' : 'Review'}</span>
+    </button>`;
+
   const modal = openModal(`
     <h3>${esc(person.name)}</h3>
-    <p class="sub"><b>${fmtDur(person.approvedMs)}</b> approved${person.pending ? ` · ${person.pending} awaiting review` : ''}</p>
+    <p class="sub">
+      <b>${fmtDur(person.approvedMs)}</b> approved${person.pending ? ` · ${person.pending} awaiting review` : ''}
+      ${person.breakMs ? ` · ☕ ${fmtDur(person.breakMs)} unpaid break deducted` : ''}
+    </p>
     <div class="detail-people" style="margin-top:10px">
-      ${rows.map((e) => `
-        <button class="ts-row ${e.approved ? 'approved' : ''}" data-entry="${e.id}">
-          <span class="grow">
-            <div style="font-weight:700">${fmtDay(e.clock_in)} · ${fmtTime(e.clock_in)} – ${e.clock_out ? fmtTime(e.clock_out) : 'still open'}</div>
-            <div class="sub">
-              ${e.clock_out ? `<b>${fmtDur(new Date(e.clock_out) - new Date(e.clock_in))}</b>` : 'open punch'}
-              ${e.venue_name ? ` · 📍 ${esc(e.venue_name)}` : ' · no venue'}
-              ${e.role_name ? ` · ${esc(e.role_name)}` : ''}
-              ${e.mileage ? ` · 🚗 ${e.mileage} mi` : ''}
+      ${dates.map((date) => {
+        const day = dayTotals.get(`${person.id}|${date}`);
+        const dayRows = rows.filter((e) => dateKey(e.clock_in) === date);
+        return `
+          <div class="ts-day">
+            <div class="ts-day-head">
+              <span>${fmtDay(dayRows[0].clock_in)}</span>
+              <span class="sub">
+                ${day ? `${fmtDur(day.workedMs)} worked${day.breakMs ? ` − ${Math.round(day.breakMs / 60000)}m break = <b>${fmtDur(day.paidMs)}</b>` : ''}` : 'open punch'}
+              </span>
             </div>
-            ${e.note ? `<div class="sub note-line">📝 ${esc(e.note)}</div>` : ''}
-          </span>
-          <span class="ts-state">${e.approved ? '✓ Approved' : 'Review'}</span>
-        </button>`).join('')}
+            ${dayRows.map(entryHTML).join('')}
+          </div>`;
+      }).join('')}
     </div>
     <div class="actions">
       <button class="btn secondary" id="pt-close">Close</button>
@@ -1958,6 +2033,11 @@ function openPayrollSettings() {
       <label>First day of a pay period</label>
       <input name="period_anchor" type="date" value="${esc(cfg.period_anchor)}">
       <p class="hint">Periods run 14 days from this date.</p>
+      <label>Unpaid break after (hours worked in a day)</label>
+      <input name="break_after_hours" type="number" min="0" max="24" step="0.25" value="${esc(cfg.break_after_hours)}">
+      <label>Length of that break (minutes)</label>
+      <input name="break_minutes" type="number" min="0" max="240" step="5" value="${esc(cfg.break_minutes)}">
+      <p class="hint">Deducted <b>once per day</b>, however many punches the day has — the same rule Connecteam uses. Set the minutes to 0 to turn it off.</p>
       <label class="check-label"><input type="checkbox" name="export_per_day" ${cfg.export_per_day === '1' ? 'checked' : ''} style="width:auto"> One row per day (adds Line Date)</label>
       <label class="check-label"><input type="checkbox" name="export_jobs" ${cfg.export_jobs === '1' ? 'checked' : ''} style="width:auto"> Include venue as Job Number / Job Name</label>
       <p class="hint">Rates are never exported — Paychex applies each worker's own rate. Add each person's Worker ID in Team.</p>
@@ -1974,6 +2054,8 @@ function openPayrollSettings() {
           paychex_company_id: fd.get('paychex_company_id') || '',
           pay_component: fd.get('pay_component') || 'Hourly',
           period_anchor: fd.get('period_anchor') || '',
+          break_after_hours: fd.get('break_after_hours') || '0',
+          break_minutes: fd.get('break_minutes') || '0',
           export_per_day: fd.get('export_per_day') ? '1' : '0',
           export_jobs: fd.get('export_jobs') ? '1' : '0',
         },
