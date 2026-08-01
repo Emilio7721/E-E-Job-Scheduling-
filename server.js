@@ -247,12 +247,8 @@ app.post('/api/users/worker-ids/import', requireAuth, requireAdmin, (req, res) =
 /* -------------------------------- settings --------------------------------- */
 
 const SETTING_DEFAULTS = {
-  paychex_company_id: '',
-  pay_component: 'Hourly',
   // Monday of the first pay period; every period runs 14 days from here.
   period_anchor: '2026-01-05',
-  export_per_day: '0',   // one row per employee per day (adds Line Date)
-  export_jobs: '0',      // include venue as Job Number / Job Name
 };
 
 function getSettings() {
@@ -272,12 +268,6 @@ app.put('/api/settings', requireAuth, requireAdmin, (req, res) => {
   for (const key of Object.keys(SETTING_DEFAULTS)) {
     if (!(key in body)) continue;
     let value = String(body[key] ?? '').trim();
-    if (key === 'paychex_company_id' && value && !/^[a-z0-9]{1,8}$/i.test(value)) {
-      return res.status(400).json({ error: 'Paychex Company ID must be up to 8 letters or numbers' });
-    }
-    if (key === 'pay_component' && value.length > 20) {
-      return res.status(400).json({ error: 'Pay Component must be 20 characters or fewer' });
-    }
     if (key === 'period_anchor' && value && !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
       return res.status(400).json({ error: 'Pay period start must be a date' });
     }
@@ -1164,80 +1154,6 @@ app.delete('/api/time/entries/:id', requireAuth, requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
-// Paychex SPI import file (flexible layout) for a pay period. Only approved,
-// finished punches, with the automatic unpaid break already deducted, and no
-// rates so Paychex applies each worker's own.
-app.get('/api/time/export', requireAuth, requireAdmin, (req, res) => {
-  const { from, to } = req.query;
-  if (!from || !to) return res.status(400).json({ error: 'A pay period is required' });
-  const cfg = getSettings();
-
-  const entries = db.prepare(
-    TIME_ENTRY_QUERY + ' WHERE t.approved = 1 AND t.clock_out IS NOT NULL AND t.clock_in >= ? AND t.clock_in < ? ORDER BY u.name, t.clock_in'
-  ).all(from, to);
-
-  const workerIds = new Map(db.prepare('SELECT id, worker_id FROM users').all().map((u) => [u.id, u.worker_id]));
-  const missing = [...new Set(entries.filter((e) => !workerIds.get(e.user_id)).map((e) => e.user_name))];
-  if (missing.length) {
-    return res.status(400).json({ error: `Add a Paychex Worker ID in Team for: ${missing.join(', ')}` });
-  }
-  if (!cfg.paychex_company_id) {
-    return res.status(400).json({ error: 'Set your Paychex Company ID in Timesheets settings first' });
-  }
-
-  const perDay = cfg.export_per_day === '1';
-  const withJobs = cfg.export_jobs === '1';
-  const lineDate = (date) => { const [y, m, d] = date.split('-'); return `${m}/${d}/${y}`; };
-
-  // Day by day, so the break is deducted once per day, then rolled up.
-  const groups = new Map();
-  for (const day of summariseDays(entries).values()) {
-    // When job columns are on the day splits by venue; the break comes off the
-    // largest slice so the day is only ever reduced once.
-    const slices = new Map();
-    for (const e of day.entries) {
-      const key = withJobs ? (e.venue_id || '') : '';
-      const slice = slices.get(key) || { venueId: e.venue_id || '', venueName: e.venue_name || '', ms: 0 };
-      slice.ms += new Date(e.clock_out) - new Date(e.clock_in);
-      slices.set(key, slice);
-    }
-    if (day.breakMs) {
-      const biggest = [...slices.values()].sort((a, b) => b.ms - a.ms)[0];
-      if (biggest) biggest.ms = Math.max(0, biggest.ms - day.breakMs);
-    }
-    for (const slice of slices.values()) {
-      const key = [day.user_id, perDay ? day.date : '', withJobs ? slice.venueId : ''].join('|');
-      const g = groups.get(key) || {
-        worker: workerIds.get(day.user_id), date: day.date,
-        venueId: slice.venueId, venueName: slice.venueName, hours: 0,
-      };
-      g.hours += slice.ms / 3600000;
-      groups.set(key, g);
-    }
-  }
-
-  const header = ['Company ID', 'Worker ID', 'Pay Component', 'Hours'];
-  if (perDay) header.push('Line Date');
-  if (withJobs) header.push('Job Number', 'Job Name');
-
-  const csvEsc = (v) => {
-    const str = String(v ?? '');
-    return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
-  };
-  const rows = [header];
-  for (const g of groups.values()) {
-    if (g.hours < 0.005) continue;
-    const row = [cfg.paychex_company_id, g.worker, cfg.pay_component, g.hours.toFixed(2)];
-    if (perDay) row.push(lineDate(g.date));
-    if (withJobs) row.push(String(g.venueId).slice(0, 25), g.venueName.slice(0, 30));
-    rows.push(row);
-  }
-
-  res.setHeader('Content-Type', 'text/csv');
-  res.setHeader('Content-Disposition', `attachment; filename="paychex-spi-${from.slice(0, 10)}.csv"`);
-  res.send(rows.map((r) => r.map(csvEsc).join(',')).join('\r\n') + '\r\n');
-});
-
 /* The timesheet overview, column for column as Connecteam exports it: every
    employee in first-name order, their punches newest first, with the day's
    automatic unpaid break and total on the first row of each day, the week's
@@ -1256,8 +1172,28 @@ app.get('/api/time/timesheet.csv', requireAuth, requireAdmin, (req, res) => {
   const { from, to } = req.query;
   if (!from || !to) return res.status(400).json({ error: 'A pay period is required' });
 
+  // The timesheet is a payroll record, so it is only ever produced once every
+  // punch in the period has been reviewed — an unapproved or still-running
+  // punch blocks the whole file rather than quietly dropping out of it.
+  const open = db.prepare(
+    'SELECT COUNT(*) AS n FROM time_entries WHERE clock_out IS NULL AND clock_in >= ? AND clock_in < ?'
+  ).get(from, to).n;
+  if (open) {
+    return res.status(400).json({
+      error: `${open} punch${open === 1 ? ' is' : 'es are'} still running in this pay period. Close ${open === 1 ? 'it' : 'them'} before downloading.`,
+    });
+  }
+  const pending = db.prepare(
+    'SELECT COUNT(*) AS n FROM time_entries WHERE approved = 0 AND clock_out IS NOT NULL AND clock_in >= ? AND clock_in < ?'
+  ).get(from, to).n;
+  if (pending) {
+    return res.status(400).json({
+      error: `${pending} punch${pending === 1 ? '' : 'es'} in this pay period ${pending === 1 ? 'has' : 'have'} not been approved yet. Approve everything first.`,
+    });
+  }
+
   const entries = db.prepare(
-    TIME_ENTRY_QUERY + ' WHERE t.clock_out IS NOT NULL AND t.clock_in >= ? AND t.clock_in < ? ORDER BY t.clock_in DESC'
+    TIME_ENTRY_QUERY + ' WHERE t.approved = 1 AND t.clock_out IS NOT NULL AND t.clock_in >= ? AND t.clock_in < ? ORDER BY t.clock_in DESC'
   ).all(from, to);
   const days = summariseDays(entries);
   const people = db.prepare('SELECT id, name FROM users').all();
