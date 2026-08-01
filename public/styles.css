@@ -606,6 +606,14 @@ select:disabled { opacity: .55; background: var(--bg); }
 }
 .ts-row.approved .ts-state { background: var(--green-soft); color: var(--green); }
 .note-line { font-style: italic; }
+.ts-day { margin-bottom: 12px; }
+.ts-day-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  font-weight: 800; font-size: 13.5px; padding: 6px 2px;
+  border-bottom: 1px solid var(--line);
+}
+.ts-day-head .sub { font-weight: 600; text-align: right; }
+.ts-day .ts-row:first-child { border-top: none; }
 
 /* ---------- signature field placement ---------- */
 .fp-bar {
