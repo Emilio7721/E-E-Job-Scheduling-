@@ -488,6 +488,37 @@ select:disabled { opacity: .55; background: var(--bg); }
 }
 .doc-card-ico { font-size: 34px; }
 
+/* ---------- reply status: banner, legend, dot key ---------- */
+.status-banner {
+  display: block; width: 100%; text-align: left;
+  border: 1px solid transparent; border-radius: var(--radius);
+  padding: 10px 14px; margin-bottom: 10px;
+  font: inherit; font-size: 14px; font-weight: 600;
+}
+button.status-banner { cursor: pointer; }
+.status-banner.accepted { background: var(--green-soft); color: var(--green); }
+.status-banner.pending { background: var(--amber-soft); color: var(--amber); }
+.status-banner.declined { background: var(--red-soft); color: var(--red); }
+
+.cal-legend, .crew-tally {
+  display: flex; flex-wrap: wrap; gap: 6px 14px;
+  margin-bottom: 10px; font-size: 12px; color: var(--muted);
+}
+.crew-tally { margin: 4px 0 10px; }
+.lg-item { display: inline-flex; align-items: center; gap: 5px; }
+.lg-item::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.lg-item.accepted::before { background: var(--green); }
+.lg-item.pending::before { background: var(--amber); }
+.lg-item.declined::before { background: var(--red); }
+
+.own-status {
+  display: flex; align-items: center; gap: 10px;
+  border-radius: var(--radius); padding: 10px 12px; margin-top: 14px; font-weight: 700;
+}
+.own-status .grow { flex: 1; min-width: 0; }
+.own-status.accepted { background: var(--green-soft); color: var(--green); }
+.own-status.declined { background: var(--red-soft); color: var(--red); }
+
 /* ---------- week calendar ---------- */
 .cal {
   background: var(--card); border-radius: var(--radius);
@@ -516,6 +547,16 @@ select:disabled { opacity: .55; background: var(--bg); }
 .cal-day.today .cal-dow { color: var(--accent); }
 .cal-day.today .cal-date { background: var(--brand); color: var(--on-gold); font-weight: 700; }
 
+/* Reply tally under each date: green / amber / red counts for that day. */
+.cal-marks { display: flex; gap: 3px; justify-content: center; min-height: 14px; margin-top: 2px; }
+.cal-mark {
+  font-size: 9.5px; font-weight: 800; line-height: 14px;
+  min-width: 15px; padding: 0 3px; border-radius: 7px;
+}
+.cal-mark.accepted { background: var(--green-soft); color: var(--green); }
+.cal-mark.pending { background: var(--amber-soft); color: var(--amber); }
+.cal-mark.declined { background: var(--red-soft); color: var(--red); }
+
 .cal-body { display: flex; position: relative; }
 .cal-gutter {
   flex: 0 0 48px; position: sticky; left: 0; z-index: 3;
@@ -540,6 +581,32 @@ select:disabled { opacity: .55; background: var(--bg); }
 .gs-title { font-weight: 700; }
 .gs-venue, .gs-people { opacity: .75; }
 .gs-people.muted { font-style: italic; }
+
+/* Anything still waiting on a reply gets a dashed outline so it stands out. */
+.grid-shift.st-pending { outline: 1.5px dashed var(--amber); outline-offset: -1.5px; }
+.grid-shift.st-declined { outline: 1.5px solid var(--red); outline-offset: -1.5px; }
+.grid-shift.st-unstaffed { outline: 1.5px dotted var(--muted); outline-offset: -1.5px; }
+
+/* Floated, so the time flows around it on the first line instead of being clipped. */
+.gs-badge {
+  float: right; margin-left: 4px; white-space: nowrap;
+  font-size: 9.5px; font-weight: 800; line-height: 1.5;
+  padding: 0 4px; border-radius: 6px;
+}
+.gs-badge.accepted { background: var(--green-soft); color: var(--green); }
+.gs-badge.pending { background: var(--amber-soft); color: var(--amber); }
+.gs-badge.declined { background: var(--red-soft); color: var(--red); }
+.gs-badge.unstaffed { background: var(--line); color: var(--muted); }
+
+.gs-people { display: flex; flex-wrap: wrap; gap: 2px 6px; opacity: 1; }
+.gs-person { display: inline-flex; align-items: center; gap: 3px; opacity: .85; }
+.gs-person::before {
+  content: ''; width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--muted);
+}
+.gs-person.accepted::before { background: var(--green); }
+.gs-person.pending::before { background: var(--amber); }
+.gs-person.declined::before { background: var(--red); }
+.gs-person.declined { text-decoration: line-through; opacity: .6; }
 
 .cal-now { position: absolute; left: 0; right: 0; top: 0; height: 0; z-index: 2; pointer-events: none; }
 .cal-now::after {

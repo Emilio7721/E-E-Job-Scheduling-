@@ -614,7 +614,8 @@ app.patch('/api/shifts/:id', requireAuth, requireAdmin, (req, res) => {
   if (new Date(ends_at) <= new Date(starts_at)) return res.status(400).json({ error: 'End time must be after start time' });
 
   // Only re-check people who are newly added, or everyone if the time moved.
-  const before = db.prepare('SELECT user_id FROM shift_assignees WHERE shift_id = ?').all(shift.id).map((r) => r.user_id);
+  const beforeRows = db.prepare('SELECT user_id, status FROM shift_assignees WHERE shift_id = ?').all(shift.id);
+  const before = beforeRows.map((r) => r.user_id);
   const timeMoved = starts_at !== shift.starts_at || ends_at !== shift.ends_at;
   const nextAssignees = Array.isArray(assignee_ids) ? assignee_ids : before;
   const toCheck = timeMoved ? nextAssignees : nextAssignees.filter((id) => !before.includes(id));
@@ -629,14 +630,31 @@ app.patch('/api/shifts/:id', requireAuth, requireAdmin, (req, res) => {
   let added = [];
   let removed = [];
   if (Array.isArray(assignee_ids)) {
-    db.prepare('DELETE FROM shift_assignees WHERE shift_id = ?').run(shift.id);
-    const addAssignee = db.prepare('INSERT OR IGNORE INTO shift_assignees (shift_id, user_id) VALUES (?, ?)');
-    for (const uid of assignee_ids) addAssignee.run(shift.id, uid);
     added = assignee_ids.filter((id) => !before.includes(id));
     removed = before.filter((id) => !assignee_ids.includes(id));
+    // Touch only the rows that actually changed, so everyone who stays on the
+    // job keeps the answer they already gave.
+    const dropAssignee = db.prepare('DELETE FROM shift_assignees WHERE shift_id = ? AND user_id = ?');
+    for (const uid of removed) dropAssignee.run(shift.id, uid);
+    const addAssignee = db.prepare('INSERT OR IGNORE INTO shift_assignees (shift_id, user_id) VALUES (?, ?)');
+    for (const uid of added) addAssignee.run(shift.id, uid);
   }
 
-  const updated = shiftWithAssignees(db.prepare(SHIFT_QUERY + ' WHERE s.id = ?').get(shift.id));
+  const after = db.prepare(SHIFT_QUERY + ' WHERE s.id = ?').get(shift.id);
+
+  // Editing the notes, title, job or attire is just extra detail on a job people
+  // already said yes to — only moving when or where it happens is a different
+  // commitment, so that is the one case where we ask them to confirm again.
+  const needsReconfirm = timeMoved || shift.venue_id !== after.venue_id;
+  const reconfirming = needsReconfirm
+    ? beforeRows.filter((r) => r.status === 'accepted' && !removed.includes(r.user_id)).map((r) => r.user_id)
+    : [];
+  if (reconfirming.length) {
+    const reset = db.prepare(`UPDATE shift_assignees SET status = 'pending' WHERE shift_id = ? AND user_id = ?`);
+    for (const uid of reconfirming) reset.run(shift.id, uid);
+  }
+
+  const updated = shiftWithAssignees(after);
 
   // Keep a plain-language history so staff can see what an admin changed.
   const history = [];
@@ -649,6 +667,11 @@ app.patch('/api/shifts/:id', requireAuth, requireAdmin, (req, res) => {
   const nameOf = (id) => db.prepare('SELECT name FROM users WHERE id = ?').get(id)?.name || 'someone';
   for (const id of added) history.push(`${nameOf(id)} added to the job`);
   for (const id of removed) history.push(`${nameOf(id)} removed from the job`);
+  if (reconfirming.length) {
+    history.push(reconfirming.length === 1
+      ? `${nameOf(reconfirming[0])} was asked to confirm the new time or venue`
+      : `${reconfirming.length} people were asked to confirm the new time or venue`);
+  }
   const logChange = db.prepare('INSERT INTO shift_changes (shift_id, user_id, summary) VALUES (?, ?, ?)');
   for (const line of history) logChange.run(shift.id, req.user.id, line);
 
@@ -671,9 +694,19 @@ app.patch('/api/shifts/:id', requireAuth, requireAdmin, (req, res) => {
     category: 'jobs',
   });
   if (changes.length) {
-    notify(kept.filter((id) => id !== req.user.id), {
+    // People who have to answer again get told why; everyone else just gets the news.
+    const reask = kept.filter((id) => reconfirming.includes(id) && id !== req.user.id);
+    const fyi = kept.filter((id) => !reconfirming.includes(id) && id !== req.user.id);
+    const when = `${fmtShiftTime(updated.starts_at)}${updated.venue_name ? ' @ ' + updated.venue_name : ''}`;
+    notify(reask, {
+      title: `Please confirm again: ${updated.title}`,
+      body: `The ${changes.includes('time') ? 'time' : 'venue'} changed — ${when}`,
+      url: '/#/schedule',
+      category: 'jobs',
+    });
+    notify(fyi, {
       title: `Job updated (${changes.join(', ')}): ${updated.title}`,
-      body: `${fmtShiftTime(updated.starts_at)}${updated.venue_name ? ' @ ' + updated.venue_name : ''}`,
+      body: `${when} — you are still on this job`,
       url: '/#/schedule',
       category: 'jobs',
     });
