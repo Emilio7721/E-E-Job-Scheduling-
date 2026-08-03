@@ -680,6 +680,70 @@ function openPinPad(title, onComplete) {
 
 /* -------------------------------- schedule -------------------------------- */
 
+const STATUS_LABEL = { accepted: 'Accepted', pending: 'Awaiting reply', declined: 'Declined' };
+
+// How the crew on one job is doing: who has answered and who still owes a reply.
+function crewStatus(shift) {
+  const counts = { accepted: 0, pending: 0, declined: 0 };
+  for (const a of shift.assignees) if (counts[a.status] !== undefined) counts[a.status] += 1;
+  const total = shift.assignees.length;
+  const state = !total ? 'unstaffed'
+    : counts.declined ? 'declined'
+      : counts.pending ? 'pending' : 'accepted';
+  return { ...counts, total, state };
+}
+
+// The badge in the corner of a calendar block. Your own answer wins when you're
+// on the job; otherwise it's a headcount of who has said yes. Kept to a couple of
+// characters — the columns are narrow, and the tooltip carries the long version.
+function shiftStatusBadge(s) {
+  const mine = s.assignees.find((a) => a.id === state.me.id);
+  if (mine) {
+    const label = { accepted: '✓ In', pending: 'Reply?', declined: '✗ Out' };
+    const tip = { accepted: "You accepted this job", pending: 'You still owe a reply', declined: 'You declined this job' };
+    return `<span class="gs-badge ${mine.status}" title="${tip[mine.status]}">${label[mine.status]}</span>`;
+  }
+  const c = crewStatus(s);
+  if (!c.total) return '<span class="gs-badge unstaffed" title="Nobody assigned yet">⚠ 0</span>';
+  const tip = `${c.accepted} accepted · ${c.pending} awaiting reply · ${c.declined} declined`;
+  return `<span class="gs-badge ${c.state}" title="${tip}">✓ ${c.accepted}/${c.total}</span>`;
+}
+
+// A one-line read on the whole visible week, so nobody has to open each job.
+function weekStatusHTML() {
+  const isAdmin = state.me.role === 'admin';
+  let mineWaiting = 0, pending = 0, declined = 0, accepted = 0;
+  for (const s of state.shifts) {
+    if (s.assignees.find((a) => a.id === state.me.id)?.status === 'pending') mineWaiting += 1;
+    for (const a of s.assignees) {
+      if (a.status === 'pending') pending += 1;
+      else if (a.status === 'declined') declined += 1;
+      else accepted += 1;
+    }
+  }
+  const spots = accepted + pending + declined;
+  if (mineWaiting) {
+    return `<button class="status-banner pending" id="jump-pending">⏳ <b>${mineWaiting}</b> job${
+      mineWaiting === 1 ? '' : 's'} waiting on your reply — tap to answer</button>`;
+  }
+  if (!spots) return '';
+  if (isAdmin && (pending || declined)) {
+    const bits = [];
+    if (pending) bits.push(`<b>${pending}</b> still to reply`);
+    if (declined) bits.push(`<b>${declined}</b> declined`);
+    return `<div class="status-banner ${declined ? 'declined' : 'pending'}">${
+      declined ? '⚠️' : '⏳'} ${bits.join(' · ')} of ${spots} spot${spots === 1 ? '' : 's'} this week</div>`;
+  }
+  return `<div class="status-banner accepted">✓ Everyone has replied${isAdmin ? ` — all ${spots} spots accepted` : ''}</div>`;
+}
+
+const CAL_LEGEND = `
+  <div class="cal-legend">
+    <span class="lg-item accepted">Accepted</span>
+    <span class="lg-item pending">Awaiting reply</span>
+    <span class="lg-item declined">Declined</span>
+  </div>`;
+
 async function loadShifts() {
   const from = new Date(state.weekStart);
   const to = new Date(state.weekStart); to.setDate(to.getDate() + 7);
@@ -718,6 +782,8 @@ function renderSchedule() {
         <button class="pill ${state.scheduleFilter === 'all' ? 'active' : ''}" data-filter="all">Everyone</button>
         <button class="pill ${state.scheduleFilter === 'mine' ? 'active' : ''}" data-filter="mine">My jobs</button>
       </div>` : ''}
+    ${weekStatusHTML()}
+    ${CAL_LEGEND}
     ${weekCalendarHTML(days, byDay)}
   `, { fab: isAdmin });
 
@@ -737,6 +803,13 @@ function renderSchedule() {
   document.querySelectorAll('[data-shift]').forEach((el) => {
     el.onclick = () => openShiftDetail(state.shifts.find((s) => s.id === Number(el.dataset.shift)));
   });
+
+  // The banner is a shortcut straight to the first job that needs an answer.
+  const jump = document.getElementById('jump-pending');
+  if (jump) jump.onclick = () => {
+    const next = state.shifts.find((s) => s.assignees.find((a) => a.id === state.me.id)?.status === 'pending');
+    if (next) openShiftDetail(next);
+  };
 
   // Scroll so the working part of the day is what you land on.
   const body = document.querySelector('.cal-scroll');
@@ -792,11 +865,21 @@ function weekCalendarHTML(days, byDay) {
   const todayKey = dateKey(new Date());
 
   const header = days.map((d) => {
-    const isToday = dateKey(d) === todayKey;
+    const key = dateKey(d);
+    // A running tally per day so a glance down the header shows where replies are missing.
+    const tally = (byDay[key] || []).reduce((acc, s) => {
+      const c = crewStatus(s);
+      return { accepted: acc.accepted + c.accepted, pending: acc.pending + c.pending, declined: acc.declined + c.declined };
+    }, { accepted: 0, pending: 0, declined: 0 });
+    const marks = ['accepted', 'pending', 'declined']
+      .filter((k) => tally[k])
+      .map((k) => `<span class="cal-mark ${k}" title="${tally[k]} ${STATUS_LABEL[k].toLowerCase()}">${tally[k]}</span>`)
+      .join('');
     return `
-      <div class="cal-day ${isToday ? 'today' : ''}">
+      <div class="cal-day ${key === todayKey ? 'today' : ''}">
         <div class="cal-dow">${d.toLocaleDateString([], { weekday: 'short' }).toUpperCase()}</div>
         <div class="cal-date">${d.getDate()}</div>
+        <div class="cal-marks">${marks}</div>
       </div>`;
   }).join('');
 
@@ -826,15 +909,19 @@ function weekCalendarHTML(days, byDay) {
       const width = 100 / laneCount;
       const showCrew = canSeeCrew(s, key, all);
       const compact = h < 52;
+      const crew = crewStatus(s);
+      const mine = s.assignees.find((a) => a.id === state.me.id);
       return `
-        <div class="grid-shift" data-shift="${s.id}"
+        <div class="grid-shift st-${mine ? mine.status : crew.state}" data-shift="${s.id}"
              style="top:${top}px;height:${h}px;left:calc(${lane * width}% + 2px);width:calc(${width}% - 4px);
                     background:${hexToRgba(color, 0.18)};border-left-color:${esc(color)}">
+          ${shiftStatusBadge(s)}
           <div class="gs-time">${fmtTime(s.starts_at)}${compact ? '' : ` – ${fmtTime(s.ends_at)}`}</div>
           <div class="gs-title">${esc(s.title)}</div>
           ${!compact && s.venue_name ? `<div class="gs-venue">${esc(s.venue_name)}</div>` : ''}
           ${!compact && showCrew && s.assignees.length
-            ? `<div class="gs-people">${s.assignees.map((a) => esc(a.name.split(' ')[0])).join(', ')}</div>`
+            ? `<div class="gs-people">${s.assignees.map((a) => `<span class="gs-person ${a.status}" title="${
+              esc(a.name)} — ${STATUS_LABEL[a.status] || ''}">${esc(a.name.split(' ')[0])}</span>`).join('')}</div>`
             : (!compact && s.assignees.length ? `<div class="gs-people muted">${s.assignees.length} scheduled</div>` : '')}
         </div>`;
     }).join('');
@@ -909,6 +996,7 @@ function openShiftDetail(s) {
   const mine = s.assignees.find((a) => a.id === state.me.id);
   const hours = ((new Date(s.ends_at) - new Date(s.starts_at)) / 3600000).toFixed(1).replace(/\.0$/, '');
   const statusLabel = { accepted: '✓ Accepted', declined: '✗ Declined', pending: '• Awaiting reply' };
+  const crew = crewStatus(s);
 
   const modal = openModal(`
     <div class="detail-title" style="border-left:5px solid ${esc(s.venue_color || 'var(--brand)')}">
@@ -946,6 +1034,11 @@ function openShiftDetail(s) {
     </div>
 
     <div class="section-title" style="margin-top:16px">Team on this job (${s.assignees.length})</div>
+    ${s.assignees.length ? `<div class="crew-tally">
+      <span class="lg-item accepted">${crew.accepted} accepted</span>
+      <span class="lg-item pending">${crew.pending} awaiting reply</span>
+      <span class="lg-item declined">${crew.declined} declined</span>
+    </div>` : ''}
     ${!canSeeCrew(s, dateKey(new Date(s.starts_at)), state.shifts)
       ? `<p class="sub">${s.assignees.length} scheduled. You only see names for jobs at a venue you're working that day.</p>`
       : s.assignees.length ? `<div class="detail-people">
@@ -960,11 +1053,16 @@ function openShiftDetail(s) {
     </div>` : '<p class="sub">Nobody assigned yet.</p>'}
     <div id="detail-changes"></div>
 
-    ${mine && mine.status === 'pending' ? `
+    ${mine ? (mine.status === 'pending' ? `
       <div class="actions">
         <button class="btn danger" data-detail-respond="declined">Decline</button>
         <button class="btn" data-detail-respond="accepted">Accept</button>
-      </div>` : ''}
+      </div>` : `
+      <div class="own-status ${mine.status}">
+        <span class="grow">${mine.status === 'accepted' ? '✓ You accepted this job' : '✗ You declined this job'}</span>
+        <button class="btn small secondary" data-detail-respond="${mine.status === 'accepted' ? 'declined' : 'accepted'}">${
+          mine.status === 'accepted' ? 'Decline instead' : 'Accept instead'}</button>
+      </div>`) : ''}
     <div class="actions">
       ${isAdmin ? '<button class="btn secondary" id="detail-edit">Edit job</button>' : ''}
       <button class="btn ${isAdmin ? 'secondary' : ''}" id="detail-close">Close</button>
