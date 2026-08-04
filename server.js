@@ -1781,6 +1781,27 @@ app.post('/api/positions', requireAuth, requireAdmin, (req, res) => {
   res.json({ position: db.prepare('SELECT * FROM positions WHERE id = ?').get(Number(info.lastInsertRowid)) });
 });
 
+// Copies the job list into positions so every job can be someone's main
+// position. Idempotent and case-insensitive — jobs already covered are skipped,
+// and imported positions land at member level like any hand-added one.
+app.post('/api/positions/import-jobs', requireAuth, requireAdmin, (req, res) => {
+  const jobs = db.prepare('SELECT name FROM roles WHERE archived = 0 ORDER BY name').all();
+  const taken = new Set(
+    db.prepare('SELECT name FROM positions WHERE archived = 0').all().map((p) => p.name.trim().toLowerCase())
+  );
+  const insert = db.prepare('INSERT INTO positions (name, is_admin) VALUES (?, 0)');
+  let added = 0;
+  for (const job of jobs) {
+    const name = job.name.trim();
+    if (!name || taken.has(name.toLowerCase())) continue;
+    taken.add(name.toLowerCase());
+    insert.run(name);
+    added += 1;
+  }
+  if (added) events.broadcast('positions', {});
+  res.json({ added, positions: db.prepare('SELECT * FROM positions WHERE archived = 0 ORDER BY name').all() });
+});
+
 app.patch('/api/positions/:id', requireAuth, requireAdmin, (req, res) => {
   const position = db.prepare('SELECT * FROM positions WHERE id = ?').get(Number(req.params.id));
   if (!position) return res.status(404).json({ error: 'Position not found' });
