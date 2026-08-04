@@ -2063,6 +2063,73 @@ function savedChecklistPhoto(photo, res) {
   return out;
 }
 
+/* ------------------------------ knowledge base ------------------------------ */
+/* The standing rules. An article with no positions is readable by everyone;
+   otherwise only the positions listed — admins always see everything. */
+
+function shapeArticle(row) {
+  return { ...row, positions: JSON.parse(row.positions || '[]') };
+}
+
+function canReadArticle(user, article) {
+  if (user.role === 'admin') return true;
+  if (!article.published) return false;
+  if (!article.positions.length) return true;
+  return !!user.position_id && article.positions.includes(user.position_id);
+}
+
+const ARTICLE_QUERY = `
+  SELECT a.*, u.name AS updated_by_name
+  FROM knowledge_articles a
+  LEFT JOIN users u ON u.id = a.updated_by
+  WHERE a.archived = 0
+  ORDER BY a.folder, a.title`;
+
+app.get('/api/knowledge', requireAuth, (req, res) => {
+  const articles = db.prepare(ARTICLE_QUERY).all().map(shapeArticle).filter((a) => canReadArticle(req.user, a));
+  res.json({ articles });
+});
+
+app.post('/api/knowledge', requireAuth, requireAdmin, (req, res) => {
+  const { title, folder = '', body = '', positions = [], published = true } = req.body || {};
+  if (!title?.trim()) return res.status(400).json({ error: 'Give the article a title' });
+  const info = db.prepare(
+    'INSERT INTO knowledge_articles (folder, title, body, positions, published, updated_by) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(
+    String(folder).trim().slice(0, 80), title.trim(), String(body).slice(0, 60_000),
+    JSON.stringify(cleanPositionIds(positions)), published ? 1 : 0, req.user.id
+  );
+  events.broadcast('knowledge', {});
+  res.json({ article: shapeArticle(db.prepare('SELECT * FROM knowledge_articles WHERE id = ?').get(Number(info.lastInsertRowid))) });
+});
+
+app.patch('/api/knowledge/:id', requireAuth, requireAdmin, (req, res) => {
+  const article = db.prepare('SELECT * FROM knowledge_articles WHERE id = ? AND archived = 0').get(Number(req.params.id));
+  if (!article) return res.status(404).json({ error: 'Article not found' });
+  const { title = article.title, folder, body, positions, published } = req.body || {};
+  if (!title?.trim()) return res.status(400).json({ error: 'Give the article a title' });
+  db.prepare(`
+    UPDATE knowledge_articles
+    SET folder = ?, title = ?, body = ?, positions = ?, published = ?, updated_by = ?, updated_at = datetime('now')
+    WHERE id = ?`).run(
+    folder === undefined ? article.folder : String(folder).trim().slice(0, 80),
+    title.trim(),
+    body === undefined ? article.body : String(body).slice(0, 60_000),
+    positions === undefined ? article.positions : JSON.stringify(cleanPositionIds(positions)),
+    published === undefined ? article.published : (published ? 1 : 0),
+    req.user.id,
+    article.id
+  );
+  events.broadcast('knowledge', {});
+  res.json({ article: shapeArticle(db.prepare('SELECT * FROM knowledge_articles WHERE id = ?').get(article.id)) });
+});
+
+app.delete('/api/knowledge/:id', requireAuth, requireAdmin, (req, res) => {
+  db.prepare('UPDATE knowledge_articles SET archived = 1 WHERE id = ?').run(Number(req.params.id));
+  events.broadcast('knowledge', {});
+  res.json({ ok: true });
+});
+
 /* ------------------------------ hours requests ------------------------------ */
 
 const HOUR_REQ_QUERY = `

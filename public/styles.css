@@ -512,6 +512,35 @@ select:disabled { opacity: .55; background: var(--bg); }
 .cl-na { color: var(--muted); font-weight: 700; }
 .cl-sig { height: 34px; background: #fff; border-radius: 6px; padding: 2px; }
 
+/* ---------- knowledge base ---------- */
+.kb-card { width: 100%; text-align: left; }
+.kb-head { border-bottom: 1px solid var(--line); padding-bottom: 10px; margin-bottom: 14px; }
+.kb-head h3 { margin: 2px 0 0; }
+.kb-tools { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+.kb-tools .pill { padding: 6px 12px; font-size: 12.5px; }
+
+.kb-body { font-size: 15px; line-height: 1.5; }
+.kb-body .kb-h1 {
+  font-size: 21px; font-weight: 800; line-height: 1.25;
+  letter-spacing: .01em; margin: 18px 0 10px;
+}
+.kb-body .kb-h2 {
+  font-size: 17px; font-weight: 800; color: var(--accent);
+  letter-spacing: .03em; margin: 20px 0 8px;
+}
+.kb-body .kb-h3 { font-size: 15px; font-weight: 700; margin: 14px 0 6px; }
+.kb-body > :first-child { margin-top: 0; }
+.kb-body .kb-p { margin: 0 0 10px; }
+.kb-body .kb-rule { border: 0; border-top: 1px solid var(--line); margin: 16px 0; }
+.kb-body .kb-list { margin: 0 0 10px; padding-left: 20px; list-style: disc; }
+.kb-body .kb-list .kb-list { margin: 4px 0 4px; padding-left: 18px; list-style: circle; }
+.kb-body .kb-list li { margin: 3px 0; }
+.kb-body b { font-weight: 700; }
+#kb-preview {
+  background: var(--card-accent); border: 1px solid var(--line);
+  border-radius: 12px; padding: 14px; max-height: 260px; overflow-y: auto;
+}
+
 /* ---------- PIN pad & kiosk ---------- */
 .pin-dots { display: flex; gap: 13px; justify-content: center; margin: 18px 0 4px; }
 .pin-dots span {

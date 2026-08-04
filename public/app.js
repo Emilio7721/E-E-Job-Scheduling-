@@ -15,6 +15,7 @@ const state = {
   channels: [],
   notifications: [],
   authMode: 'login',
+  kbQuery: '',
   weekStart: startOfWeek(new Date()),
   selectedDay: dateKey(new Date()),
   scheduleFilter: 'all', // 'all' | 'mine'
@@ -141,7 +142,7 @@ function connectEvents() {
   for (const [event, views] of Object.entries({
     time: ['clock', 'timesheets'], forms: ['forms'], posts: ['updates'],
     hours: ['hours'], roles: ['roles'], positions: ['positions', 'team'], users: ['team'], settings: ['timesheets'],
-    checklists: ['checklists', 'checklist-subs'],
+    checklists: ['checklists', 'checklist-subs'], knowledge: ['knowledge'],
     attire: ['attire', 'schedule'], availability: ['availability', 'schedule'],
   })) {
     es.addEventListener(event, () => { if (views.includes(route().view)) render(); });
@@ -518,7 +519,7 @@ const TABS = [
 ];
 
 // Views that live under the "More" hub still highlight the More tab.
-const MORE_VIEWS = ['more', 'venues', 'team', 'forms', 'signed', 'place', 'timesheets', 'settings', 'notifications', 'hours', 'roles', 'positions', 'attire', 'checklists', 'checklist-subs'];
+const MORE_VIEWS = ['more', 'venues', 'team', 'forms', 'signed', 'place', 'timesheets', 'settings', 'notifications', 'hours', 'roles', 'positions', 'attire', 'checklists', 'checklist-subs', 'knowledge'];
 
 function tabbarHTML(active, extraClass = '') {
   return `
@@ -2930,6 +2931,291 @@ async function renderChecklistSubmissions(id) {
   `, { back: () => { location.hash = '#/checklists'; } });
 }
 
+/* ----------------------------- knowledge base ------------------------------- */
+/* The standing rules. Bodies are written in a small markdown dialect so the
+   editor stays a plain textarea that works on a phone — no rich-text widget. */
+
+// Inline marks, applied to text that has ALREADY been escaped.
+function rulesInline(escaped) {
+  return escaped
+    .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<i>$2</i>');
+}
+
+// # heading · ## section · - bullet (indent to nest) · --- divider · blank line
+// separates paragraphs. Everything is escaped first, so a body can never inject
+// markup.
+function renderRules(body) {
+  const lines = String(body || '').replace(/\r/g, '').split('\n');
+  const out = [];
+  let depth = 0;        // open <ul> elements
+  let liOpen = false;   // an <li> at the current depth is still open
+
+  const closeLi = () => { if (liOpen) { out.push('</li>'); liOpen = false; } };
+  // Closing a nested list lands us back inside the parent's still-open <li>.
+  const closeTo = (want) => {
+    while (depth > want) { closeLi(); out.push('</ul>'); depth--; liOpen = depth > 0; }
+    if (!depth) closeLi();
+  };
+
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    if (!line.trim()) { closeTo(0); continue; }
+
+    if (/^\s*(-{3,}|_{3,})\s*$/.test(line)) { closeTo(0); out.push('<hr class="kb-rule">'); continue; }
+
+    const heading = line.match(/^(#{1,3})\s+(.*)$/);
+    if (heading) {
+      closeTo(0);
+      out.push(`<div class="kb-h${heading[1].length}">${rulesInline(esc(heading[2].trim()))}</div>`);
+      continue;
+    }
+
+    const bullet = line.match(/^(\s*)[-*•]\s+(.*)$/);
+    if (bullet) {
+      // Two spaces (or a tab) per level, capped so deep indents stay readable.
+      const want = Math.min(Math.floor(bullet[1].replace(/\t/g, '  ').length / 2) + 1, 3);
+      if (want > depth) {
+        // Nest inside the open <li> rather than beside it.
+        while (depth < want) { out.push('<ul class="kb-list">'); depth++; liOpen = false; }
+      } else {
+        closeTo(want);
+      }
+      closeLi();
+      out.push(`<li>${rulesInline(esc(bullet[2].trim()))}`);
+      liOpen = true;
+      continue;
+    }
+
+    closeTo(0);
+    out.push(`<p class="kb-p">${rulesInline(esc(line.trim()))}</p>`);
+  }
+  closeTo(0);
+  return out.join('');
+}
+
+async function renderKnowledge() {
+  const isAdmin = state.me.role === 'admin';
+  const { articles } = await api('/api/knowledge');
+  state.kbQuery = state.kbQuery || '';
+
+  const matches = (a) => {
+    const q = state.kbQuery.trim().toLowerCase();
+    if (!q) return true;
+    return `${a.folder} ${a.title} ${a.body}`.toLowerCase().includes(q);
+  };
+  const shown = articles.filter(matches);
+
+  const byFolder = new Map();
+  for (const a of shown) {
+    const key = a.folder || 'General';
+    if (!byFolder.has(key)) byFolder.set(key, []);
+    byFolder.get(key).push(a);
+  }
+
+  const audience = (a) => (a.positions.length
+    ? a.positions.map((id) => state.positions.find((p) => p.id === id)?.name).filter(Boolean).join(', ')
+    : 'Everyone');
+
+  shell('Knowledge Base', `
+    <p class="hint" style="margin-bottom:10px">${isAdmin
+      ? 'The rules the team works to. Leave an article’s audience as <b>Everyone</b>, or limit it to certain positions.'
+      : 'The rules we all work to. Search or tap an article to read it.'}</p>
+    <input class="picker-search" id="kb-search" type="search" autocomplete="off"
+      placeholder="Search the rules…" value="${esc(state.kbQuery)}">
+    ${shown.length ? [...byFolder].map(([folder, list]) => `
+      <div class="section-title">${esc(folder)}</div>
+      ${list.map((a) => `
+        <button class="card kb-card" data-kb="${a.id}">
+          <div class="row">
+            <span class="venue-icon" style="background:var(--brand-soft);color:var(--text)">📖</span>
+            <span class="grow">
+              <div style="font-weight:700">${esc(a.title)}</div>
+              <div class="sub">${esc(rulesSummary(a.body))}</div>
+              <div class="sub">👁 ${esc(audience(a))}${a.updated_by_name ? ` · updated by ${esc(a.updated_by_name)}` : ''}</div>
+            </span>
+            ${isAdmin && !a.published ? '<span class="role-tag">Draft</span>' : ''}
+          </div>
+        </button>`).join('')}`).join('')
+      : `<div class="empty"><div class="big">📖</div>${state.kbQuery
+        ? 'Nothing matches that search'
+        : (isAdmin ? 'No articles yet — tap ＋ to write the first rule sheet' : 'No articles shared with your position yet')}</div>`}
+  `, { back: () => { location.hash = '#/more'; }, fab: isAdmin });
+
+  // Filter without a full re-render so the box keeps focus as you type.
+  const search = document.getElementById('kb-search');
+  search.oninput = () => {
+    state.kbQuery = search.value;
+    const at = search.selectionStart;
+    renderKnowledge().then(() => {
+      const next = document.getElementById('kb-search');
+      next?.focus();
+      next?.setSelectionRange(at, at);
+    });
+  };
+
+  document.querySelectorAll('[data-kb]').forEach((b) => {
+    b.onclick = () => openArticle(articles.find((a) => a.id === Number(b.dataset.kb)));
+  });
+  if (isAdmin) {
+    document.getElementById('fab').onclick = () => openArticleEditor(null, articles);
+  }
+}
+
+// First couple of lines of real text, for the card subtitle.
+function rulesSummary(body) {
+  const line = String(body || '').split('\n')
+    .map((l) => l.replace(/^[\s#*•-]+/, '').replace(/\*\*/g, '').trim())
+    .find(Boolean) || 'No content yet';
+  return line.length > 80 ? `${line.slice(0, 80)}…` : line;
+}
+
+function openArticle(article) {
+  const isAdmin = state.me.role === 'admin';
+  const modal = openModal(`
+    <div class="kb-head">
+      <div class="sub">${esc(article.folder || 'General')}</div>
+      <h3>${esc(article.title)}</h3>
+    </div>
+    <div class="kb-body">${renderRules(article.body) || '<p class="hint">Nothing written yet.</p>'}</div>
+    <div class="sub" style="margin-top:14px">
+      ${article.updated_by_name ? `Last updated by ${esc(article.updated_by_name)} · ` : ''}${fmtWhen(article.updated_at)}
+    </div>
+    <div class="actions">
+      ${isAdmin ? '<button class="btn secondary" id="kb-edit">Edit</button>' : ''}
+      <button class="btn${isAdmin ? ' secondary' : ''}" id="kb-close">Close</button>
+    </div>
+  `, { wide: true });
+  modal.querySelector('#kb-close').onclick = closeModal;
+  const edit = modal.querySelector('#kb-edit');
+  if (edit) edit.onclick = () => openArticleEditor(article);
+}
+
+function openArticleEditor(article, all = []) {
+  const positions = [...(article?.positions || [])];
+  const folders = [...new Set(all.map((a) => a.folder).filter(Boolean))];
+
+  const modal = openModal(`
+    <h3>${article ? 'Edit article' : 'New article'}</h3>
+    <label>Folder</label>
+    <input id="kb-folder" list="kb-folders" value="${esc(article?.folder || '')}" placeholder="e.g. Professionalism">
+    <datalist id="kb-folders">${folders.map((f) => `<option value="${esc(f)}">`).join('')}</datalist>
+
+    <label>Title</label>
+    <input id="kb-title" value="${esc(article?.title || '')}" placeholder="e.g. Pre-Shift Team Briefing">
+
+    <label>Who can read it</label>
+    <div class="pos-picker">
+      <button type="button" class="pill ${positions.length ? '' : 'active'}" id="kb-everyone">Everyone</button>
+      ${state.positions.map((p) => `
+        <button type="button" class="pill ${positions.includes(p.id) ? 'active' : ''}" data-kb-pos="${p.id}">${esc(p.name)}</button>`).join('')}
+    </div>
+    <p class="hint" style="margin:4px 0 0">Pick nothing and everyone sees it. Admins always see everything.</p>
+
+    <label style="margin-top:14px">The rules</label>
+    <div class="kb-tools">
+      <button type="button" class="pill" data-md="# ">Heading</button>
+      <button type="button" class="pill" data-md="## ">Section</button>
+      <button type="button" class="pill" data-md="- ">Bullet</button>
+      <button type="button" class="pill" data-md="  - ">Sub-bullet</button>
+      <button type="button" class="pill" data-md="**">Bold</button>
+      <button type="button" class="pill" data-md="---">Divider</button>
+    </div>
+    <textarea id="kb-body" rows="12" spellcheck="true" placeholder="## PROFESSIONALISM
+- No gum.
+- No phones.
+- Introduce yourself.
+
+## FOOD SAFETY
+- Touch your face? **Change your gloves.**">${esc(article?.body || '')}</textarea>
+
+    <div class="section-title" style="margin-top:14px">Preview</div>
+    <div class="kb-body" id="kb-preview"></div>
+
+    <label class="check-label">
+      <input type="checkbox" id="kb-published" style="width:auto" ${article?.published !== 0 ? 'checked' : ''}>
+      Published — visible to the team
+    </label>
+
+    <div class="actions">
+      ${article ? '<button type="button" class="btn danger" id="kb-delete">Delete</button>' : ''}
+      <button type="button" class="btn secondary" id="kb-cancel">Cancel</button>
+      <button type="button" class="btn" id="kb-save">${article ? 'Save changes' : 'Create article'}</button>
+    </div>
+  `, { wide: true });
+
+  const body = modal.querySelector('#kb-body');
+  const preview = modal.querySelector('#kb-preview');
+  const drawPreview = () => { preview.innerHTML = renderRules(body.value) || '<p class="hint">Nothing yet.</p>'; };
+  body.oninput = drawPreview;
+  drawPreview();
+
+  // Toolbar wraps the selection for bold, otherwise prefixes the current line.
+  modal.querySelectorAll('[data-md]').forEach((b) => {
+    b.onclick = () => {
+      const mark = b.dataset.md;
+      const { selectionStart: from, selectionEnd: to, value } = body;
+      if (mark === '**') {
+        body.value = `${value.slice(0, from)}**${value.slice(from, to) || 'bold'}**${value.slice(to)}`;
+        body.selectionStart = from + 2;
+        body.selectionEnd = from + 2 + (to - from || 4);
+      } else if (mark === '---') {
+        body.value = `${value.slice(0, from)}\n---\n${value.slice(to)}`;
+        body.selectionStart = body.selectionEnd = from + 5;
+      } else {
+        const lineStart = value.lastIndexOf('\n', from - 1) + 1;
+        body.value = value.slice(0, lineStart) + mark + value.slice(lineStart);
+        body.selectionStart = body.selectionEnd = from + mark.length;
+      }
+      body.focus();
+      drawPreview();
+    };
+  });
+
+  const everyone = modal.querySelector('#kb-everyone');
+  const syncAudience = () => everyone.classList.toggle('active', positions.length === 0);
+  everyone.onclick = () => {
+    positions.length = 0;
+    modal.querySelectorAll('[data-kb-pos]').forEach((p) => p.classList.remove('active'));
+    syncAudience();
+  };
+  modal.querySelectorAll('[data-kb-pos]').forEach((b) => {
+    b.onclick = () => {
+      const id = Number(b.dataset.kbPos);
+      const at = positions.indexOf(id);
+      at === -1 ? positions.push(id) : positions.splice(at, 1);
+      b.classList.toggle('active');
+      syncAudience();
+    };
+  });
+
+  modal.querySelector('#kb-cancel').onclick = () => (article ? openArticle(article) : closeModal());
+  const del = modal.querySelector('#kb-delete');
+  if (del) del.onclick = async () => {
+    if (!confirm('Delete this article?')) return;
+    await api(`/api/knowledge/${article.id}`, { method: 'DELETE' });
+    closeModal(); toast('Article deleted');
+    render();
+  };
+  modal.querySelector('#kb-save').onclick = async () => {
+    const payload = {
+      folder: modal.querySelector('#kb-folder').value,
+      title: modal.querySelector('#kb-title').value,
+      body: body.value,
+      positions,
+      published: modal.querySelector('#kb-published').checked,
+    };
+    if (!payload.title.trim()) return toast('Give the article a title');
+    try {
+      await api(article ? `/api/knowledge/${article.id}` : '/api/knowledge',
+        { method: article ? 'PATCH' : 'POST', body: payload });
+      closeModal();
+      toast(article ? 'Article saved' : 'Article created');
+      render();
+    } catch (err) { toast(err.message); }
+  };
+}
+
 /* ------------------------------- availability ------------------------------- */
 
 function minToLabel(min) {
@@ -4037,6 +4323,7 @@ function renderMore() {
     { href: '#/hours', icon: '🕐', label: 'Hours Requests', sub: 'Submit worked hours for approval' },
     { href: '#/forms', icon: '📄', label: 'Documents', sub: 'Read & sign uploaded documents' },
     { href: '#/checklists', icon: '📋', label: 'Checklists', sub: isAdmin ? 'Build the per-shift checklists for each venue' : 'Shift checklists you fill in' },
+    { href: '#/knowledge', icon: '📖', label: 'Knowledge Base', sub: 'The rules we all work to' },
     ...(isAdmin ? [
       { href: '#/attire', icon: '👔', label: 'Attire', sub: 'What the team wears on each job' },
       { href: '#/timesheets', icon: '🧾', label: 'Timesheets', sub: 'Review, approve & download hours' },
@@ -4098,6 +4385,7 @@ async function render() {
     else if (view === 'attire') await renderAttire();
     else if (view === 'signed') await renderSignedDocs();
     else if (view === 'checklists') await renderChecklists();
+    else if (view === 'knowledge') await renderKnowledge();
     else if (view === 'checklist-subs' && arg) await renderChecklistSubmissions(Number(arg));
     else if (view === 'place' && arg) await renderFieldPlacer(Number(arg));
     else if (view === 'updates') await renderUpdates();

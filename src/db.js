@@ -236,6 +236,26 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_checklist_subs_list ON checklist_submissions(checklist_id);
 `);
 
+// Knowledge base: the standing rules everyone works to. Body is the small
+// markdown dialect rendered by renderRules() in the client. An empty
+// `positions` means everyone can read it; otherwise only those positions.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS knowledge_articles (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    folder     TEXT NOT NULL DEFAULT '',
+    title      TEXT NOT NULL,
+    body       TEXT NOT NULL DEFAULT '',
+    positions  TEXT NOT NULL DEFAULT '[]',
+    published  INTEGER NOT NULL DEFAULT 1,
+    archived   INTEGER NOT NULL DEFAULT 0,
+    updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_knowledge_folder ON knowledge_articles(folder);
+`);
+
 // Lightweight migrations for databases created before a column existed.
 function ensureColumn(table, column, ddl) {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
