@@ -1828,6 +1828,241 @@ app.delete('/api/positions/:id', requireAuth, requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
+/* -------------------------------- checklists -------------------------------- */
+/* A checklist hangs off a venue, so every job there carries it, and the leads
+   holding one of its positions fill it fresh each shift. */
+
+const CHECK_FIELD_TYPES = new Set(['section', 'note', 'check', 'datetime', 'photo', 'scale', 'signature']);
+
+// Field specs are authored client-side; keep only what we understand so a bad
+// payload can't smuggle extra keys into the stored JSON.
+function cleanFields(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const f of raw.slice(0, 200)) {
+    const type = String(f?.type || '');
+    if (!CHECK_FIELD_TYPES.has(type)) continue;
+    const label = String(f?.label ?? '').trim().slice(0, 300);
+    if (!label && type !== 'note') continue;
+    out.push({
+      id: String(f.id || `f${out.length + 1}-${crypto.randomBytes(3).toString('hex')}`).slice(0, 40),
+      type,
+      label,
+      description: String(f?.description ?? '').trim().slice(0, 2000),
+      // Section headers and notes have nothing to answer, so they are never required.
+      required: type === 'section' || type === 'note' ? false : f?.required !== false,
+    });
+  }
+  return out;
+}
+
+function cleanPositionIds(raw) {
+  if (!Array.isArray(raw)) return [];
+  const known = new Set(db.prepare('SELECT id FROM positions WHERE archived = 0').all().map((p) => p.id));
+  return [...new Set(raw.map(Number).filter((n) => known.has(n)))];
+}
+
+function shapeChecklist(row) {
+  return {
+    ...row,
+    fields: JSON.parse(row.fields || '[]'),
+    positions: JSON.parse(row.positions || '[]'),
+  };
+}
+
+// A member sees a checklist when their position is on its list; admins see all.
+function canFillChecklist(user, list) {
+  if (user.role === 'admin') return true;
+  return !!user.position_id && list.positions.includes(user.position_id);
+}
+
+const CHECKLIST_QUERY = `
+  SELECT c.*, v.name AS venue_name,
+         (SELECT COUNT(*) FROM checklist_submissions s WHERE s.checklist_id = c.id) AS submission_count
+  FROM checklists c
+  LEFT JOIN venues v ON v.id = c.venue_id
+  WHERE c.archived = 0
+  ORDER BY v.name, c.title`;
+
+app.get('/api/checklists', requireAuth, (req, res) => {
+  const all = db.prepare(CHECKLIST_QUERY).all().map(shapeChecklist);
+  const visible = req.user.role === 'admin'
+    ? all
+    : all.filter((c) => c.published && canFillChecklist(req.user, c));
+  res.json({ checklists: visible });
+});
+
+app.post('/api/checklists', requireAuth, requireAdmin, (req, res) => {
+  const { title, venue_id = null, fields = [], positions = [], published = true } = req.body || {};
+  if (!title?.trim()) return res.status(400).json({ error: 'Checklist title is required' });
+  const venue = venue_id ? db.prepare('SELECT id FROM venues WHERE id = ?').get(Number(venue_id)) : null;
+  if (venue_id && !venue) return res.status(400).json({ error: 'Unknown venue' });
+  const info = db.prepare(
+    'INSERT INTO checklists (title, venue_id, fields, positions, published, created_by) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(
+    title.trim(), venue?.id ?? null,
+    JSON.stringify(cleanFields(fields)), JSON.stringify(cleanPositionIds(positions)),
+    published ? 1 : 0, req.user.id
+  );
+  events.broadcast('checklists', {});
+  res.json({ checklist: shapeChecklist(db.prepare('SELECT * FROM checklists WHERE id = ?').get(Number(info.lastInsertRowid))) });
+});
+
+app.patch('/api/checklists/:id', requireAuth, requireAdmin, (req, res) => {
+  const list = db.prepare('SELECT * FROM checklists WHERE id = ? AND archived = 0').get(Number(req.params.id));
+  if (!list) return res.status(404).json({ error: 'Checklist not found' });
+  const { title = list.title, venue_id, fields, positions, published } = req.body || {};
+  if (!title?.trim()) return res.status(400).json({ error: 'Checklist title is required' });
+  let venueId = list.venue_id;
+  if (venue_id !== undefined) {
+    venueId = venue_id ? Number(venue_id) : null;
+    if (venueId && !db.prepare('SELECT 1 FROM venues WHERE id = ?').get(venueId)) {
+      return res.status(400).json({ error: 'Unknown venue' });
+    }
+  }
+  db.prepare('UPDATE checklists SET title = ?, venue_id = ?, fields = ?, positions = ?, published = ? WHERE id = ?').run(
+    title.trim(),
+    venueId,
+    fields === undefined ? list.fields : JSON.stringify(cleanFields(fields)),
+    positions === undefined ? list.positions : JSON.stringify(cleanPositionIds(positions)),
+    published === undefined ? list.published : (published ? 1 : 0),
+    list.id
+  );
+  events.broadcast('checklists', {});
+  res.json({ checklist: shapeChecklist(db.prepare('SELECT * FROM checklists WHERE id = ?').get(list.id)) });
+});
+
+app.delete('/api/checklists/:id', requireAuth, requireAdmin, (req, res) => {
+  db.prepare('UPDATE checklists SET archived = 1 WHERE id = ?').run(Number(req.params.id));
+  events.broadcast('checklists', {});
+  res.json({ ok: true });
+});
+
+// Everything due on one shift: the venue's published checklists, plus whether
+// this person has already turned each one in for that shift.
+app.get('/api/shifts/:id/checklists', requireAuth, (req, res) => {
+  const shift = db.prepare('SELECT * FROM shifts WHERE id = ?').get(Number(req.params.id));
+  if (!shift) return res.status(404).json({ error: 'Job not found' });
+  const lists = db.prepare(CHECKLIST_QUERY).all().map(shapeChecklist)
+    .filter((c) => c.published && c.venue_id && c.venue_id === shift.venue_id)
+    .filter((c) => canFillChecklist(req.user, c));
+  const done = db.prepare(`
+    SELECT s.checklist_id, s.id, s.created_at, u.name AS user_name
+    FROM checklist_submissions s
+    LEFT JOIN users u ON u.id = s.user_id
+    WHERE s.shift_id = ?`).all(shift.id);
+  res.json({
+    checklists: lists.map((c) => ({
+      ...c,
+      submissions: done.filter((d) => d.checklist_id === c.id),
+    })),
+  });
+});
+
+app.get('/api/checklists/:id/submissions', requireAuth, requireAdmin, (req, res) => {
+  const list = db.prepare(
+    'SELECT c.*, v.name AS venue_name FROM checklists c LEFT JOIN venues v ON v.id = c.venue_id WHERE c.id = ?'
+  ).get(Number(req.params.id));
+  if (!list) return res.status(404).json({ error: 'Checklist not found' });
+  const submissions = db.prepare(`
+    SELECT s.*, u.name AS user_name, u.color AS user_color, sh.title AS shift_title, sh.starts_at AS shift_starts_at
+    FROM checklist_submissions s
+    LEFT JOIN users u ON u.id = s.user_id
+    LEFT JOIN shifts sh ON sh.id = s.shift_id
+    WHERE s.checklist_id = ?
+    ORDER BY s.created_at DESC
+    LIMIT 500`).all(list.id);
+  res.json({
+    checklist: shapeChecklist(list),
+    submissions: submissions.map((s) => ({
+      ...s,
+      answers: JSON.parse(s.answers || '{}'),
+      photos: Object.keys(JSON.parse(s.photos || '{}')), // paths stay server-side
+    })),
+  });
+});
+
+app.post('/api/checklists/:id/submit', requireAuth, (req, res) => {
+  const row = db.prepare('SELECT * FROM checklists WHERE id = ? AND archived = 0').get(Number(req.params.id));
+  if (!row) return res.status(404).json({ error: 'Checklist not found' });
+  const list = shapeChecklist(row);
+  if (!list.published) return res.status(400).json({ error: 'This checklist is not published yet' });
+  if (!canFillChecklist(req.user, list)) return res.status(403).json({ error: 'This checklist is not assigned to your position' });
+
+  const { shift_id = null, answers = {} } = req.body || {};
+  let shiftId = null;
+  if (shift_id) {
+    const shift = db.prepare('SELECT * FROM shifts WHERE id = ?').get(Number(shift_id));
+    if (!shift) return res.status(400).json({ error: 'Unknown job' });
+    if (shift.venue_id !== list.venue_id) return res.status(400).json({ error: 'That job is at a different venue' });
+    shiftId = shift.id;
+  }
+
+  const clean = {};
+  const photos = {};
+  for (const field of list.fields) {
+    if (field.type === 'section' || field.type === 'note') continue;
+    const value = answers[field.id];
+    const missing = value === undefined || value === null || value === '';
+    if (missing) {
+      if (field.required) return res.status(400).json({ error: `"${field.label}" still needs an answer` });
+      continue;
+    }
+    if (field.type === 'check') {
+      if (value !== 'yes' && value !== 'na') return res.status(400).json({ error: `"${field.label}" has an invalid answer` });
+      clean[field.id] = value;
+    } else if (field.type === 'scale') {
+      const n = Math.round(Number(value));
+      if (!Number.isFinite(n) || n < 1 || n > 10) return res.status(400).json({ error: `"${field.label}" must be between 1 and 10` });
+      clean[field.id] = n;
+    } else if (field.type === 'datetime') {
+      const when = new Date(value);
+      if (Number.isNaN(when.getTime())) return res.status(400).json({ error: `"${field.label}" needs a valid date and time` });
+      clean[field.id] = when.toISOString();
+    } else if (field.type === 'signature') {
+      clean[field.id] = String(value).slice(0, 400_000);
+    } else if (field.type === 'photo') {
+      const saved = savedChecklistPhoto(value, res);
+      if (saved === false) return;
+      if (saved) photos[field.id] = saved;
+    }
+  }
+
+  const info = db.prepare(
+    'INSERT INTO checklist_submissions (checklist_id, shift_id, user_id, answers, photos) VALUES (?, ?, ?, ?, ?)'
+  ).run(list.id, shiftId, req.user.id, JSON.stringify(clean), JSON.stringify(photos));
+
+  events.broadcast('checklists', {});
+  res.json({ ok: true, submission_id: Number(info.lastInsertRowid) });
+});
+
+app.get('/api/checklists/submissions/:sid/photo/:fieldId', requireAuth, (req, res) => {
+  const sub = db.prepare('SELECT * FROM checklist_submissions WHERE id = ?').get(Number(req.params.sid));
+  if (!sub) return res.status(404).end();
+  if (req.user.role !== 'admin' && sub.user_id !== req.user.id) return res.status(403).end();
+  const stored = JSON.parse(sub.photos || '{}')[req.params.fieldId];
+  if (!stored || !fs.existsSync(stored)) return res.status(404).end();
+  res.setHeader('Content-Type', 'image/jpeg');
+  res.setHeader('Cache-Control', 'private, max-age=86400');
+  fs.createReadStream(stored).pipe(res);
+});
+
+// Same data-URL handling as attire photos: returns a path, null when empty, or
+// false once an error response has already gone out.
+function savedChecklistPhoto(photo, res) {
+  if (!photo) return null;
+  const base64 = String(photo).includes(',') ? String(photo).split(',').pop() : String(photo);
+  let bytes;
+  try { bytes = Buffer.from(base64, 'base64'); } catch { res.status(400).json({ error: 'That photo could not be read' }); return false; }
+  if (bytes.length > 4 * 1024 * 1024) { res.status(400).json({ error: 'Photos must be under 4 MB' }); return false; }
+  const isJpeg = bytes[0] === 0xff && bytes[1] === 0xd8;
+  const isPng = bytes.subarray(0, 8).toString('hex') === '89504e470d0a1a0a';
+  if (!isJpeg && !isPng) { res.status(400).json({ error: 'Photos must be JPG or PNG' }); return false; }
+  const out = path.join(UPLOAD_DIR, `checklist-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`);
+  fs.writeFileSync(out, bytes);
+  return out;
+}
+
 /* ------------------------------ hours requests ------------------------------ */
 
 const HOUR_REQ_QUERY = `

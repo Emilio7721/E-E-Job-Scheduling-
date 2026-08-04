@@ -141,6 +141,7 @@ function connectEvents() {
   for (const [event, views] of Object.entries({
     time: ['clock', 'timesheets'], forms: ['forms'], posts: ['updates'],
     hours: ['hours'], roles: ['roles'], positions: ['positions', 'team'], users: ['team'], settings: ['timesheets'],
+    checklists: ['checklists', 'checklist-subs'],
     attire: ['attire', 'schedule'], availability: ['availability', 'schedule'],
   })) {
     es.addEventListener(event, () => { if (views.includes(route().view)) render(); });
@@ -381,11 +382,13 @@ async function maybeShowOnboarding() {
 
 /* --------------------------------- modal ---------------------------------- */
 
-function openModal(html) {
+// `wide` gives long content (a checklist being built or filled in) more room
+// and its own scroll, instead of stretching the sheet past the screen.
+function openModal(html, { wide = false } = {}) {
   closeModal();
   const backdrop = document.createElement('div');
   backdrop.className = 'modal-backdrop';
-  backdrop.innerHTML = `<div class="modal">${html}</div>`;
+  backdrop.innerHTML = `<div class="modal${wide ? ' wide' : ''}">${html}</div>`;
   backdrop.addEventListener('click', (e) => { if (e.target === backdrop) closeModal(); });
   document.body.appendChild(backdrop);
   return backdrop.querySelector('.modal');
@@ -515,7 +518,7 @@ const TABS = [
 ];
 
 // Views that live under the "More" hub still highlight the More tab.
-const MORE_VIEWS = ['more', 'venues', 'team', 'forms', 'signed', 'place', 'timesheets', 'settings', 'notifications', 'hours', 'roles', 'positions', 'attire'];
+const MORE_VIEWS = ['more', 'venues', 'team', 'forms', 'signed', 'place', 'timesheets', 'settings', 'notifications', 'hours', 'roles', 'positions', 'attire', 'checklists', 'checklist-subs'];
 
 function tabbarHTML(active, extraClass = '') {
   return `
@@ -1067,6 +1070,7 @@ function openShiftDetail(s) {
           </span>
         </div>`).join('')}
     </div>` : '<p class="sub">Nobody assigned yet.</p>'}
+    <div id="detail-checklists"></div>
     <div id="detail-changes"></div>
 
     ${mine ? (mine.status === 'pending' ? `
@@ -1086,6 +1090,37 @@ function openShiftDetail(s) {
   `);
 
   modal.querySelector('#detail-close').onclick = closeModal;
+
+  // Checklists due on this job — only the ones this person's position covers.
+  const drawChecklists = () => api(`/api/shifts/${s.id}/checklists`).then(({ checklists }) => {
+    const box = modal.querySelector('#detail-checklists');
+    if (!box || !checklists.length) return;
+    box.innerHTML = `
+      <div class="section-title" style="margin-top:16px">Checklists for this job</div>
+      <div class="detail-people">
+        ${checklists.map((c) => {
+          const mine = c.submissions.filter((x) => x.user_name === state.me.name);
+          return `
+          <div class="row detail-person">
+            <span class="detail-ico">📋</span>
+            <span class="grow">
+              <div style="font-weight:700">${esc(c.title)}</div>
+              <div class="sub">${c.submissions.length
+                ? `✅ ${c.submissions.length} turned in${mine.length ? ' · including yours' : ''}`
+                : '⏳ Not submitted for this job yet'}</div>
+            </span>
+            <button class="btn small${c.submissions.length ? ' secondary' : ''}" data-cl-fill="${c.id}">${mine.length ? 'Fill again' : 'Fill in'}</button>
+          </div>`;
+        }).join('')}
+      </div>`;
+    box.querySelectorAll('[data-cl-fill]').forEach((b) => {
+      b.onclick = () => {
+        const list = checklists.find((c) => c.id === Number(b.dataset.clFill));
+        openChecklistFill(list, s.id, () => { closeModal(); loadShifts().then(render); });
+      };
+    });
+  }).catch(() => {});
+  drawChecklists();
 
   // Any edits an admin made since the job was created.
   api(`/api/shifts/${s.id}/changes`).then(({ changes }) => {
@@ -2425,6 +2460,476 @@ async function renderPositions() {
   });
 }
 
+/* -------------------------------- checklists -------------------------------- */
+/* Per-shift checklists: an admin builds one against a venue, and the leads
+   holding one of its positions fill it fresh on every job at that venue. */
+
+const CHECK_FIELDS = {
+  section:   { icon: '🔖', label: 'Section header', hint: 'Groups the items below it, e.g. Kitchen or Bar' },
+  note:      { icon: '📄', label: 'Text block', hint: 'Instructions to read — nothing to answer' },
+  check:     { icon: '✓',  label: 'Check item', hint: 'Yes / Not Applicable' },
+  datetime:  { icon: '📅', label: 'Date & time', hint: 'e.g. Event Start Time, Event End Time' },
+  photo:     { icon: '📷', label: 'Photo', hint: 'Take or upload a picture' },
+  scale:     { icon: '🎚️', label: 'Scale 1–10', hint: 'A slider from 1 to 10' },
+  signature: { icon: '✍️', label: 'Signature', hint: 'Sign with a finger' },
+};
+
+function newFieldId() {
+  return `f${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+}
+
+async function renderChecklists() {
+  const isAdmin = state.me.role === 'admin';
+  const [{ checklists }, { venues }] = await Promise.all([api('/api/checklists'), api('/api/venues')]);
+  state.venues = venues;
+
+  const byVenue = new Map();
+  for (const c of checklists) {
+    const key = c.venue_name || 'No venue';
+    if (!byVenue.has(key)) byVenue.set(key, []);
+    byVenue.get(key).push(c);
+  }
+
+  shell('Checklists', `
+    <p class="hint" style="margin-bottom:12px">${isAdmin
+      ? 'Checklists belong to a <b>venue</b>, so every job there carries them. Leads holding one of the checklist’s positions fill it in fresh each shift.'
+      : 'Fill these in on each shift you work. Open the job from your schedule to submit one against that shift.'}</p>
+    ${checklists.length ? [...byVenue].map(([venue, lists]) => `
+      <div class="section-title">📍 ${esc(venue)}</div>
+      ${lists.map((c) => `
+        <div class="card">
+          <div class="row">
+            <span class="venue-icon" style="background:var(--brand-soft);color:var(--text)">📋</span>
+            <span class="grow">
+              <div style="font-weight:700">${esc(c.title)}</div>
+              <div class="sub">${c.fields.filter((f) => f.type === 'check').length} check item${
+                c.fields.filter((f) => f.type === 'check').length === 1 ? '' : 's'} · ${c.fields.length} field${c.fields.length === 1 ? '' : 's'}${
+                isAdmin ? ` · ${c.submission_count} submission${c.submission_count === 1 ? '' : 's'}` : ''}</div>
+              <div class="sub">${c.positions.length
+                ? esc(c.positions.map((id) => state.positions.find((p) => p.id === id)?.name).filter(Boolean).join(', '))
+                : '<b>No positions yet</b> — nobody but admins can fill this'}</div>
+            </span>
+            ${isAdmin ? `<span class="role-tag">${c.published ? 'Live' : 'Draft'}</span>` : ''}
+          </div>
+          ${isAdmin ? `<div class="shift-actions">
+            <button class="btn small secondary" data-cl-edit="${c.id}">Edit</button>
+            <button class="btn small secondary" data-cl-subs="${c.id}">Submissions</button>
+            <button class="btn small secondary" data-cl-pub="${c.id}">${c.published ? 'Unpublish' : 'Publish'}</button>
+            <button class="btn small danger" data-cl-del="${c.id}">Delete</button>
+          </div>` : ''}
+        </div>`).join('')}`).join('')
+      : `<div class="empty"><div class="big">📋</div>${isAdmin
+        ? 'No checklists yet — tap ＋ to build one for a venue'
+        : 'No checklists are assigned to your position yet'}</div>`}
+  `, { back: () => { location.hash = '#/more'; }, fab: isAdmin });
+
+  if (isAdmin) {
+    document.getElementById('fab').onclick = () => openChecklistEditor(null);
+    document.querySelectorAll('[data-cl-edit]').forEach((b) => {
+      b.onclick = () => openChecklistEditor(checklists.find((c) => c.id === Number(b.dataset.clEdit)));
+    });
+    document.querySelectorAll('[data-cl-subs]').forEach((b) => {
+      b.onclick = () => { location.hash = `#/checklist-subs/${b.dataset.clSubs}`; };
+    });
+    document.querySelectorAll('[data-cl-pub]').forEach((b) => {
+      b.onclick = async () => {
+        const list = checklists.find((c) => c.id === Number(b.dataset.clPub));
+        await api(`/api/checklists/${list.id}`, { method: 'PATCH', body: { published: !list.published } });
+        toast(list.published ? 'Unpublished — hidden from the team' : 'Published — live on that venue’s jobs');
+        render();
+      };
+    });
+    document.querySelectorAll('[data-cl-del]').forEach((b) => {
+      b.onclick = async () => {
+        if (!confirm('Delete this checklist? Submissions already turned in are kept.')) return;
+        await api(`/api/checklists/${b.dataset.clDel}`, { method: 'DELETE' });
+        toast('Checklist deleted');
+        render();
+      };
+    });
+  }
+}
+
+/* ---------------------------- checklist builder ----------------------------- */
+
+function openChecklistEditor(list) {
+  // Work on a copy so Cancel really cancels.
+  const draft = {
+    id: list?.id || null,
+    title: list?.title || '',
+    venue_id: list?.venue_id || null,
+    positions: [...(list?.positions || [])],
+    fields: (list?.fields || []).map((f) => ({ ...f })),
+  };
+
+  const modal = openModal('<div id="cl-editor"></div>', { wide: true });
+  const panel = modal.querySelector('#cl-editor');
+
+  const draw = () => {
+    panel.innerHTML = `
+      <h3>${draft.id ? 'Edit checklist' : 'New checklist'}</h3>
+      <label>Title</label>
+      <input id="cl-title" value="${esc(draft.title)}" placeholder="e.g. Cleaning Checklist — The Grand Oak">
+      <label>Venue</label>
+      <select id="cl-venue">
+        <option value="">Pick a venue…</option>
+        ${state.venues.map((v) => `<option value="${v.id}" ${draft.venue_id === v.id ? 'selected' : ''}>${esc(v.name)}</option>`).join('')}
+      </select>
+      <p class="hint" style="margin:4px 0 0">Every job at this venue will carry the checklist.</p>
+
+      <label style="margin-top:14px">Who has to fill it in</label>
+      ${state.positions.length ? `<div class="pos-picker">
+        ${state.positions.map((p) => `
+          <button type="button" class="pill ${draft.positions.includes(p.id) ? 'active' : ''}" data-cl-pos="${p.id}">${esc(p.name)}</button>`).join('')}
+      </div>` : '<p class="hint">No positions yet — add them in More → Positions first.</p>'}
+      <p class="hint" style="margin:4px 0 0">Admins can always fill and review it.</p>
+
+      <div class="section-title" style="margin-top:16px">Fields (${draft.fields.length})</div>
+      <div class="cl-fields">
+        ${draft.fields.length ? draft.fields.map((f, i) => `
+          <div class="cl-field ${f.type}">
+            <span class="cl-num">${i + 1}</span>
+            <span class="grow">
+              <div class="cl-field-label">${CHECK_FIELDS[f.type].icon} ${esc(f.label) || '<i>Empty text block</i>'}${
+                f.required && f.type !== 'section' && f.type !== 'note' ? ' <span class="cl-req">*</span>' : ''}</div>
+              ${f.description ? `<div class="sub">${esc(f.description.slice(0, 90))}${f.description.length > 90 ? '…' : ''}</div>` : ''}
+            </span>
+            <button type="button" class="icon-btn" data-cl-up="${i}" ${i === 0 ? 'disabled' : ''}>↑</button>
+            <button type="button" class="icon-btn" data-cl-down="${i}" ${i === draft.fields.length - 1 ? 'disabled' : ''}>↓</button>
+            <button type="button" class="icon-btn" data-cl-fedit="${i}">✏️</button>
+            <button type="button" class="icon-btn" data-cl-fdel="${i}">🗑️</button>
+          </div>`).join('') : '<p class="hint">No fields yet — add one below.</p>'}
+      </div>
+
+      <div class="section-title" style="margin-top:14px">Add field</div>
+      <div class="cl-add">
+        ${Object.entries(CHECK_FIELDS).map(([type, spec]) => `
+          <button type="button" class="pill" data-cl-add="${type}" title="${esc(spec.hint)}">${spec.icon} ${spec.label}</button>`).join('')}
+      </div>
+
+      <div class="actions">
+        <button type="button" class="btn secondary" id="cl-cancel">Cancel</button>
+        <button type="button" class="btn" id="cl-save">${draft.id ? 'Save changes' : 'Create checklist'}</button>
+      </div>`;
+
+    const title = modal.querySelector('#cl-title');
+    const venue = modal.querySelector('#cl-venue');
+    title.oninput = () => { draft.title = title.value; };
+    venue.onchange = () => { draft.venue_id = venue.value ? Number(venue.value) : null; };
+
+    modal.querySelectorAll('[data-cl-pos]').forEach((b) => {
+      b.onclick = () => {
+        const id = Number(b.dataset.clPos);
+        const at = draft.positions.indexOf(id);
+        at === -1 ? draft.positions.push(id) : draft.positions.splice(at, 1);
+        b.classList.toggle('active');
+      };
+    });
+    modal.querySelectorAll('[data-cl-add]').forEach((b) => {
+      b.onclick = () => drawField(b.dataset.clAdd, null, (field) => { draft.fields.push(field); });
+    });
+    modal.querySelectorAll('[data-cl-fedit]').forEach((b) => {
+      b.onclick = () => {
+        const i = Number(b.dataset.clFedit);
+        drawField(draft.fields[i].type, draft.fields[i], (field) => { draft.fields[i] = field; });
+      };
+    });
+    modal.querySelectorAll('[data-cl-fdel]').forEach((b) => {
+      b.onclick = () => { draft.fields.splice(Number(b.dataset.clFdel), 1); draw(); };
+    });
+    modal.querySelectorAll('[data-cl-up]').forEach((b) => {
+      b.onclick = () => {
+        const i = Number(b.dataset.clUp);
+        [draft.fields[i - 1], draft.fields[i]] = [draft.fields[i], draft.fields[i - 1]];
+        draw();
+      };
+    });
+    modal.querySelectorAll('[data-cl-down]').forEach((b) => {
+      b.onclick = () => {
+        const i = Number(b.dataset.clDown);
+        [draft.fields[i + 1], draft.fields[i]] = [draft.fields[i], draft.fields[i + 1]];
+        draw();
+      };
+    });
+
+    modal.querySelector('#cl-cancel').onclick = closeModal;
+    modal.querySelector('#cl-save').onclick = async () => {
+      if (!draft.title.trim()) return toast('Give the checklist a title');
+      if (!draft.venue_id) return toast('Pick the venue this checklist belongs to');
+      const body = {
+        title: draft.title, venue_id: draft.venue_id,
+        positions: draft.positions, fields: draft.fields,
+      };
+      try {
+        await api(draft.id ? `/api/checklists/${draft.id}` : '/api/checklists',
+          { method: draft.id ? 'PATCH' : 'POST', body });
+        closeModal();
+        toast(draft.id ? 'Checklist saved' : 'Checklist created');
+        render();
+      } catch (err) { toast(err.message); }
+    };
+  };
+
+  // One field, edited in place inside the same sheet — opening a second modal
+  // would tear the builder down, since openModal() closes whatever is open.
+  const drawField = (type, existing, commit) => {
+    const spec = CHECK_FIELDS[type];
+    const answerable = type !== 'section' && type !== 'note';
+    const placeholder = {
+      datetime: 'Event Start Time', section: 'Kitchen',
+      scale: 'How clean was the venue on arrival?', photo: 'Photo of the finished bar',
+      signature: 'Signature',
+    }[type] || 'Towels';
+
+    panel.innerHTML = `
+      <h3>${spec.icon} ${existing ? 'Edit' : 'Add'} ${spec.label.toLowerCase()}</h3>
+      <p class="sub">${esc(spec.hint)}</p>
+      <form id="cl-field-form">
+        <label>${type === 'note' ? 'Text' : 'Label'}</label>
+        ${type === 'note'
+          ? `<textarea name="label" rows="3" placeholder="Please make sure you have all these items…">${esc(existing?.label || '')}</textarea>`
+          : `<input name="label" required value="${esc(existing?.label || '')}" placeholder="${placeholder}">`}
+        ${answerable ? `
+          <label>Description (optional)</label>
+          <textarea name="description" rows="3" placeholder="The longer instructions — shown in grey under the label">${esc(existing?.description || '')}</textarea>
+          <label class="check-label" style="margin-top:10px">
+            <input type="checkbox" name="required" style="width:auto" ${existing?.required !== false ? 'checked' : ''}>
+            Required — can't submit without it
+          </label>` : ''}
+        <div class="actions">
+          <button type="button" class="btn secondary" id="cl-field-cancel">Cancel</button>
+          <button type="submit" class="btn">${existing ? 'Save field' : 'Add field'}</button>
+        </div>
+      </form>`;
+
+    panel.querySelector('#cl-field-cancel').onclick = draw;
+    panel.querySelector('#cl-field-form').onsubmit = (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      const label = String(fd.get('label') || '').trim();
+      if (!label && type !== 'note') return toast('Give the field a label');
+      commit({
+        id: existing?.id || newFieldId(),
+        type,
+        label,
+        description: String(fd.get('description') || '').trim(),
+        required: answerable ? !!fd.get('required') : false,
+      });
+      draw();
+    };
+  };
+
+  draw();
+}
+
+/* ----------------------------- filling one in ------------------------------- */
+
+function openChecklistFill(list, shiftId = null, onDone = null) {
+  const answers = {};
+  const pads = {};
+
+  const body = list.fields.map((f) => {
+    const req = f.required ? ' <span class="cl-req">*</span>' : '';
+    if (f.type === 'section') return `<div class="cl-section">${esc(f.label)}</div>`;
+    if (f.type === 'note') return `<div class="cl-note">${esc(f.label)}</div>`;
+    const head = `
+      <div class="cl-fill-label">${esc(f.label)}${req}</div>
+      ${f.description ? `<div class="cl-fill-desc">${esc(f.description)}</div>` : ''}`;
+
+    if (f.type === 'check') {
+      return `<div class="cl-item" data-field="${f.id}">${head}
+        <div class="cl-yesno">
+          <button type="button" class="btn small secondary" data-answer="yes" data-for="${f.id}">Yes</button>
+          <button type="button" class="btn small secondary" data-answer="na" data-for="${f.id}">Not Applicable</button>
+        </div>
+      </div>`;
+    }
+    if (f.type === 'datetime') {
+      return `<div class="cl-item" data-field="${f.id}">${head}
+        <input type="datetime-local" data-input="${f.id}">
+      </div>`;
+    }
+    if (f.type === 'scale') {
+      return `<div class="cl-item" data-field="${f.id}">${head}
+        <div class="cl-scale">
+          <span class="grow">
+            <input type="range" min="1" max="10" step="1" value="5" data-input="${f.id}">
+            <div class="cl-scale-ends"><span>1</span><span>10</span></div>
+          </span>
+          <output data-out="${f.id}">5</output>
+        </div>
+      </div>`;
+    }
+    if (f.type === 'photo') {
+      return `<div class="cl-item" data-field="${f.id}">${head}
+        <input type="file" accept="image/*" capture="environment" data-photo="${f.id}" hidden>
+        <button type="button" class="btn small secondary" data-photo-btn="${f.id}">📷 Take or upload a photo</button>
+        <img class="cl-photo" data-photo-preview="${f.id}" alt="" hidden>
+      </div>`;
+    }
+    return `<div class="cl-item" data-field="${f.id}">${head}
+      <div class="sign-pad-wrap">
+        <canvas class="sign-pad" data-sign="${f.id}"></canvas>
+        <button type="button" class="sign-clear" data-sign-clear="${f.id}">Clear</button>
+      </div>
+    </div>`;
+  }).join('');
+
+  const modal = openModal(`
+    <h3>${esc(list.title)}</h3>
+    <p class="sub">${esc(list.venue_name || '')}</p>
+    <div class="cl-fill">${body || '<p class="hint">This checklist has no fields yet.</p>'}</div>
+    <div class="actions">
+      <button type="button" class="btn secondary" id="cl-fill-cancel">Cancel</button>
+      <button type="button" class="btn" id="cl-fill-send">Send</button>
+    </div>
+  `, { wide: true });
+
+  // Yes / Not Applicable
+  modal.querySelectorAll('[data-answer]').forEach((b) => {
+    b.onclick = () => {
+      const id = b.dataset.for;
+      answers[id] = b.dataset.answer;
+      modal.querySelectorAll(`[data-for="${id}"]`).forEach((other) => {
+        other.classList.toggle('secondary', other !== b);
+      });
+    };
+  });
+
+  modal.querySelectorAll('[data-input]').forEach((input) => {
+    const id = input.dataset.input;
+    if (input.type === 'range') {
+      const out = modal.querySelector(`[data-out="${id}"]`);
+      answers[id] = Number(input.value);
+      input.oninput = () => { answers[id] = Number(input.value); out.textContent = input.value; };
+    } else {
+      input.onchange = () => { answers[id] = input.value ? new Date(input.value).toISOString() : ''; };
+    }
+  });
+
+  modal.querySelectorAll('[data-photo-btn]').forEach((b) => {
+    const id = b.dataset.photoBtn;
+    const file = modal.querySelector(`[data-photo="${id}"]`);
+    const preview = modal.querySelector(`[data-photo-preview="${id}"]`);
+    b.onclick = () => file.click();
+    file.onchange = async () => {
+      const chosen = file.files?.[0];
+      if (!chosen) return;
+      try {
+        answers[id] = await shrinkImage(chosen);
+        preview.src = answers[id];
+        preview.hidden = false;
+        b.textContent = '📷 Replace photo';
+      } catch { toast('That photo could not be read'); }
+    };
+  });
+
+  for (const f of list.fields.filter((x) => x.type === 'signature')) {
+    pads[f.id] = initSignaturePad(
+      modal.querySelector(`[data-sign="${f.id}"]`),
+      modal.querySelector(`[data-sign-clear="${f.id}"]`)
+    );
+  }
+
+  modal.querySelector('#cl-fill-cancel').onclick = closeModal;
+  modal.querySelector('#cl-fill-send').onclick = async () => {
+    for (const [id, pad] of Object.entries(pads)) {
+      if (!pad.isEmpty()) answers[id] = pad.toDataURL();
+    }
+    // Catch gaps here so the person is scrolled to the problem rather than
+    // just being told about it.
+    const missing = list.fields.find((f) => (
+      f.required && f.type !== 'section' && f.type !== 'note'
+      && (answers[f.id] === undefined || answers[f.id] === '')
+    ));
+    if (missing) {
+      const el = modal.querySelector(`[data-field="${missing.id}"]`);
+      el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      el?.classList.add('cl-missing');
+      setTimeout(() => el?.classList.remove('cl-missing'), 2000);
+      return toast(`"${missing.label}" still needs an answer`);
+    }
+    const send = modal.querySelector('#cl-fill-send');
+    send.disabled = true;
+    try {
+      await api(`/api/checklists/${list.id}/submit`, { method: 'POST', body: { shift_id: shiftId, answers } });
+      closeModal();
+      toast('Checklist sent ✅');
+      onDone ? onDone() : render();
+    } catch (err) {
+      send.disabled = false;
+      toast(err.message);
+    }
+  };
+}
+
+// Photos come straight off a phone camera, so scale them down before they go
+// over the wire — the server caps uploads at 4 MB.
+function shrinkImage(file, max = 1600) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = reject;
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = reject;
+      img.onload = () => {
+        const scale = Math.min(1, max / Math.max(img.width, img.height));
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.round(img.width * scale);
+        canvas.height = Math.round(img.height * scale);
+        canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL('image/jpeg', 0.82));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+/* --------------------------- submissions (admin) ---------------------------- */
+
+async function renderChecklistSubmissions(id) {
+  if (state.me.role !== 'admin') { location.hash = '#/more'; return; }
+  const { checklist, submissions } = await api(`/api/checklists/${id}/submissions`);
+  const answerable = checklist.fields.filter((f) => f.type !== 'section' && f.type !== 'note');
+
+  const cell = (field, sub) => {
+    const v = sub.answers[field.id];
+    if (v === undefined) return '<span class="sub">—</span>';
+    if (field.type === 'check') return v === 'yes' ? '<span class="cl-yes">Yes</span>' : '<span class="cl-na">N/A</span>';
+    if (field.type === 'datetime') return `${fmtDay(v)} ${fmtTime(v)}`;
+    if (field.type === 'scale') return `<b>${v}</b>/10`;
+    if (field.type === 'signature') return `<img class="cl-sig" src="${v}" alt="Signature">`;
+    return '';
+  };
+
+  shell(checklist.title, `
+    <p class="hint" style="margin-bottom:12px">📍 ${esc(checklist.venue_name || 'No venue')} · ${submissions.length} submission${submissions.length === 1 ? '' : 's'}</p>
+    ${submissions.length ? submissions.map((s) => `
+      <div class="card">
+        <div class="row">
+          <span class="avatar lg" style="background:${esc(s.user_color || '#a8862c')}">${esc(initials(s.user_name || '?'))}</span>
+          <span class="grow">
+            <div style="font-weight:700">${esc(s.user_name || 'Someone')}</div>
+            <div class="sub">${fmtWhen(s.created_at)}${s.shift_title ? ` · ${esc(s.shift_title)}` : ''}</div>
+          </span>
+        </div>
+        <div class="cl-answers">
+          ${answerable.map((f) => `
+            <div class="cl-answer">
+              <span class="grow">${esc(f.label)}</span>
+              <span class="cl-answer-value">${f.type === 'photo'
+                ? (s.photos.includes(f.id)
+                  ? `<img class="cl-photo sm" src="/api/checklists/submissions/${s.id}/photo/${encodeURIComponent(f.id)}" alt="${esc(f.label)}">`
+                  : '<span class="sub">—</span>')
+                : cell(f, s)}</span>
+            </div>`).join('')}
+        </div>
+      </div>`).join('')
+      : '<div class="empty"><div class="big">📋</div>Nothing submitted yet</div>'}
+  `, { back: () => { location.hash = '#/checklists'; } });
+}
+
 /* ------------------------------- availability ------------------------------- */
 
 function minToLabel(min) {
@@ -3531,6 +4036,7 @@ function renderMore() {
   const items = [
     { href: '#/hours', icon: '🕐', label: 'Hours Requests', sub: 'Submit worked hours for approval' },
     { href: '#/forms', icon: '📄', label: 'Documents', sub: 'Read & sign uploaded documents' },
+    { href: '#/checklists', icon: '📋', label: 'Checklists', sub: isAdmin ? 'Build the per-shift checklists for each venue' : 'Shift checklists you fill in' },
     ...(isAdmin ? [
       { href: '#/attire', icon: '👔', label: 'Attire', sub: 'What the team wears on each job' },
       { href: '#/timesheets', icon: '🧾', label: 'Timesheets', sub: 'Review, approve & download hours' },
@@ -3591,6 +4097,8 @@ async function render() {
     else if (view === 'availability') await renderAvailability();
     else if (view === 'attire') await renderAttire();
     else if (view === 'signed') await renderSignedDocs();
+    else if (view === 'checklists') await renderChecklists();
+    else if (view === 'checklist-subs' && arg) await renderChecklistSubmissions(Number(arg));
     else if (view === 'place' && arg) await renderFieldPlacer(Number(arg));
     else if (view === 'updates') await renderUpdates();
     else if (view === 'more') renderMore();

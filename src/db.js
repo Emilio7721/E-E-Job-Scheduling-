@@ -205,6 +205,37 @@ db.exec(`
   );
 `);
 
+// Per-shift checklists. A checklist belongs to a venue, so every job at that
+// venue carries it, and it is filled fresh each shift — unlike `forms`, which
+// are uploaded PDFs a person signs once.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS checklists (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    title      TEXT NOT NULL,
+    venue_id   INTEGER REFERENCES venues(id) ON DELETE CASCADE,
+    fields     TEXT NOT NULL DEFAULT '[]',  -- JSON array of field specs, in order
+    positions  TEXT NOT NULL DEFAULT '[]',  -- JSON array of position ids that must fill it
+    published  INTEGER NOT NULL DEFAULT 1,
+    archived   INTEGER NOT NULL DEFAULT 0,
+    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS checklist_submissions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    checklist_id INTEGER NOT NULL REFERENCES checklists(id) ON DELETE CASCADE,
+    shift_id     INTEGER REFERENCES shifts(id) ON DELETE SET NULL,
+    user_id      INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    answers      TEXT NOT NULL DEFAULT '{}', -- JSON: field id -> answer (signatures inline)
+    photos       TEXT NOT NULL DEFAULT '{}', -- JSON: field id -> file path on disk
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_checklists_venue ON checklists(venue_id);
+  CREATE INDEX IF NOT EXISTS idx_checklist_subs_shift ON checklist_submissions(shift_id);
+  CREATE INDEX IF NOT EXISTS idx_checklist_subs_list ON checklist_submissions(checklist_id);
+`);
+
 // Lightweight migrations for databases created before a column existed.
 function ensureColumn(table, column, ddl) {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
