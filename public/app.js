@@ -565,21 +565,36 @@ function shell(title, contentHTML, { back = null, fab = null } = {}) {
 
 /* ---------------------------- people picker -------------------------------- */
 
+// Someone's position is their main job; what they work on a given shift is set
+// per job when scheduling, so the picker shows the position as context.
+function positionName(user) {
+  return state.positions.find((p) => p.id === user.position_id)?.name || '';
+}
+
 // Search box + filtered, multi-select list of people. Returns markup; pair it
 // with bindPeoplePicker() to keep `selected` in sync as the admin types.
-function peoplePickerHTML(people, selected, { id = 'picker', placeholder = 'Search team members…' } = {}) {
+// Typing matches the name *or* the position, so searching "Server" surfaces
+// everyone who holds that position.
+function peoplePickerHTML(people, selected, { id = 'picker', placeholder = 'Search by name or position…' } = {}) {
   return `
     <input class="picker-search" id="${id}-search" type="search" autocomplete="off" placeholder="${esc(placeholder)}">
     <div class="assignee-list" id="${id}-list">
-      ${people.map((u) => `
-        <button type="button" class="opt ${selected.has(u.id) ? 'on' : ''}" data-user="${u.id}" data-name="${esc(u.name.toLowerCase())}">
+      ${people.map((u) => {
+        const pos = positionName(u);
+        return `
+        <button type="button" class="opt ${selected.has(u.id) ? 'on' : ''}" data-user="${u.id}"
+          data-name="${esc(u.name.toLowerCase())}" data-search="${esc(`${u.name} ${pos}`.toLowerCase())}">
           <span class="avatar" style="background:${esc(u.color)}">${esc(initials(u.name))}</span>
-          <span class="grow">${esc(u.name)}</span>
+          <span class="grow">
+            <span class="opt-name">${esc(u.name)}</span>
+            ${pos ? `<span class="opt-pos">${esc(pos)}</span>` : ''}
+          </span>
           <span class="opt-note"></span>
           <span class="check">✓</span>
-        </button>`).join('')}
+        </button>`;
+      }).join('')}
     </div>
-    <div class="picker-empty" id="${id}-empty" hidden>No one matches that search.</div>`;
+    <div class="picker-empty" id="${id}-empty" hidden>No one matches that name or position.</div>`;
 }
 
 // Greys out anyone who can't work the times currently in the form.
@@ -609,11 +624,12 @@ function bindPeoplePicker(root, selected, { id = 'picker' } = {}) {
   const empty = root.querySelector(`#${id}-empty`);
   const options = [...root.querySelectorAll(`#${id}-list [data-user]`)];
 
+  // Matches the name or the position, so "bar" finds Bar Backs as well as Barbara.
   const filter = () => {
     const q = search.value.trim().toLowerCase();
     let shown = 0;
     for (const opt of options) {
-      const match = !q || opt.dataset.name.includes(q);
+      const match = !q || opt.dataset.search.includes(q);
       opt.hidden = !match;
       if (match) shown++;
     }
@@ -1136,6 +1152,10 @@ function openShiftModal(shift = null) {
       <label>Ends</label><input name="ends_at" type="datetime-local" required value="${endVal}">
       <label>Notes</label><textarea name="notes" rows="2" placeholder="Instructions, dress code, contact…">${esc(shift?.notes || '')}</textarea>
       <label>Assign team members</label>
+      <p class="hint" style="margin:0 0 6px">Search by name or by position — typing a position (e.g. Server) shows everyone who holds it.</p>
+      <div class="picker-quick" id="shift-picker-quick" hidden>
+        <button type="button" class="btn small secondary" id="shift-picker-by-job"></button>
+      </div>
       ${peoplePickerHTML(state.users, selected, { id: 'shift-picker' })}
       <div class="actions">
         ${shift ? `<button type="button" class="btn danger" id="delete-shift">Delete</button>` : ''}
@@ -1144,7 +1164,36 @@ function openShiftModal(shift = null) {
     </form>
   `);
 
-  bindPeoplePicker(modal, selected, { id: 'shift-picker' });
+  const filterPicker = bindPeoplePicker(modal, selected, { id: 'shift-picker' });
+
+  // The job on a shift changes week to week, so offer a one-tap shortcut to the
+  // people whose main position matches the job that's currently picked.
+  const roleSel = modal.querySelector('[name=role_id]');
+  const search = modal.querySelector('#shift-picker-search');
+  const quick = modal.querySelector('#shift-picker-quick');
+  const quickBtn = modal.querySelector('#shift-picker-by-job');
+  const currentJob = () => state.roles.find((r) => r.id === Number(roleSel.value)) || null;
+  const refreshQuick = () => {
+    const job = currentJob();
+    const n = job
+      ? state.users.filter((u) => positionName(u).toLowerCase() === job.name.toLowerCase()).length
+      : 0;
+    quick.hidden = !n;
+    if (!n) return;
+    const on = search.value.trim().toLowerCase() === job.name.toLowerCase();
+    quickBtn.textContent = `Only ${job.name} (${n})`;
+    quickBtn.classList.toggle('secondary', !on);
+  };
+  quickBtn.onclick = () => {
+    const job = currentJob();
+    if (!job) return;
+    search.value = search.value.trim().toLowerCase() === job.name.toLowerCase() ? '' : job.name;
+    filterPicker();
+    refreshQuick();
+  };
+  search.addEventListener('input', refreshQuick);
+  roleSel.addEventListener('change', refreshQuick);
+  refreshQuick();
 
   // Keep the availability markers in step with whatever times are chosen.
   const refreshConflicts = () => {
@@ -2257,7 +2306,7 @@ async function renderRoles() {
   const { roles } = await api('/api/roles');
   state.roles = roles;
   shell('Jobs', `
-    <p class="hint" style="margin-bottom:12px">Jobs your team works (Server, Bar Back, Set Up…). Used when scheduling and when clocking out. Team positions are managed separately in <b>Positions</b>.</p>
+    <p class="hint" style="margin-bottom:12px">Jobs your team works (Server, Bar Back, Set Up…). Used when scheduling and when clocking out — the job changes shift to shift. Someone's <b>main</b> job is their position: pull this whole list into <b>Positions</b> from that page.</p>
     ${roles.length ? roles.map((r) => `
       <div class="card row">
         <span class="venue-icon" style="background:var(--brand-soft);color:var(--text)">🧑‍🍳</span>
@@ -2295,10 +2344,24 @@ async function renderRoles() {
 
 async function renderPositions() {
   if (state.me.role !== 'admin') { location.hash = '#/more'; return; }
-  const { positions } = await api('/api/positions');
+  const [{ positions }, { roles }] = await Promise.all([api('/api/positions'), api('/api/roles')]);
   state.positions = positions;
+  state.roles = roles;
+
+  // Every job should be available as a position: a position is someone's main
+  // job, while the job they work changes shift to shift.
+  const have = new Set(positions.map((p) => p.name.trim().toLowerCase()));
+  const missing = roles.filter((r) => r.name.trim() && !have.has(r.name.trim().toLowerCase()));
+
   shell('Positions', `
-    <p class="hint" style="margin-bottom:12px">Team positions you assign in <b>Team</b>. New positions are <b>member</b> level — tap the Member button to grant admin permission, which promotes everyone holding it.</p>
+    <p class="hint" style="margin-bottom:12px">A position is someone's <b>main job</b> — assign it in <b>Team</b>. The job they actually work changes shift to shift, so that's picked per job when scheduling. New positions are <b>member</b> level — tap the Member button to grant admin permission, which promotes everyone holding it.</p>
+    ${roles.length ? `<div class="card">
+      <div style="font-weight:700">${missing.length ? 'Bring the job list over' : 'Every job is a position ✓'}</div>
+      <div class="sub" style="margin:3px 0 ${missing.length ? '10px' : '0'}">${missing.length
+        ? `${missing.length} of your ${roles.length} job${roles.length === 1 ? '' : 's'} ${missing.length === 1 ? 'is' : 'are'} not a position yet: ${esc(missing.slice(0, 6).map((r) => r.name).join(', '))}${missing.length > 6 ? `, +${missing.length - 6} more` : ''}`
+        : `All ${roles.length} job${roles.length === 1 ? '' : 's'} from <b>Jobs</b> can be set as someone's main position.`}</div>
+      ${missing.length ? `<button class="btn small" id="import-jobs">Add ${missing.length} job${missing.length === 1 ? '' : 's'} as positions</button>` : ''}
+    </div>` : ''}
     ${positions.length ? positions.map((r) => `
       <div class="card row">
         <span class="grow">
@@ -2317,6 +2380,15 @@ async function renderPositions() {
     // New positions are member-level; grant admin from the list when needed.
     await api('/api/positions', { method: 'POST', body: { name, is_admin: false } });
     toast('Position added as member level');
+    render();
+  };
+  const importBtn = document.getElementById('import-jobs');
+  if (importBtn) importBtn.onclick = async () => {
+    importBtn.disabled = true;
+    try {
+      const { added } = await api('/api/positions/import-jobs', { method: 'POST' });
+      toast(added ? `${added} job${added === 1 ? '' : 's'} added as positions` : 'Positions already cover every job');
+    } catch (err) { toast(err.message); }
     render();
   };
   document.querySelectorAll('[data-adm-pos]').forEach((b) => {
@@ -3027,207 +3099,6 @@ async function openFormStatus(formId) {
     done.forEach((p, i) => setTimeout(
       () => window.open(`/api/forms/${formId}/submissions/${p.submission_id}/pdf`, '_blank'), i * 400));
   };
-}
-
-/* ------------------------------ hours requests ------------------------------ */
-
-function openHourRequestModal() {
-  const today = dateKey(new Date());
-  const modal = openModal(`
-    <h3>Request hours</h3>
-    <p class="sub">For time you worked but didn't clock — sent to a manager for approval.</p>
-    <form id="hours-form">
-      <label>Venue / job</label>
-      <select name="venue_id">
-        <option value="">No venue</option>
-        ${state.venues.map((v) => `<option value="${v.id}">${esc(v.name)}</option>`).join('')}
-      </select>
-      <label>Job</label>
-      <select name="role_id">
-        <option value="">No job</option>
-        ${state.roles.map((r) => `<option value="${r.id}">${esc(r.name)}</option>`).join('')}
-      </select>
-      <label>Date</label><input name="date" type="date" required value="${today}">
-      <div style="display:flex;gap:10px">
-        <span style="flex:1"><label>Starts</label><input name="start" type="time" required value="09:00"></span>
-        <span style="flex:1"><label>Ends</label><input name="end" type="time" required value="17:00"></span>
-      </div>
-      <label>Note (optional)</label><textarea name="note" rows="2" placeholder="Attach a note to your request…"></textarea>
-      <p class="hint">All requests are sent for a manager's approval.</p>
-      <div class="actions"><button type="submit" class="btn">Send for approval</button></div>
-    </form>
-  `);
-  modal.querySelector('#hours-form').onsubmit = async (e) => {
-    e.preventDefault();
-    const fd = new FormData(e.target);
-    const starts = new Date(`${fd.get('date')}T${fd.get('start')}`);
-    let ends = new Date(`${fd.get('date')}T${fd.get('end')}`);
-    if (ends <= starts) ends = new Date(ends.getTime() + 24 * 3600000); // overnight shift
-    try {
-      await api('/api/hour-requests', {
-        method: 'POST',
-        body: {
-          venue_id: fd.get('venue_id') ? Number(fd.get('venue_id')) : null,
-          role_id: fd.get('role_id') ? Number(fd.get('role_id')) : null,
-          starts_at: starts.toISOString(),
-          ends_at: ends.toISOString(),
-          note: fd.get('note') || '',
-        },
-      });
-      closeModal(); toast('Sent for approval ✅');
-      if (route().view === 'hours') render();
-    } catch (err) { toast(err.message); }
-  };
-}
-
-async function renderHours() {
-  const { requests } = await api('/api/hour-requests');
-  const isAdmin = state.me.role === 'admin';
-  const pending = requests.filter((r) => r.status === 'pending');
-  const rest = requests.filter((r) => r.status !== 'pending');
-
-  const reqCard = (r) => {
-    const hours = ((new Date(r.ends_at) - new Date(r.starts_at)) / 3600000).toFixed(1);
-    return `
-    <div class="card row">
-      <span style="font-size:24px">🕐</span>
-      <span class="grow">
-        <div style="font-weight:700">${isAdmin ? esc(r.user_name) + ' · ' : ''}${hours}h</div>
-        <div class="sub">${fmtDay(r.starts_at)} · ${fmtTime(r.starts_at)} – ${fmtTime(r.ends_at)}</div>
-        ${r.venue_name || r.role_name ? `<div class="sub">${[r.role_name, r.venue_name].filter(Boolean).map(esc).join(' @ ')}</div>` : ''}
-        ${r.note ? `<div class="sub">${esc(r.note)}</div>` : ''}
-      </span>
-      ${r.status === 'pending' && isAdmin ? `
-        <button class="btn small" data-decide-hours="approved" data-id="${r.id}">✓</button>
-        <button class="btn small danger" data-decide-hours="denied" data-id="${r.id}">✗</button>` : `
-        <span class="status-tag ${r.status}">${r.status}</span>`}
-      ${r.status === 'pending' && !isAdmin && r.user_id === state.me.id ? `<button class="icon-btn" data-cancel-hours="${r.id}" title="Withdraw">🗑️</button>` : ''}
-    </div>`;
-  };
-
-  shell('Hours Requests', `
-    ${pending.length ? `<div class="section-title">Pending${isAdmin ? ' approval' : ''}</div>${pending.map(reqCard).join('')}` : ''}
-    <div class="section-title">History</div>
-    ${rest.length ? rest.map(reqCard).join('') : '<div class="empty"><div class="big">🕐</div>No hours requests yet.<br>Approved requests land straight in the timesheet.</div>'}
-  `, { back: () => { location.hash = '#/more'; }, fab: true });
-
-  document.getElementById('fab').onclick = () => openHourRequestModal();
-  document.querySelectorAll('[data-decide-hours]').forEach((b) => {
-    b.onclick = async () => {
-      await api(`/api/hour-requests/${b.dataset.id}/decide`, { method: 'POST', body: { status: b.dataset.decideHours } });
-      toast(b.dataset.decideHours === 'approved' ? 'Approved — added to the timesheet' : 'Request denied');
-      render();
-    };
-  });
-  document.querySelectorAll('[data-cancel-hours]').forEach((b) => {
-    b.onclick = async () => {
-      await api(`/api/hour-requests/${b.dataset.cancelHours}`, { method: 'DELETE' });
-      render();
-    };
-  });
-}
-
-/* ---------------------------------- roles ----------------------------------- */
-
-async function renderRoles() {
-  if (state.me.role !== 'admin') { location.hash = '#/more'; return; }
-  const { roles } = await api('/api/roles');
-  state.roles = roles;
-  shell('Jobs', `
-    <p class="hint" style="margin-bottom:12px">Jobs your team works (Server, Bar Back, Set Up…). Used when scheduling and when clocking out. Team positions are managed separately in <b>Positions</b>.</p>
-    ${roles.length ? roles.map((r) => `
-      <div class="card row">
-        <span class="venue-icon" style="background:var(--brand-soft);color:var(--text)">🧑‍🍳</span>
-        <span class="grow" style="font-weight:700">${esc(r.name)}</span>
-        <button class="icon-btn" data-edit-role="${r.id}">✏️</button>
-        <button class="icon-btn" data-del-role="${r.id}">🗑️</button>
-      </div>`).join('') : '<div class="empty"><div class="big">🧑‍🍳</div>No jobs yet — tap ＋ to add Server, Bar Back, Set Up…</div>'}
-  `, { back: () => { location.hash = '#/more'; }, fab: true });
-
-  document.getElementById('fab').onclick = async () => {
-    const name = prompt('New job name (e.g. Server, Bar Back):');
-    if (!name?.trim()) return;
-    await api('/api/roles', { method: 'POST', body: { name } });
-    render();
-  };
-  document.querySelectorAll('[data-edit-role]').forEach((b) => {
-    b.onclick = async () => {
-      const role = roles.find((r) => r.id === Number(b.dataset.editRole));
-      const name = prompt('Rename job:', role.name);
-      if (!name?.trim() || name === role.name) return;
-      await api(`/api/roles/${role.id}`, { method: 'PATCH', body: { name } });
-      render();
-    };
-  });
-  document.querySelectorAll('[data-del-role]').forEach((b) => {
-    b.onclick = async () => {
-      if (!confirm('Delete this job? Past timesheet entries keep their label.')) return;
-      await api(`/api/roles/${b.dataset.delRole}`, { method: 'DELETE' });
-      render();
-    };
-  });
-}
-
-/* -------------------------------- positions --------------------------------- */
-
-async function renderPositions() {
-  if (state.me.role !== 'admin') { location.hash = '#/more'; return; }
-  const { positions } = await api('/api/positions');
-  state.positions = positions;
-  shell('Positions', `
-    <p class="hint" style="margin-bottom:12px">Team positions you assign in <b>Team</b>. New positions are <b>member</b> level — tap the Member button to grant admin permission, which promotes everyone holding it.</p>
-    ${positions.length ? positions.map((r) => `
-      <div class="card row">
-        <span class="grow">
-          <div style="font-weight:700">${esc(r.name)}</div>
-          <div class="sub">${r.is_admin ? 'Grants admin access' : 'Member access'}</div>
-        </span>
-        <button class="btn small ${r.is_admin ? '' : 'secondary'}" data-adm-pos="${r.id}">${r.is_admin ? 'Admin ✓' : 'Member'}</button>
-        <button class="icon-btn" data-edit-pos="${r.id}">✏️</button>
-        <button class="icon-btn" data-del-pos="${r.id}">🗑️</button>
-      </div>`).join('') : '<div class="empty"><div class="big">👥</div>No positions yet — tap ＋ to add e.g. Operations Manager, Shift Lead…</div>'}
-  `, { back: () => { location.hash = '#/more'; }, fab: true });
-
-  document.getElementById('fab').onclick = async () => {
-    const name = prompt('New position name (e.g. Operations Manager, Shift Lead):');
-    if (!name?.trim()) return;
-    // New positions are member-level; grant admin from the list when needed.
-    await api('/api/positions', { method: 'POST', body: { name, is_admin: false } });
-    toast('Position added as member level');
-    render();
-  };
-  document.querySelectorAll('[data-adm-pos]').forEach((b) => {
-    b.onclick = async () => {
-      const position = positions.find((r) => r.id === Number(b.dataset.admPos));
-      const grant = !position.is_admin;
-      if (!confirm(grant
-        ? `Give ADMIN permission to "${position.name}"? Everyone holding it becomes an admin.`
-        : `Remove admin permission from "${position.name}"? Everyone holding it becomes a regular member.`)) return;
-      try {
-        await api(`/api/positions/${position.id}`, { method: 'PATCH', body: { is_admin: grant } });
-        toast(grant ? 'Position now grants admin access' : 'Position is member-level now');
-      } catch (err) { toast(err.message); }
-      state.users = (await api('/api/users')).users;
-      render();
-    };
-  });
-  document.querySelectorAll('[data-edit-pos]').forEach((b) => {
-    b.onclick = async () => {
-      const position = positions.find((r) => r.id === Number(b.dataset.editPos));
-      const name = prompt('Rename position:', position.name);
-      if (!name?.trim() || name === position.name) return;
-      await api(`/api/positions/${position.id}`, { method: 'PATCH', body: { name } });
-      render();
-    };
-  });
-  document.querySelectorAll('[data-del-pos]').forEach((b) => {
-    b.onclick = async () => {
-      if (!confirm('Delete this position? People holding it keep their current access level.')) return;
-      await api(`/api/positions/${b.dataset.delPos}`, { method: 'DELETE' });
-      state.users = (await api('/api/users')).users;
-      render();
-    };
-  });
 }
 
 /* ---------------------------------- attire ---------------------------------- */
