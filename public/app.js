@@ -16,6 +16,8 @@ const state = {
   notifications: [],
   authMode: 'login',
   kbQuery: '',
+  clWeek: null,      // Monday of the checklist week being reviewed
+  clSubsWeek: null,  // same, inside one checklist's own week view
   weekStart: startOfWeek(new Date()),
   selectedDay: dateKey(new Date()),
   scheduleFilter: 'all', // 'all' | 'mine'
@@ -2479,9 +2481,63 @@ function newFieldId() {
   return `f${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 }
 
+// Monday-anchored, matching the workweek the server groups submissions into.
+function mondayKey(d) {
+  return dateKey(startOfWeek(d));
+}
+
+function shiftWeek(week, days) {
+  const d = new Date(`${week}T12:00:00`);
+  d.setDate(d.getDate() + days);
+  return dateKey(d);
+}
+
+// "Aug 3 – Aug 9". A year is spelled out only where it isn't the current one —
+// which means both ends of a week that straddles New Year.
+function weekLabel(week) {
+  const end = shiftWeek(week, 6);
+  const now = String(new Date().getFullYear());
+  const day = (key, withYear) => new Date(`${key}T12:00:00`).toLocaleDateString([], {
+    month: 'short', day: 'numeric', ...(withYear ? { year: 'numeric' } : {}),
+  });
+  const [from, to] = [week.slice(0, 4), end.slice(0, 4)];
+  if (from !== to) return `${day(week, from !== now)} – ${day(end, to !== now)}`;
+  return `${day(week)} – ${day(end, from !== now)}`;
+}
+
+function weekSubtitle(week, count) {
+  const here = week === mondayKey(new Date()) ? 'This week · ' : '';
+  return `${here}${count} submitted`;
+}
+
+// Downloads a PDF, surfacing the server's reason instead of saving an error page.
+async function downloadPdf(url, filename) {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return toast((await res.json().catch(() => ({}))).error || 'Download failed');
+    const blob = await res.blob();
+    const href = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = href;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(href);
+    toast('PDF downloaded');
+  } catch (err) { toast(err.message); }
+}
+
 async function renderChecklists() {
   const isAdmin = state.me.role === 'admin';
-  const [{ checklists }, { venues }] = await Promise.all([api('/api/checklists'), api('/api/venues')]);
+  state.clWeek = state.clWeek || mondayKey(new Date());
+  state.clSubsWeek = null; // coming back here resets where a checklist opens
+  // Admins read a week at a time; members just need the list they have to fill.
+  const [data, { venues }] = await Promise.all([
+    isAdmin ? api(`/api/checklists/weekly?week=${state.clWeek}`) : api('/api/checklists'),
+    api('/api/venues'),
+  ]);
+  const checklists = data.checklists;
+  const week = isAdmin ? data.week : null;
+  if (isAdmin) state.clWeek = week;
   state.venues = venues;
 
   const byVenue = new Map();
@@ -2490,11 +2546,19 @@ async function renderChecklists() {
     if (!byVenue.has(key)) byVenue.set(key, []);
     byVenue.get(key).push(c);
   }
+  const weekTotal = isAdmin ? checklists.reduce((n, c) => n + c.submissions.length, 0) : 0;
 
   shell('Checklists', `
     <p class="hint" style="margin-bottom:12px">${isAdmin
-      ? 'Checklists belong to a <b>venue</b>, so every job there carries them. Leads holding one of the checklist’s positions fill it in fresh each shift.'
+      ? 'Checklists belong to a <b>venue</b>, so every job there carries them. Leads holding one of the checklist’s positions fill it in fresh each shift — and every week stands on its own, so you can pull a week’s record whenever you need it.'
       : 'Fill these in on each shift you work. Open the job from your schedule to submit one against that shift.'}</p>
+    ${isAdmin ? `
+    <div class="week-nav">
+      <button class="icon-btn" id="cl-week-prev">‹</button>
+      <div class="range">${weekLabel(week)}<div class="sub" style="font-weight:500">${
+        weekSubtitle(week, weekTotal)}</div></div>
+      <button class="icon-btn" id="cl-week-next">›</button>
+    </div>` : ''}
     ${checklists.length ? [...byVenue].map(([venue, lists]) => `
       <div class="section-title">📍 ${esc(venue)}</div>
       ${lists.map((c) => `
@@ -2505,7 +2569,11 @@ async function renderChecklists() {
               <div style="font-weight:700">${esc(c.title)}</div>
               <div class="sub">${c.fields.filter((f) => f.type === 'check').length} check item${
                 c.fields.filter((f) => f.type === 'check').length === 1 ? '' : 's'} · ${c.fields.length} field${c.fields.length === 1 ? '' : 's'}${
-                isAdmin ? ` · ${c.submission_count} submission${c.submission_count === 1 ? '' : 's'}` : ''}</div>
+                isAdmin ? ` · ${c.submission_count} all time` : ''}</div>
+              ${isAdmin ? `<div class="sub"><b class="${c.submissions.length ? 'cl-yes' : 'cl-na'}">${
+                c.submissions.length} this week</b>${c.submissions.length
+                  ? ` · last by ${esc(c.submissions[0].user_name || 'someone')}`
+                  : ''}</div>` : ''}
               <div class="sub">${c.positions.length
                 ? esc(c.positions.map((id) => state.positions.find((p) => p.id === id)?.name).filter(Boolean).join(', '))
                 : '<b>No positions yet</b> — nobody but admins can fill this'}</div>
@@ -2515,6 +2583,7 @@ async function renderChecklists() {
           ${isAdmin ? `<div class="shift-actions">
             <button class="btn small secondary" data-cl-edit="${c.id}">Edit</button>
             <button class="btn small secondary" data-cl-subs="${c.id}">Submissions</button>
+            <button class="btn small secondary" data-cl-pdf="${c.id}">⬇️ Week PDF</button>
             <button class="btn small secondary" data-cl-pub="${c.id}">${c.published ? 'Unpublish' : 'Publish'}</button>
             <button class="btn small danger" data-cl-del="${c.id}">Delete</button>
           </div>` : ''}
@@ -2522,15 +2591,33 @@ async function renderChecklists() {
       : `<div class="empty"><div class="big">📋</div>${isAdmin
         ? 'No checklists yet — tap ＋ to build one for a venue'
         : 'No checklists are assigned to your position yet'}</div>`}
+    ${isAdmin && checklists.length ? `
+      <button class="btn" id="cl-week-pdf" style="margin-top:10px">⬇️ Download this week (PDF)</button>
+      <p class="hint">Every checklist above, with each answer, photo and signature turned in between
+        ${weekLabel(week)}.</p>` : ''}
   `, { back: () => { location.hash = '#/more'; }, fab: isAdmin });
 
   if (isAdmin) {
+    document.getElementById('cl-week-prev').onclick = () => { state.clWeek = shiftWeek(week, -7); render(); };
+    document.getElementById('cl-week-next').onclick = () => { state.clWeek = shiftWeek(week, 7); render(); };
+    document.getElementById('cl-week-pdf')?.addEventListener('click', () => {
+      downloadPdf(`/api/checklists/weekly/pdf?week=${week}`, `checklists-week-of-${week}.pdf`);
+    });
+    document.querySelectorAll('[data-cl-pdf]').forEach((b) => {
+      b.onclick = () => downloadPdf(
+        `/api/checklists/weekly/pdf?week=${week}&checklist=${b.dataset.clPdf}`,
+        `checklist-${b.dataset.clPdf}-week-of-${week}.pdf`
+      );
+    });
     document.getElementById('fab').onclick = () => openChecklistEditor(null);
     document.querySelectorAll('[data-cl-edit]').forEach((b) => {
       b.onclick = () => openChecklistEditor(checklists.find((c) => c.id === Number(b.dataset.clEdit)));
     });
     document.querySelectorAll('[data-cl-subs]').forEach((b) => {
-      b.onclick = () => { location.hash = `#/checklist-subs/${b.dataset.clSubs}`; };
+      b.onclick = () => {
+        state.clSubsWeek = week; // open on the week being looked at here
+        location.hash = `#/checklist-subs/${b.dataset.clSubs}`;
+      };
     });
     document.querySelectorAll('[data-cl-pub]').forEach((b) => {
       b.onclick = async () => {
@@ -2551,6 +2638,79 @@ async function renderChecklists() {
   }
 }
 
+/* ---------------------------- mobile preview -------------------------------- */
+/* A phone sitting beside the editor, showing what the team will actually get.
+   Used by the checklist builder and the knowledge base editor alike, so an
+   admin never has to publish something to find out how it reads. */
+
+const PHONE_STATUS_ICONS = `
+  <svg class="phone-icons" viewBox="0 0 46 12" width="46" height="12" fill="currentColor" aria-hidden="true">
+    <rect x="0" y="7.5" width="2.6" height="4.5" rx="1"/>
+    <rect x="4.2" y="5.5" width="2.6" height="6.5" rx="1"/>
+    <rect x="8.4" y="3" width="2.6" height="9" rx="1"/>
+    <rect x="12.6" y="0.5" width="2.6" height="11.5" rx="1"/>
+    <path d="M18.6 4.6a8.2 8.2 0 0 1 9.8 0l-1.4 1.8a6 6 0 0 0-7 0z"/>
+    <path d="M20.9 7.6a4.4 4.4 0 0 1 5.2 0l-2.6 3.3z"/>
+    <rect x="31" y="2" width="12.4" height="8" rx="2.4" fill="none" stroke="currentColor" stroke-width="1"/>
+    <rect x="32.3" y="3.3" width="8.6" height="5.4" rx="1.3"/>
+    <path d="M44.6 4.6v2.8a1.7 1.7 0 0 0 0-2.8z"/>
+  </svg>`;
+
+// `action` is the button at the foot of the phone; pass '' for a screen that
+// has nothing to submit.
+function phonePreviewHTML(id, { title = '', subtitle = '', action = '' } = {}) {
+  return `
+    <div class="phone-preview" id="${id}">
+      <div class="phone-preview-label">Mobile Preview</div>
+      <div class="phone">
+        <div class="phone-status"><span>9:41</span>${PHONE_STATUS_ICONS}</div>
+        <div class="phone-title" data-phone-title>${esc(title)}</div>
+        <div class="phone-sub" data-phone-sub>${esc(subtitle)}</div>
+        <div class="phone-screen" data-phone-screen></div>
+        ${action ? `<div class="phone-foot"><button type="button" class="phone-send" disabled>${esc(action)}</button></div>` : ''}
+        <div class="phone-home"></div>
+      </div>
+      <button type="button" class="phone-reset" data-phone-reset>↺ Reset preview</button>
+    </div>`;
+}
+
+// Wires one preview up. `paint` returns the screen's HTML; it is called again
+// on Reset, which is what clears any Yes / Not Applicable taps.
+function bindPhonePreview(root, paint, { onPaint = null } = {}) {
+  const screen = root.querySelector('[data-phone-screen]');
+  // Live edits keep their place in the screen; only Reset scrolls back to the
+  // top, so typing at the bottom of a long article does not jump.
+  const repaint = () => {
+    const at = screen.scrollTop;
+    screen.innerHTML = paint();
+    screen.scrollTop = at;
+    onPaint?.(screen);
+  };
+  root.querySelector('[data-phone-reset]').onclick = () => { repaint(); screen.scrollTop = 0; };
+  repaint();
+  return {
+    repaint,
+    setTitle: (text) => { root.querySelector('[data-phone-title]').textContent = text; },
+    setSubtitle: (text) => { root.querySelector('[data-phone-sub]').textContent = text; },
+  };
+}
+
+// Taps inside a checklist preview are for looks only — nothing is recorded and
+// nothing is uploaded, so the file picker and signature pad stay inert.
+function bindChecklistPreviewTaps(screen) {
+  screen.querySelectorAll('[data-answer]').forEach((b) => {
+    b.onclick = () => {
+      screen.querySelectorAll(`[data-for="${b.dataset.for}"]`)
+        .forEach((other) => other.classList.toggle('secondary', other !== b));
+    };
+  });
+  screen.querySelectorAll('input[type="range"]').forEach((input) => {
+    const out = screen.querySelector(`[data-out="${input.dataset.input}"]`);
+    input.oninput = () => { out.textContent = input.value; };
+  });
+  screen.querySelectorAll('[data-photo-btn], [data-sign-clear]').forEach((b) => { b.disabled = true; });
+}
+
 /* ---------------------------- checklist builder ----------------------------- */
 
 function openChecklistEditor(list) {
@@ -2565,6 +2725,9 @@ function openChecklistEditor(list) {
 
   const modal = openModal('<div id="cl-editor"></div>', { wide: true });
   const panel = modal.querySelector('#cl-editor');
+
+  const previewTitle = () => draft.title.trim() || 'Untitled checklist';
+  const previewVenue = () => state.venues.find((v) => v.id === draft.venue_id)?.name || 'No venue yet';
 
   const draw = () => {
     panel.innerHTML = `
@@ -2608,15 +2771,30 @@ function openChecklistEditor(list) {
           <button type="button" class="pill" data-cl-add="${type}" title="${esc(spec.hint)}">${spec.icon} ${spec.label}</button>`).join('')}
       </div>
 
+      ${phonePreviewHTML('cl-preview', { title: previewTitle(), subtitle: previewVenue(), action: '➤ Send' })}
+
       <div class="actions">
         <button type="button" class="btn secondary" id="cl-cancel">Cancel</button>
         <button type="button" class="btn" id="cl-save">${draft.id ? 'Save changes' : 'Create checklist'}</button>
       </div>`;
 
+    const preview = bindPhonePreview(
+      modal.querySelector('#cl-preview'),
+      () => (draft.fields.length
+        ? `<div class="cl-fill">${checklistFieldsHTML(draft.fields)}</div>`
+        : '<p class="phone-empty">Add a field and it shows up here, exactly as the team will see it on their phone.</p>'),
+      { onPaint: bindChecklistPreviewTaps }
+    );
+
     const title = modal.querySelector('#cl-title');
     const venue = modal.querySelector('#cl-venue');
-    title.oninput = () => { draft.title = title.value; };
-    venue.onchange = () => { draft.venue_id = venue.value ? Number(venue.value) : null; };
+    // Retyping the title must not tear down the panel, so the phone's header is
+    // patched in place instead of redrawing everything.
+    title.oninput = () => { draft.title = title.value; preview.setTitle(previewTitle()); };
+    venue.onchange = () => {
+      draft.venue_id = venue.value ? Number(venue.value) : null;
+      preview.setSubtitle(previewVenue());
+    };
 
     modal.querySelectorAll('[data-cl-pos]').forEach((b) => {
       b.onclick = () => {
@@ -2725,11 +2903,11 @@ function openChecklistEditor(list) {
 
 /* ----------------------------- filling one in ------------------------------- */
 
-function openChecklistFill(list, shiftId = null, onDone = null) {
-  const answers = {};
-  const pads = {};
-
-  const body = list.fields.map((f) => {
+// The phone view of a checklist, shared by the real fill-in sheet and the
+// builder's mobile preview — one renderer, so the preview cannot drift from
+// what the lead actually gets.
+function checklistFieldsHTML(fields) {
+  return fields.map((f) => {
     const req = f.required ? ' <span class="cl-req">*</span>' : '';
     if (f.type === 'section') return `<div class="cl-section">${esc(f.label)}</div>`;
     if (f.type === 'note') return `<div class="cl-note">${esc(f.label)}</div>`;
@@ -2775,6 +2953,12 @@ function openChecklistFill(list, shiftId = null, onDone = null) {
       </div>
     </div>`;
   }).join('');
+}
+
+function openChecklistFill(list, shiftId = null, onDone = null) {
+  const answers = {};
+  const pads = {};
+  const body = checklistFieldsHTML(list.fields);
 
   const modal = openModal(`
     <h3>${esc(list.title)}</h3>
@@ -2891,8 +3075,14 @@ function shrinkImage(file, max = 1600) {
 
 async function renderChecklistSubmissions(id) {
   if (state.me.role !== 'admin') { location.hash = '#/more'; return; }
-  const { checklist, submissions } = await api(`/api/checklists/${id}/submissions`);
+  // The week carries over from the Checklists screen, so paging there and then
+  // opening a checklist lands on the same week.
+  const asked = state.clSubsWeek || state.clWeek;
+  const { checklist, submissions, week, weeks, days } =
+    await api(`/api/checklists/${id}/submissions${asked ? `?week=${asked}` : ''}`);
+  state.clSubsWeek = week;
   const answerable = checklist.fields.filter((f) => f.type !== 'section' && f.type !== 'note');
+  const byDay = days.map((d) => ({ day: d, subs: submissions.filter((s) => s.day === d) }));
 
   const cell = (field, sub) => {
     const v = sub.answers[field.id];
@@ -2904,31 +3094,64 @@ async function renderChecklistSubmissions(id) {
     return '';
   };
 
+  const submissionCard = (s) => `
+    <div class="card">
+      <div class="row">
+        <span class="avatar lg" style="background:${esc(s.user_color || '#a8862c')}">${esc(initials(s.user_name || '?'))}</span>
+        <span class="grow">
+          <div style="font-weight:700">${esc(s.user_name || 'Someone')}</div>
+          <div class="sub">${fmtWhen(s.created_at)}${s.shift_title ? ` · ${esc(s.shift_title)}` : ''}</div>
+        </span>
+      </div>
+      <div class="cl-answers">
+        ${answerable.map((f) => `
+          <div class="cl-answer">
+            <span class="grow">${esc(f.label)}</span>
+            <span class="cl-answer-value">${f.type === 'photo'
+              ? (s.photos.includes(f.id)
+                ? `<img class="cl-photo sm" src="/api/checklists/submissions/${s.id}/photo/${encodeURIComponent(f.id)}" alt="${esc(f.label)}">`
+                : '<span class="sub">—</span>')
+              : cell(f, s)}</span>
+          </div>`).join('')}
+      </div>
+    </div>`;
+
   shell(checklist.title, `
-    <p class="hint" style="margin-bottom:12px">📍 ${esc(checklist.venue_name || 'No venue')} · ${submissions.length} submission${submissions.length === 1 ? '' : 's'}</p>
-    ${submissions.length ? submissions.map((s) => `
-      <div class="card">
-        <div class="row">
-          <span class="avatar lg" style="background:${esc(s.user_color || '#a8862c')}">${esc(initials(s.user_name || '?'))}</span>
-          <span class="grow">
-            <div style="font-weight:700">${esc(s.user_name || 'Someone')}</div>
-            <div class="sub">${fmtWhen(s.created_at)}${s.shift_title ? ` · ${esc(s.shift_title)}` : ''}</div>
-          </span>
-        </div>
-        <div class="cl-answers">
-          ${answerable.map((f) => `
-            <div class="cl-answer">
-              <span class="grow">${esc(f.label)}</span>
-              <span class="cl-answer-value">${f.type === 'photo'
-                ? (s.photos.includes(f.id)
-                  ? `<img class="cl-photo sm" src="/api/checklists/submissions/${s.id}/photo/${encodeURIComponent(f.id)}" alt="${esc(f.label)}">`
-                  : '<span class="sub">—</span>')
-                : cell(f, s)}</span>
-            </div>`).join('')}
-        </div>
-      </div>`).join('')
-      : '<div class="empty"><div class="big">📋</div>Nothing submitted yet</div>'}
+    <p class="hint" style="margin-bottom:12px">📍 ${esc(checklist.venue_name || 'No venue')}</p>
+    <div class="week-nav">
+      <button class="icon-btn" id="cl-sub-prev">‹</button>
+      <div class="range">${weekLabel(week)}<div class="sub" style="font-weight:500">${
+        weekSubtitle(week, submissions.length)}</div></div>
+      <button class="icon-btn" id="cl-sub-next">›</button>
+    </div>
+    ${submissions.length
+      ? byDay.filter((d) => d.subs.length).map((d) => `
+        <div class="section-title">${new Date(`${d.day}T12:00:00`).toLocaleDateString([], {
+          weekday: 'long', month: 'short', day: 'numeric',
+        })} · ${d.subs.length}</div>
+        ${d.subs.slice().reverse().map(submissionCard).join('')}`).join('')
+      : `<div class="empty"><div class="big">📋</div>Nothing submitted in this week</div>`}
+    <button class="btn" id="cl-sub-pdf" style="margin-top:10px" ${submissions.length ? '' : 'disabled'}>
+      ⬇️ Download this week (PDF)
+    </button>
+    ${weeks.filter((w) => w.count).length ? `
+      <div class="section-title" style="margin-top:16px">Weeks with submissions</div>
+      <div class="pos-picker">
+        ${weeks.filter((w) => w.count).map((w) => `
+          <button type="button" class="pill ${w.week === week ? 'active' : ''}" data-cl-jump="${w.week}">
+            ${weekLabel(w.week)} · ${w.count}</button>`).join('')}
+      </div>` : ''}
   `, { back: () => { location.hash = '#/checklists'; } });
+
+  document.getElementById('cl-sub-prev').onclick = () => { state.clSubsWeek = shiftWeek(week, -7); render(); };
+  document.getElementById('cl-sub-next').onclick = () => { state.clSubsWeek = shiftWeek(week, 7); render(); };
+  document.querySelectorAll('[data-cl-jump]').forEach((b) => {
+    b.onclick = () => { state.clSubsWeek = b.dataset.clJump; render(); };
+  });
+  document.getElementById('cl-sub-pdf').onclick = () => downloadPdf(
+    `/api/checklists/weekly/pdf?week=${week}&checklist=${checklist.id}`,
+    `checklist-${checklist.id}-week-of-${week}.pdf`
+  );
 }
 
 /* ----------------------------- knowledge base ------------------------------- */
@@ -3129,8 +3352,11 @@ function openArticleEditor(article, all = []) {
 ## FOOD SAFETY
 - Touch your face? **Change your gloves.**">${esc(article?.body || '')}</textarea>
 
-    <div class="section-title" style="margin-top:14px">Preview</div>
-    <div class="kb-body" id="kb-preview"></div>
+    ${phonePreviewHTML('kb-preview', {
+      title: article?.title || 'Untitled article',
+      subtitle: article?.folder || 'General',
+      action: 'Close',
+    })}
 
     <label class="check-label">
       <input type="checkbox" id="kb-published" style="width:auto" ${article?.published !== 0 ? 'checked' : ''}>
@@ -3145,10 +3371,16 @@ function openArticleEditor(article, all = []) {
   `, { wide: true });
 
   const body = modal.querySelector('#kb-body');
-  const preview = modal.querySelector('#kb-preview');
-  const drawPreview = () => { preview.innerHTML = renderRules(body.value) || '<p class="hint">Nothing yet.</p>'; };
+  const titleInput = modal.querySelector('#kb-title');
+  const folderInput = modal.querySelector('#kb-folder');
+  const preview = bindPhonePreview(
+    modal.querySelector('#kb-preview'),
+    () => `<div class="kb-body">${renderRules(body.value) || '<p class="phone-empty">Start typing and the article renders here, the way the team will read it.</p>'}</div>`
+  );
+  const drawPreview = () => preview.repaint();
   body.oninput = drawPreview;
-  drawPreview();
+  titleInput.oninput = () => preview.setTitle(titleInput.value.trim() || 'Untitled article');
+  folderInput.oninput = () => preview.setSubtitle(folderInput.value.trim() || 'General');
 
   // Toolbar wraps the selection for bold, otherwise prefixes the current line.
   modal.querySelectorAll('[data-md]').forEach((b) => {
