@@ -1876,6 +1876,85 @@ function canFillChecklist(user, list) {
   return !!user.position_id && list.positions.includes(user.position_id);
 }
 
+/* Checklists come back around every week, so submissions are read a workweek at
+   a time — Monday to Sunday in company time, the same week the timesheet uses. */
+
+// created_at comes from SQLite's datetime('now'): naive UTC, no zone marker.
+// Pin the zone on before any date maths or it reads as local time.
+function utcIso(stamp) {
+  const s = String(stamp || '').trim();
+  if (!s || s.includes('T')) return s;
+  return `${s.replace(' ', 'T')}Z`;
+}
+
+function submissionWeek(stamp) {
+  return weekStart(localParts(utcIso(stamp)).date);
+}
+
+function todayLocal() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: TZ });
+}
+
+// The Sunday that closes a week that starts on `monday`.
+function weekEnd(monday) {
+  const d = new Date(`${monday}T12:00:00`);
+  d.setDate(d.getDate() + 6);
+  return d.toLocaleDateString('en-CA');
+}
+
+// Anything unparseable falls back to the week we are in now, so a hand-edited
+// URL lands somewhere sensible rather than erroring.
+function askedWeek(raw) {
+  const s = String(raw || '');
+  return weekStart(/^\d{4}-\d{2}-\d{2}$/.test(s) ? s : todayLocal());
+}
+
+// The seven local dates of a week, for the day-by-day breakdown.
+function weekDays(monday) {
+  return Array.from({ length: 7 }, (_, i) => {
+    const d = new Date(`${monday}T12:00:00`);
+    d.setDate(d.getDate() + i);
+    return d.toLocaleDateString('en-CA');
+  });
+}
+
+function shapeSubmission(row) {
+  return {
+    ...row,
+    week: submissionWeek(row.created_at),
+    day: localParts(utcIso(row.created_at)).date,
+    answers: JSON.parse(row.answers || '{}'),
+    photos: Object.keys(JSON.parse(row.photos || '{}')), // paths stay server-side
+  };
+}
+
+// A UTC window that certainly contains the local week, give or take a day at
+// each end. SQL narrows the rows; the exact local-week test happens in JS.
+function weekWindow(week) {
+  const stamp = (d) => d.toISOString().slice(0, 19).replace('T', ' ');
+  const from = new Date(`${week}T00:00:00Z`);
+  from.setUTCDate(from.getUTCDate() - 1);
+  const to = new Date(`${weekEnd(week)}T00:00:00Z`);
+  to.setUTCDate(to.getUTCDate() + 2);
+  return [stamp(from), stamp(to)];
+}
+
+const SUBMISSION_QUERY = `
+  SELECT s.*, u.name AS user_name, u.color AS user_color,
+         sh.title AS shift_title, sh.starts_at AS shift_starts_at
+  FROM checklist_submissions s
+  LEFT JOIN users u ON u.id = s.user_id
+  LEFT JOIN shifts sh ON sh.id = s.shift_id
+  WHERE s.checklist_id = ?
+    AND datetime(s.created_at) >= ? AND datetime(s.created_at) < ?
+  ORDER BY s.created_at DESC`;
+
+// Rows for one checklist's local week, newest first.
+function weekSubmissions(checklistId, week) {
+  return db.prepare(SUBMISSION_QUERY).all(checklistId, ...weekWindow(week))
+    .map(shapeSubmission).filter((s) => s.week === week);
+}
+
 const CHECKLIST_QUERY = `
   SELECT c.*, v.name AS venue_name,
          (SELECT COUNT(*) FROM checklist_submissions s WHERE s.checklist_id = c.id) AS submission_count
@@ -1959,26 +2038,48 @@ app.get('/api/shifts/:id/checklists', requireAuth, (req, res) => {
   });
 });
 
+// Every checklist alongside what came in during one week — the admin's Monday
+// morning view of who filled what.
+app.get('/api/checklists/weekly', requireAuth, requireAdmin, (req, res) => {
+  const week = askedWeek(req.query.week);
+  const lists = db.prepare(CHECKLIST_QUERY).all().map(shapeChecklist);
+  res.json({
+    week,
+    week_end: weekEnd(week),
+    days: weekDays(week),
+    checklists: lists.map((c) => ({
+      ...c,
+      // The list view only counts them, so the answers stay behind.
+      submissions: weekSubmissions(c.id, week).map(({ answers, photos, ...rest }) => rest),
+    })),
+  });
+});
+
 app.get('/api/checklists/:id/submissions', requireAuth, requireAdmin, (req, res) => {
   const list = db.prepare(
     'SELECT c.*, v.name AS venue_name FROM checklists c LEFT JOIN venues v ON v.id = c.venue_id WHERE c.id = ?'
   ).get(Number(req.params.id));
   if (!list) return res.status(404).json({ error: 'Checklist not found' });
-  const submissions = db.prepare(`
-    SELECT s.*, u.name AS user_name, u.color AS user_color, sh.title AS shift_title, sh.starts_at AS shift_starts_at
-    FROM checklist_submissions s
-    LEFT JOIN users u ON u.id = s.user_id
-    LEFT JOIN shifts sh ON sh.id = s.shift_id
-    WHERE s.checklist_id = ?
-    ORDER BY s.created_at DESC
-    LIMIT 500`).all(list.id);
+
+  // Weeks that actually hold something — one cheap column over the whole
+  // history — plus the current one, so the pager always has somewhere to land.
+  const counts = new Map([[weekStart(todayLocal()), 0]]);
+  for (const row of db.prepare('SELECT created_at FROM checklist_submissions WHERE checklist_id = ?').all(list.id)) {
+    const wk = submissionWeek(row.created_at);
+    counts.set(wk, (counts.get(wk) || 0) + 1);
+  }
+  const weeks = [...counts]
+    .map(([wk, count]) => ({ week: wk, count }))
+    .sort((a, b) => b.week.localeCompare(a.week));
+
+  const week = req.query.week === undefined ? weeks[0].week : askedWeek(req.query.week);
   res.json({
     checklist: shapeChecklist(list),
-    submissions: submissions.map((s) => ({
-      ...s,
-      answers: JSON.parse(s.answers || '{}'),
-      photos: Object.keys(JSON.parse(s.photos || '{}')), // paths stay server-side
-    })),
+    week,
+    week_end: weekEnd(week),
+    days: weekDays(week),
+    weeks,
+    submissions: weekSubmissions(list.id, week),
   });
 });
 
@@ -2062,6 +2163,225 @@ function savedChecklistPhoto(photo, res) {
   fs.writeFileSync(out, bytes);
   return out;
 }
+
+/* ---------------------------- the weekly PDF -------------------------------- */
+/* One week of filled-in checklists as a paper record: every submission, every
+   answer, with the photos and signatures that came with it. */
+
+// The standard fonts are WinAnsi, so a stray emoji in a label would throw
+// mid-render. Fold the punctuation people actually paste, drop the rest.
+const PDF_SUBS = [
+  [/[‘’‚‛]/g, "'"],  // curly single quotes
+  [/[“”„]/g, '"'],   // curly double quotes
+  [/[–—]/g, '-'],    // en and em dashes
+  [/…/g, '...'],     // ellipsis
+  [/[   ]/g, ' '],   // non-breaking and figure spaces
+  [/[•·]/g, '-'],    // bullets
+];
+function pdfSafe(text) {
+  let s = String(text ?? '');
+  for (const [re, to] of PDF_SUBS) s = s.replace(re, to);
+  return s.replace(/[^\x20-\x7E\xA1-\xFF]/g, '').trimEnd();
+}
+
+// pdf-lib draws a string as one line, so wrapping is ours to do.
+function wrapText(text, font, size, width) {
+  const lines = [];
+  for (const para of pdfSafe(text).split('\n')) {
+    let line = '';
+    for (const word of para.split(/\s+/).filter(Boolean)) {
+      const next = line ? `${line} ${word}` : word;
+      if (font.widthOfTextAtSize(next, size) <= width) { line = next; continue; }
+      if (line) lines.push(line);
+      line = word;
+      // A single word wider than the column still has to break somewhere.
+      while (font.widthOfTextAtSize(line, size) > width && line.length > 1) {
+        let cut = line.length;
+        while (cut > 1 && font.widthOfTextAtSize(line.slice(0, cut), size) > width) cut--;
+        lines.push(line.slice(0, cut));
+        line = line.slice(cut);
+      }
+    }
+    lines.push(line);
+  }
+  return lines.length ? lines : [''];
+}
+
+function fmtStamp(iso, opts) {
+  return new Date(iso).toLocaleString('en-US', { timeZone: TZ, ...opts });
+}
+
+function fmtWeekRange(week) {
+  const day = (d) => new Date(`${d}T12:00:00`).toLocaleDateString('en-US', {
+    month: 'short', day: 'numeric', year: 'numeric',
+  });
+  return `${day(week)} - ${day(weekEnd(week))}`;
+}
+
+async function buildChecklistWeekPdf(sections, { week, title }) {
+  const pdf = await PDFDocument.create();
+  const font = await pdf.embedFont(StandardFonts.Helvetica);
+  const bold = await pdf.embedFont(StandardFonts.HelveticaBold);
+
+  const [W, H] = [612, 792];
+  const margin = 54;
+  const colWidth = W - margin * 2;
+  const grey = rgb(0.35, 0.35, 0.35);
+  let page = null;
+  let y = 0;
+
+  const newPage = () => { page = pdf.addPage([W, H]); y = H - margin; };
+  // Start a fresh page when what comes next would not fit above the footer.
+  const room = (height) => { if (!page || y - height < margin + 22) newPage(); };
+
+  const text = (body, { size = 11, f = font, color = rgb(0, 0, 0), gap = 15, indent = 0 } = {}) => {
+    for (const line of wrapText(body, f, size, colWidth - indent)) {
+      room(gap);
+      page.drawText(line, { x: margin + indent, y: y - size, size, font: f, color });
+      y -= gap;
+    }
+  };
+  const rule = (color = rgb(0.85, 0.85, 0.85)) => {
+    room(12);
+    page.drawLine({ start: { x: margin, y }, end: { x: W - margin, y }, thickness: 0.8, color });
+    y -= 12;
+  };
+  const gap = (h) => { y -= h; };
+
+  newPage();
+  text('E&E Management', { size: 18, f: bold, gap: 15 });
+  text('Event Services and More', { size: 9, color: grey, gap: 24 });
+  text(title, { size: 15, f: bold, gap: 19 });
+  text(`Week of ${fmtWeekRange(week)}`, { size: 11, f: bold, gap: 15 });
+  text(`Generated ${fmtStamp(new Date().toISOString(), { dateStyle: 'long', timeStyle: 'short' })}`,
+    { size: 9, color: grey, gap: 20 });
+  rule(rgb(0.7, 0.7, 0.7));
+
+  const dayName = (d) => new Date(`${d}T12:00:00`).toLocaleDateString('en-US', { weekday: 'short', month: 'numeric', day: 'numeric' });
+
+  for (const section of sections) {
+    gap(8);
+    room(60);
+    text(section.title, { size: 13, f: bold, gap: 16 });
+    text(`Venue: ${section.venue || 'No venue'}  -  ${section.submissions.length} submitted this week`,
+      { size: 9.5, color: grey, gap: 14 });
+
+    // Day-by-day, so an empty Wednesday is as visible as a busy Friday.
+    const byDay = weekDays(week).map((d) => {
+      const n = section.submissions.filter((s) => s.day === d).length;
+      return `${dayName(d)}: ${n || '-'}`;
+    });
+    text(byDay.join('   '), { size: 9, color: grey, gap: 16 });
+
+    if (!section.submissions.length) {
+      text('Nothing was submitted for this checklist during the week.', { size: 10, color: grey, gap: 16 });
+      rule();
+      continue;
+    }
+
+    const answerable = section.fields.filter((f) => f.type !== 'section' && f.type !== 'note');
+    for (const sub of [...section.submissions].reverse()) {
+      gap(6);
+      room(70);
+      text(`${sub.user_name || 'Someone'}  -  ${fmtStamp(utcIso(sub.created_at), { dateStyle: 'medium', timeStyle: 'short' })}`,
+        { size: 11, f: bold, gap: 14 });
+      if (sub.shift_title) text(`Job: ${sub.shift_title}`, { size: 9, color: grey, gap: 14 });
+
+      for (const field of answerable) {
+        const value = sub.answers[field.id];
+        text(field.label, { size: 10, f: bold, gap: 13, indent: 12 });
+
+        if (field.type === 'photo') {
+          const image = await embedStoredImage(pdf, sub.photoPaths?.[field.id]);
+          if (!image) { text('-- no photo --', { size: 10, color: grey, gap: 14, indent: 24 }); continue; }
+          const w = Math.min(190, image.width);
+          const h = (image.height / image.width) * w;
+          room(h + 10);
+          page.drawImage(image, { x: margin + 24, y: y - h, width: w, height: h });
+          y -= h + 10;
+          continue;
+        }
+        if (field.type === 'signature' && typeof value === 'string' && value.startsWith('data:image')) {
+          const image = await embedDataUrl(pdf, value);
+          if (image) {
+            const w = Math.min(170, image.width);
+            const h = (image.height / image.width) * w;
+            room(h + 10);
+            page.drawImage(image, { x: margin + 24, y: y - h, width: w, height: h });
+            y -= h + 10;
+            continue;
+          }
+        }
+        text(answerText(field, value), { size: 10, gap: 14, indent: 24 });
+      }
+      rule();
+    }
+  }
+
+  // Numbered once everything is laid out, so the total is known.
+  const pages = pdf.getPages();
+  pages.forEach((p, i) => {
+    p.drawText(`Page ${i + 1} of ${pages.length}`, {
+      x: margin, y: margin - 20, size: 8, font, color: rgb(0.55, 0.55, 0.55),
+    });
+  });
+
+  return Buffer.from(await pdf.save());
+}
+
+function answerText(field, value) {
+  if (value === undefined || value === null || value === '') return '-- not answered --';
+  if (field.type === 'check') return value === 'yes' ? 'Yes' : 'Not Applicable';
+  if (field.type === 'scale') return `${value} / 10`;
+  if (field.type === 'datetime') return fmtStamp(value, { dateStyle: 'medium', timeStyle: 'short' });
+  if (field.type === 'signature') return 'Signed';
+  return String(value);
+}
+
+async function embedStoredImage(pdf, filePath) {
+  if (!filePath || !fs.existsSync(filePath)) return null;
+  try {
+    const bytes = fs.readFileSync(filePath);
+    const isPng = bytes.subarray(0, 8).toString('hex') === '89504e470d0a1a0a';
+    return isPng ? await pdf.embedPng(bytes) : await pdf.embedJpg(bytes);
+  } catch { return null; }
+}
+
+async function embedDataUrl(pdf, dataUrl) {
+  try { return await pdf.embedPng(Buffer.from(String(dataUrl).split(',').pop(), 'base64')); }
+  catch { return null; }
+}
+
+// One checklist's week, or every checklist's week when no id is given.
+app.get('/api/checklists/weekly/pdf', requireAuth, requireAdmin, async (req, res) => {
+  const week = askedWeek(req.query.week);
+  const only = req.query.checklist ? Number(req.query.checklist) : null;
+  const lists = db.prepare(CHECKLIST_QUERY).all().map(shapeChecklist)
+    .filter((c) => !only || c.id === only);
+  if (!lists.length) return res.status(404).json({ error: 'Checklist not found' });
+
+  const sections = lists.map((list) => ({
+    title: list.title,
+    venue: list.venue_name,
+    fields: list.fields,
+    // The PDF embeds the photos, so it needs the paths shapeSubmission drops.
+    submissions: db.prepare(SUBMISSION_QUERY).all(list.id, ...weekWindow(week))
+      .map((row) => ({ ...shapeSubmission(row), photoPaths: JSON.parse(row.photos || '{}') }))
+      .filter((s) => s.week === week),
+  }));
+
+  const title = only ? lists[0].title : 'Checklists - Weekly Record';
+  try {
+    const bytes = await buildChecklistWeekPdf(sections, { week, title });
+    const slug = `${only ? lists[0].title : 'all-checklists'}`.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${slug || 'checklists'}-week-of-${week}.pdf"`);
+    res.send(bytes);
+  } catch (err) {
+    console.error('checklist week pdf', err);
+    res.status(500).json({ error: 'That PDF could not be built' });
+  }
+});
 
 /* ------------------------------ knowledge base ------------------------------ */
 /* The standing rules. An article with no positions is readable by everyone;
