@@ -14,11 +14,13 @@ A Connecteam-style workforce app for E&E: **job scheduling**, **venues**, **team
 - **📄 Documents & e-signatures** — admins upload a PDF (handbook, waiver, policy); the team reads it on their phone and signs with a typed name plus a drawn signature. Admins can **place signature, date and printed-name fields anywhere on the document** — tap the page where each stamp belongs — and every signer's handwriting is burned into those exact spots, with an audit signature page appended as well. Admins get a **Signed Documents** screen showing who has and hasn't signed, with per-person and bulk downloads.
 - **👔 Attire** — admins define what to wear (name, description, photo, colour); each scheduled job can specify the attire, and the Attire tab shows everyone the outfit for their next job.
 - **📢 Updates feed** — company announcements posted by admins, pushed to every phone, with likes.
+- **✉️ Text messages** — one message from the company number out to **every phone on the team** (everyone signed up in the app), or to a hand-picked few. **Send it now or schedule it for a date and time** — it goes out on its own, whether or not anyone is online. The screen keeps the full record in one table: when it went, who sent it, the message, how many it reached, the delivery rate and the cost, and opening a message shows every recipient's number and delivery status. Texts leave through a Twilio-compatible carrier account when one is configured (see below); with no account connected they still reach everyone as an app push notification, and each recipient is recorded as such.
 - **🔔 Notifications on your phone** — real web push notifications (banner + lock screen) for job assignments, schedule changes, cancellations, chat messages, tasks, time-off decisions, new forms, and announcements — even when the app is closed. Plus an in-app notification feed.
 - **🔑 PIN sign-in** — no passwords: new team members sign up with their **name and phone number** and get a unique **5-digit PIN** used to sign in and clock in. The **first account created becomes the admin**.
 - **🔢 Kiosk mode** — an admin PIN locks any device into a full-screen punch clock (it stays locked across restarts until an admin PIN is entered again). Members clock in/out **only at the kiosk**, in person; admins can also punch from their own phone.
 - **👥 Team** — everyone who signs up appears in the team list; admins manage roles, hourly rates, and PINs.
-- **📱 Installable app** — add it to your home screen and it runs full-screen with its own icon, like a native app. On desktop it lays out as a proper web app with a branded sidebar.
+- **💾 Forms that keep your place** — every answer in a checklist, and the name, tick and signature on a document, are saved to the device the moment they're made. Close the app mid-checklist, take a call, come back tomorrow: it reopens exactly where it was left, with a **Start over** button if you'd rather begin again. Drafts clear themselves once the form is sent.
+- **📱 Installable app** — add it to your home screen and it runs full-screen with its own icon, like a native app. On desktop it becomes a full workspace: a grouped sidebar (Communication, Operations, Setup), a search box that jumps to any screen, teammate or venue, and each screen laid out as a titled panel. Editors that carry a **mobile preview** show the phone beside the form, so an admin sees the member's screen while writing it.
 
 ## Quick start
 
@@ -53,6 +55,18 @@ Use the **Test** button in Settings to confirm the device receives notifications
 | `PORT` | `3000` | HTTP port |
 | `APP_TZ` | `America/New_York` | Time zone used in notification text |
 | `VAPID_CONTACT` | `mailto:admin@example.com` | Contact for push service |
+| `TWILIO_ACCOUNT_SID` | — | Carrier account for real text messages |
+| `TWILIO_AUTH_TOKEN` | — | Carrier auth token (kept in the server's environment, never in the database) |
+| `TWILIO_FROM_NUMBER` | — | Number texts are sent from; can be overridden in Settings → Text messaging |
+
+## Sending real text messages
+
+Text blasts work out of the box **as app notifications**. To send them as actual
+SMS, set `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN` and `TWILIO_FROM_NUMBER` (any
+Twilio-compatible API works — point `TWILIO_API_BASE` at another provider if
+needed), then restart. The Text Messages screen says which mode is active, and
+what each send cost. The per-segment price used for the estimate lives in
+**Settings → Text messaging**.
 
 ## Tech
 

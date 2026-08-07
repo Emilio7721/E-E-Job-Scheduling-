@@ -256,6 +256,40 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_knowledge_folder ON knowledge_articles(folder);
 `);
 
+// Text message blasts: one row per message the office sends out, plus a row per
+// person it went to. Recipients are snapshotted (name + number at send time) so
+// the delivery record still reads correctly after someone changes their number
+// or leaves. `scheduled_at` in the future means the sweep sends it later.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS text_messages (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    body         TEXT NOT NULL,
+    from_number  TEXT NOT NULL DEFAULT '',
+    audience     TEXT NOT NULL DEFAULT 'all',       -- 'all' | 'some'
+    scheduled_at TEXT,                              -- ISO 8601 UTC; NULL = sent straight away
+    sent_at      TEXT,
+    status       TEXT NOT NULL DEFAULT 'scheduled', -- scheduled | sent | canceled | failed
+    created_by   INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS text_recipients (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id   INTEGER NOT NULL REFERENCES text_messages(id) ON DELETE CASCADE,
+    user_id      INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    name         TEXT NOT NULL DEFAULT '',
+    phone        TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'queued',    -- queued | delivered | app | failed | no_number | canceled
+    error        TEXT NOT NULL DEFAULT '',
+    price        REAL NOT NULL DEFAULT 0,
+    provider_id  TEXT,
+    delivered_at TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_text_recipients_msg ON text_recipients(message_id);
+  CREATE INDEX IF NOT EXISTS idx_text_messages_due ON text_messages(status, scheduled_at);
+`);
+
 // Lightweight migrations for databases created before a column existed.
 function ensureColumn(table, column, ddl) {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);

@@ -45,6 +45,7 @@ const NOTIF_CATEGORIES = {
   chat: 'Chat messages',
   announcements: 'Company updates',
   documents: 'Documents to read and sign',
+  texts: 'Text messages sent to the whole team',
   hours: 'Hours and time-off decisions',
   admin: 'Admin alerts (responses, requests, signatures)',
 };
@@ -249,6 +250,10 @@ app.post('/api/users/worker-ids/import', requireAuth, requireAdmin, (req, res) =
 const SETTING_DEFAULTS = {
   // Monday of the first pay period; every period runs 14 days from here.
   period_anchor: '2026-01-05',
+  // The number text blasts are sent from. Blank falls back to TWILIO_FROM_NUMBER.
+  sms_from_number: '',
+  // What the carrier charges per 160-character segment, used for the estimate.
+  sms_price: '0.0079',
 };
 
 function getSettings() {
@@ -270,6 +275,12 @@ app.put('/api/settings', requireAuth, requireAdmin, (req, res) => {
     let value = String(body[key] ?? '').trim();
     if (key === 'period_anchor' && value && !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
       return res.status(400).json({ error: 'Pay period start must be a date' });
+    }
+    if (key === 'sms_from_number' && value && !/^\+?[\d\s()\-.]{7,20}$/.test(value)) {
+      return res.status(400).json({ error: 'That sending number does not look like a phone number' });
+    }
+    if (key === 'sms_price' && value && !(Number(value) >= 0)) {
+      return res.status(400).json({ error: 'Price per message must be a number' });
     }
     save.run(key, value);
   }
@@ -2612,6 +2623,248 @@ app.post('/api/posts/:id/like', requireAuth, (req, res) => {
   else db.prepare('INSERT INTO post_likes (post_id, user_id) VALUES (?, ?)').run(postId, req.user.id);
   events.broadcast('posts', {});
   res.json({ liked: !liked });
+});
+
+/* ------------------------------- text messages ------------------------------ */
+
+/* One message, typed once, sent to every phone in the team.
+   The SMS leg goes out through a Twilio-compatible HTTP API when the account
+   details are in the environment (TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN /
+   TWILIO_FROM_NUMBER). With no account configured the message still reaches
+   everyone who has the app — as a push notification — and each recipient is
+   recorded as 'app' so nobody is told a text went out when it did not. */
+
+const SMS_ENDPOINT = process.env.TWILIO_API_BASE || 'https://api.twilio.com';
+
+function smsConfig() {
+  const settings = getSettings();
+  const sid = (process.env.TWILIO_ACCOUNT_SID || '').trim();
+  const token = (process.env.TWILIO_AUTH_TOKEN || '').trim();
+  const from = (settings.sms_from_number || process.env.TWILIO_FROM_NUMBER || '').trim();
+  return {
+    sid, token, from,
+    price: Number(settings.sms_price) || 0,
+    configured: !!(sid && token && from),
+  };
+}
+
+// Digits as typed by the team, turned into what a carrier expects. A bare
+// 10-digit US number is the common case here; anything already in +E.164 form
+// (or a longer international number) is passed through.
+function e164(phone) {
+  const raw = String(phone || '').trim();
+  if (!raw) return '';
+  if (raw.startsWith('+')) return '+' + raw.slice(1).replace(/\D/g, '');
+  const digits = raw.replace(/\D/g, '');
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
+  return digits.length >= 8 ? `+${digits}` : '';
+}
+
+// Carriers bill per segment: 160 GSM-7 characters, or 70 when the text needs
+// unicode (emoji, curly quotes), dropping to 153/67 once it splits.
+function smsSegments(body) {
+  const text = String(body || '');
+  const unicode = /[^\x00-\x7F]/.test(text);
+  const single = unicode ? 70 : 160;
+  const multi = unicode ? 67 : 153;
+  if (text.length === 0) return 0;
+  return text.length <= single ? 1 : Math.ceil(text.length / multi);
+}
+
+async function sendOneSms({ to, body, cfg }) {
+  const res = await fetch(`${SMS_ENDPOINT}/2010-04-01/Accounts/${encodeURIComponent(cfg.sid)}/Messages.json`, {
+    method: 'POST',
+    headers: {
+      Authorization: 'Basic ' + Buffer.from(`${cfg.sid}:${cfg.token}`).toString('base64'),
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: new URLSearchParams({ To: to, From: cfg.from, Body: body }),
+    signal: AbortSignal.timeout(20000),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.message || `Carrier rejected the message (${res.status})`);
+  return { id: data.sid || '', price: Math.abs(Number(data.price)) || 0 };
+}
+
+function textMessageRow(row) {
+  const counts = db.prepare(`
+    SELECT COUNT(*) AS total,
+           SUM(status IN ('delivered', 'app')) AS delivered,
+           SUM(status = 'failed') AS failed,
+           COALESCE(SUM(price), 0) AS price
+    FROM text_recipients WHERE message_id = ?
+  `).get(row.id);
+  return {
+    ...row,
+    recipients: counts.total,
+    delivered: counts.delivered || 0,
+    failed: counts.failed || 0,
+    price: Number(counts.price) || 0,
+    segments: smsSegments(row.body),
+  };
+}
+
+// Sends (or re-sends) everything still queued on one message. Runs one number
+// at a time on purpose: a failure on one phone must not lose the rest, and each
+// row records its own outcome.
+async function deliverTextMessage(messageId) {
+  const message = db.prepare('SELECT * FROM text_messages WHERE id = ?').get(messageId);
+  if (!message || message.status === 'canceled') return;
+  const cfg = smsConfig();
+  const queued = db.prepare(`SELECT * FROM text_recipients WHERE message_id = ? AND status = 'queued'`).all(messageId);
+  const segments = smsSegments(message.body);
+  const mark = db.prepare(
+    'UPDATE text_recipients SET status = ?, error = ?, price = ?, provider_id = ?, delivered_at = ? WHERE id = ?'
+  );
+
+  for (const r of queued) {
+    const to = e164(r.phone);
+    if (!to) {
+      mark.run('no_number', 'No mobile number on file', 0, null, null, r.id);
+      continue;
+    }
+    if (!cfg.configured) {
+      // No carrier account: the app is the delivery channel.
+      mark.run('app', '', 0, null, new Date().toISOString(), r.id);
+      continue;
+    }
+    try {
+      const sent = await sendOneSms({ to, body: message.body, cfg });
+      mark.run('delivered', '', sent.price || segments * cfg.price, sent.id, new Date().toISOString(), r.id);
+    } catch (err) {
+      mark.run('failed', String(err.message).slice(0, 300), 0, null, null, r.id);
+    }
+  }
+
+  // Everyone with the app also gets it in their pocket, so a text blast is
+  // never missed by someone whose number bounced. The sender is left out —
+  // they wrote it.
+  const userIds = db.prepare(
+    'SELECT user_id FROM text_recipients WHERE message_id = ? AND user_id IS NOT NULL AND user_id != ?'
+  ).all(messageId, message.created_by || 0).map((r) => r.user_id);
+  notify(userIds, {
+    title: '💬 Message from the office',
+    body: message.body.length > 160 ? message.body.slice(0, 157) + '…' : message.body,
+    url: '/#/updates',
+    category: 'texts',
+  });
+
+  const any = db.prepare(`SELECT COUNT(*) AS n FROM text_recipients WHERE message_id = ? AND status IN ('delivered', 'app')`)
+    .get(messageId).n;
+  db.prepare('UPDATE text_messages SET status = ?, sent_at = ? WHERE id = ?')
+    .run(any ? 'sent' : 'failed', new Date().toISOString(), messageId);
+  events.broadcast('texts', {});
+}
+
+// Scheduled blasts go out on the same one-minute sweep as shift reminders.
+let sendingDueTexts = false;
+async function sendDueTexts() {
+  if (sendingDueTexts) return;
+  sendingDueTexts = true;
+  try {
+    const due = db.prepare(
+      `SELECT id FROM text_messages WHERE status = 'scheduled' AND scheduled_at IS NOT NULL AND scheduled_at <= ?`
+    ).all(new Date().toISOString());
+    for (const row of due) await deliverTextMessage(row.id);
+  } catch (err) {
+    console.error('scheduled text sweep failed', err);
+  } finally {
+    sendingDueTexts = false;
+  }
+}
+setInterval(sendDueTexts, 60 * 1000);
+sendDueTexts();
+
+app.get('/api/texts/config', requireAuth, requireAdmin, (req, res) => {
+  const cfg = smsConfig();
+  res.json({
+    configured: cfg.configured,
+    from_number: cfg.from,
+    price: cfg.price,
+    reachable: db.prepare(`SELECT COUNT(*) AS n FROM users WHERE phone IS NOT NULL AND phone != ''`).get().n,
+    headcount: db.prepare('SELECT COUNT(*) AS n FROM users').get().n,
+  });
+});
+
+app.get('/api/texts', requireAuth, requireAdmin, (req, res) => {
+  const rows = db.prepare(`
+    SELECT t.*, u.name AS sent_by_name, u.color AS sent_by_color
+    FROM text_messages t LEFT JOIN users u ON u.id = t.created_by
+    ORDER BY COALESCE(t.sent_at, t.scheduled_at, t.created_at) DESC, t.id DESC
+    LIMIT 200
+  `).all();
+  res.json({ messages: rows.map(textMessageRow) });
+});
+
+app.get('/api/texts/:id', requireAuth, requireAdmin, (req, res) => {
+  const row = db.prepare(`
+    SELECT t.*, u.name AS sent_by_name, u.color AS sent_by_color
+    FROM text_messages t LEFT JOIN users u ON u.id = t.created_by WHERE t.id = ?
+  `).get(Number(req.params.id));
+  if (!row) return res.status(404).json({ error: 'Message not found' });
+  const recipients = db.prepare(`
+    SELECT r.*, u.color AS user_color
+    FROM text_recipients r LEFT JOIN users u ON u.id = r.user_id
+    WHERE r.message_id = ? ORDER BY r.id
+  `).all(row.id);
+  res.json({ message: textMessageRow(row), recipients });
+});
+
+app.post('/api/texts', requireAuth, requireAdmin, (req, res) => {
+  const { body, scheduled_at = null, user_ids = null } = req.body || {};
+  const text = String(body || '').trim();
+  if (!text) return res.status(400).json({ error: 'Write the message first' });
+  if (text.length > 1600) return res.status(400).json({ error: 'Keep the message under 1600 characters' });
+
+  let when = null;
+  if (scheduled_at) {
+    const at = new Date(scheduled_at);
+    if (Number.isNaN(at.getTime())) return res.status(400).json({ error: 'That send time is not a real date' });
+    if (at.getTime() < Date.now() - 60 * 1000) return res.status(400).json({ error: 'Pick a send time in the future' });
+    when = at.toISOString();
+  }
+
+  const everyone = !Array.isArray(user_ids) || user_ids.length === 0;
+  const people = everyone
+    ? db.prepare('SELECT id, name, phone FROM users ORDER BY name').all()
+    : db.prepare(`SELECT id, name, phone FROM users WHERE id IN (${user_ids.map(() => '?').join(',')}) ORDER BY name`)
+      .all(...user_ids.map(Number));
+  if (!people.length) return res.status(400).json({ error: 'Nobody to send to yet' });
+
+  const cfg = smsConfig();
+  const info = db.prepare(`
+    INSERT INTO text_messages (body, from_number, audience, scheduled_at, status, created_by)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(text, cfg.from, everyone ? 'all' : 'some', when, 'scheduled', req.user.id);
+  const id = Number(info.lastInsertRowid);
+
+  const addRecipient = db.prepare(
+    'INSERT INTO text_recipients (message_id, user_id, name, phone) VALUES (?, ?, ?, ?)'
+  );
+  for (const p of people) addRecipient.run(id, p.id, p.name, p.phone || '');
+
+  events.broadcast('texts', {});
+  if (!when) {
+    // Answer the browser now; the carrier round-trips in the background.
+    deliverTextMessage(id).catch((err) => console.error('text send failed', err));
+  }
+  res.json({ ok: true, id, scheduled: !!when, recipients: people.length });
+});
+
+app.delete('/api/texts/:id', requireAuth, requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  const row = db.prepare('SELECT * FROM text_messages WHERE id = ?').get(id);
+  if (!row) return res.status(404).json({ error: 'Message not found' });
+  if (row.status === 'scheduled') {
+    // Still waiting on the clock — call it off rather than lose the record.
+    db.prepare(`UPDATE text_messages SET status = 'canceled' WHERE id = ?`).run(id);
+    db.prepare(`UPDATE text_recipients SET status = 'canceled' WHERE message_id = ? AND status = 'queued'`).run(id);
+  } else {
+    db.prepare('DELETE FROM text_messages WHERE id = ?').run(id);
+  }
+  events.broadcast('texts', {});
+  res.json({ ok: true, canceled: row.status === 'scheduled' });
 });
 
 /* ---------------------------------- static --------------------------------- */

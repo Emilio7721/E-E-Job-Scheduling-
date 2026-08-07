@@ -146,6 +146,7 @@ function connectEvents() {
     hours: ['hours'], roles: ['roles'], positions: ['positions', 'team'], users: ['team'], settings: ['timesheets'],
     checklists: ['checklists', 'checklist-subs'], knowledge: ['knowledge'],
     attire: ['attire', 'schedule'], availability: ['availability', 'schedule'],
+    texts: ['texts'],
   })) {
     es.addEventListener(event, () => { if (views.includes(route().view)) render(); });
   }
@@ -183,22 +184,16 @@ function unreadNotifCount() {
   return state.notifications.filter((n) => !n.read).length;
 }
 
+// The bottom bar and the desktop sidebar both carry [data-tab] buttons, so every
+// match is updated — not just the first one in the document.
 function updateBadges() {
-  const chatBadge = document.querySelector('[data-tab="chat"] .tab-badge');
-  const chatBtn = document.querySelector('[data-tab="chat"]');
-  if (chatBtn) {
-    const n = unreadChatCount();
-    if (n && !chatBadge) chatBtn.insertAdjacentHTML('beforeend', `<span class="tab-badge">${n}</span>`);
-    else if (n && chatBadge) chatBadge.textContent = n;
-    else chatBadge?.remove();
-  }
-  const updatesBtn = document.querySelector('[data-tab="updates"]');
-  if (updatesBtn) {
-    const badge = updatesBtn.querySelector('.tab-badge');
-    const n = unreadNotifCount();
-    if (n && !badge) updatesBtn.insertAdjacentHTML('beforeend', `<span class="tab-badge">${n}</span>`);
-    else if (n && badge) badge.textContent = n;
-    else badge?.remove();
+  for (const [tab, count] of [['chat', unreadChatCount()], ['updates', unreadNotifCount()]]) {
+    document.querySelectorAll(`[data-tab="${tab}"]`).forEach((btn) => {
+      const badge = btn.querySelector('.tab-badge');
+      if (count && !badge) btn.insertAdjacentHTML('beforeend', `<span class="tab-badge">${count}</span>`);
+      else if (count && badge) badge.textContent = count;
+      else badge?.remove();
+    });
   }
 }
 
@@ -383,6 +378,77 @@ async function maybeShowOnboarding() {
   queueNotifPrompt();
 }
 
+/* ------------------------------- saved drafts ------------------------------- */
+
+/* Half-filled forms are kept on the device, one draft per person per form, so
+   a phone call, a locked screen or a closed tab in the middle of a checklist
+   costs nothing — reopening it puts every answer back where it was. */
+
+const DRAFT_TTL_MS = 30 * 24 * 3600 * 1000; // a month of grace, then it lapses
+
+function draftKey(kind, id) {
+  return `ee-draft:${state.me?.id || 0}:${kind}:${id}`;
+}
+
+function loadDraft(kind, id) {
+  try {
+    const raw = localStorage.getItem(draftKey(kind, id));
+    if (!raw) return null;
+    const draft = JSON.parse(raw);
+    if (!draft?.saved_at || Date.now() - draft.saved_at > DRAFT_TTL_MS) {
+      clearDraft(kind, id);
+      return null;
+    }
+    return draft;
+  } catch { return null; }
+}
+
+// Photos and signatures are big; if the device refuses the whole draft, the
+// caller's lighter `fallback` (usually the same answers minus the images) is
+// still worth keeping. Returns 'full', 'trimmed' or 'failed'.
+function saveDraft(kind, id, data, { fallback = null } = {}) {
+  const write = (payload) => {
+    localStorage.setItem(draftKey(kind, id), JSON.stringify({ ...payload, saved_at: Date.now() }));
+  };
+  try {
+    write(data);
+    return 'full';
+  } catch {
+    if (!fallback) return 'failed';
+    try { write({ ...fallback, trimmed: true }); return 'trimmed'; }
+    catch { return 'failed'; }
+  }
+}
+
+function clearDraft(kind, id) {
+  try { localStorage.removeItem(draftKey(kind, id)); } catch {}
+}
+
+function draftAgo(savedAt) {
+  const mins = Math.round((Date.now() - savedAt) / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins} min ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+  return new Date(savedAt).toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
+// The line under a form that says the work is safe. `state` is 'full',
+// 'trimmed' or 'failed', matching what saveDraft() managed to store.
+function showDraftState(el, state) {
+  if (!el) return;
+  if (state === 'failed') {
+    el.className = 'draft-note warn';
+    el.textContent = '⚠️ This device is out of storage — send before closing the app.';
+  } else if (state === 'trimmed') {
+    el.className = 'draft-note warn';
+    el.textContent = '⚠️ Answers saved, but photos and signatures are too big to hold — send before closing.';
+  } else {
+    el.className = 'draft-note';
+    el.textContent = '✓ Saved on this device — you can close the app and come back.';
+  }
+}
+
 /* --------------------------------- modal ---------------------------------- */
 
 // `wide` gives long content (a checklist being built or filled in) more room
@@ -521,7 +587,87 @@ const TABS = [
 ];
 
 // Views that live under the "More" hub still highlight the More tab.
-const MORE_VIEWS = ['more', 'venues', 'team', 'forms', 'signed', 'place', 'timesheets', 'settings', 'notifications', 'hours', 'roles', 'positions', 'attire', 'checklists', 'checklist-subs', 'knowledge'];
+const MORE_VIEWS = ['more', 'venues', 'team', 'forms', 'signed', 'place', 'timesheets', 'settings', 'notifications', 'hours', 'roles', 'positions', 'attire', 'checklists', 'checklist-subs', 'knowledge', 'texts'];
+
+// The desktop sidebar. A phone has six tabs and a More hub; a desktop has room
+// for the whole app at once, grouped the way the work is grouped, each entry
+// with its own coloured tile so it can be found by shape rather than by reading.
+const NAV_GROUPS = [
+  {
+    items: [
+      { id: 'schedule', icon: '📅', label: 'Schedule', tone: '#f97316' },
+      { id: 'availability', icon: '📗', label: 'Availability', tone: '#16a34a' },
+      { id: 'team', icon: '👥', label: 'Team', tone: '#0ea5e9' },
+      { id: 'venues', icon: '📍', label: 'Venues', tone: '#8b5cf6' },
+    ],
+  },
+  {
+    title: 'Communication',
+    items: [
+      { id: 'chat', icon: '💬', label: 'Chat', tone: '#10b981' },
+      { id: 'updates', icon: '📢', label: 'Updates', tone: '#3b82f6' },
+      { id: 'texts', icon: '✉️', label: 'Text Messages', tone: '#22c55e', admin: true },
+      { id: 'knowledge', icon: '📖', label: 'Knowledge Base', tone: '#f43f5e' },
+      { id: 'notifications', icon: '🔔', label: 'Notifications', tone: '#eab308' },
+    ],
+  },
+  {
+    title: 'Operations',
+    items: [
+      { id: 'clock', icon: '⏱️', label: 'Time Clock', tone: '#ef4444' },
+      { id: 'forms', icon: '📄', label: 'Documents', tone: '#a855f7' },
+      { id: 'checklists', icon: '📋', label: 'Checklists', tone: '#f59e0b' },
+      { id: 'hours', icon: '🕐', label: 'Hours Requests', tone: '#0891b2' },
+      { id: 'timesheets', icon: '🧾', label: 'Timesheets', tone: '#6366f1', admin: true },
+      { id: 'attire', icon: '👔', label: 'Attire', tone: '#d946ef', admin: true },
+    ],
+  },
+  {
+    title: 'Setup',
+    admin: true,
+    items: [
+      { id: 'roles', icon: '🧑‍🍳', label: 'Jobs', tone: '#84cc16' },
+      { id: 'positions', icon: '🧩', label: 'Positions', tone: '#14b8a6' },
+      { id: 'signed', icon: '📁', label: 'Signed Documents', tone: '#64748b' },
+      { id: 'kiosk', icon: '🔢', label: 'Kiosk Mode', tone: '#475569' },
+      { id: 'settings', icon: '⚙️', label: 'Settings', tone: '#6b7280' },
+    ],
+  },
+];
+
+// Sub-screens highlight (and take their heading icon from) the entry they hang off.
+const NAV_PARENT = {
+  'checklist-subs': 'checklists',
+  place: 'forms',
+  more: 'settings',
+};
+
+function navItem(view) {
+  const id = NAV_PARENT[view] || view;
+  for (const g of NAV_GROUPS) {
+    const hit = g.items.find((i) => i.id === id);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function sidenavHTML(view) {
+  const isAdmin = state.me?.role === 'admin';
+  const active = NAV_PARENT[view] || view;
+  return `
+    <nav class="sidenav">
+      <img class="sidenav-logo" src="/brand/logo.png" alt="E&amp;E Management">
+      ${NAV_GROUPS.filter((g) => !g.admin || isAdmin).map((g) => `
+        <div class="sidenav-group">
+          ${g.title ? `<div class="sidenav-title">${g.title}</div>` : ''}
+          ${g.items.filter((i) => !i.admin || isAdmin).map((i) => `
+            <button data-tab="${i.id}" class="sidenav-item ${active === i.id ? 'active' : ''}">
+              <span class="nav-tile" style="background:${i.tone}">${i.icon}</span>
+              <span class="nav-label">${i.label}</span>
+            </button>`).join('')}
+        </div>`).join('')}
+    </nav>`;
+}
 
 function tabbarHTML(active, extraClass = '') {
   return `
@@ -539,6 +685,73 @@ function bindTabbar() {
   });
 }
 
+/* ------------------------------- quick search ------------------------------- */
+
+// The desktop search box: one field over the whole app. It jumps to a screen, a
+// teammate (straight into the DM) or a venue, so nothing is more than a
+// keystroke and Enter away.
+function quickSearchHits(query) {
+  const q = query.trim().toLowerCase();
+  if (!q) return [];
+  const isAdmin = state.me.role === 'admin';
+  const hits = [];
+  for (const g of NAV_GROUPS) {
+    if (g.admin && !isAdmin) continue;
+    for (const i of g.items) {
+      if (i.admin && !isAdmin) continue;
+      if (i.label.toLowerCase().includes(q)) {
+        hits.push({ icon: i.icon, tone: i.tone, label: i.label, sub: g.title || 'Screen', go: () => { location.hash = `#/${i.id}`; } });
+      }
+    }
+  }
+  for (const u of state.users) {
+    if (u.id === state.me.id || !u.name.toLowerCase().includes(q)) continue;
+    hits.push({
+      icon: '👤', tone: u.color, label: u.name, sub: positionName(u) || 'Team member',
+      go: async () => {
+        try {
+          const { channel } = await api('/api/channels/dm', { method: 'POST', body: { user_id: u.id } });
+          await refreshChannels();
+          location.hash = `#/chat/${channel.id}`;
+        } catch { location.hash = '#/team'; }
+      },
+    });
+  }
+  for (const v of state.venues) {
+    if (!v.name.toLowerCase().includes(q)) continue;
+    hits.push({ icon: '📍', tone: v.color, label: v.name, sub: v.address || 'Venue', go: () => { location.hash = '#/venues'; } });
+  }
+  return hits.slice(0, 8);
+}
+
+function bindQuickSearch() {
+  const box = document.getElementById('quick-search');
+  const list = document.getElementById('quick-results');
+  if (!box || !list) return;
+  let hits = [];
+  const close = () => { list.hidden = true; list.innerHTML = ''; };
+  const draw = () => {
+    hits = quickSearchHits(box.value);
+    if (!hits.length) return close();
+    list.innerHTML = hits.map((h, i) => `
+      <button class="quick-hit" data-hit="${i}">
+        <span class="nav-tile" style="background:${esc(h.tone || '#6b7280')}">${h.icon}</span>
+        <span class="grow"><span class="quick-label">${esc(h.label)}</span><span class="sub">${esc(h.sub)}</span></span>
+      </button>`).join('');
+    list.hidden = false;
+    list.querySelectorAll('[data-hit]').forEach((b) => {
+      b.onmousedown = (e) => { e.preventDefault(); box.value = ''; close(); hits[Number(b.dataset.hit)].go(); };
+    });
+  };
+  box.oninput = draw;
+  box.onfocus = draw;
+  box.onblur = () => setTimeout(close, 120);
+  box.onkeydown = (e) => {
+    if (e.key === 'Enter' && hits.length) { e.preventDefault(); box.value = ''; close(); hits[0].go(); }
+    if (e.key === 'Escape') { box.value = ''; close(); box.blur(); }
+  };
+}
+
 async function signOut() {
   if (!confirm('Sign out of E&E?')) return;
   await api('/api/auth/logout', { method: 'POST' });
@@ -548,20 +761,49 @@ async function signOut() {
   renderAuth();
 }
 
+/* One shell for both shapes of the app. A phone gets the title bar and the
+   bottom tabs it always had; a desktop gets the sidebar, a search field across
+   the top, and the screen laid out as a titled panel — the same markup, sorted
+   out in CSS, so no screen has to know which it is being viewed on.
+   `fab` is the screen's primary action: a floating ＋ on a phone, a labelled
+   button in the panel header on a desktop (pass a string to name it). */
 function shell(title, contentHTML, { back = null, fab = null } = {}) {
-  let { view } = route();
-  if (MORE_VIEWS.includes(view)) view = 'more';
+  const { view } = route();
+  const tab = MORE_VIEWS.includes(view) ? 'more' : view;
+  const item = navItem(view);
+  const fabButton = fab
+    ? `<button class="fab" id="fab"><span class="fab-plus">＋</span><span class="fab-label">${esc(typeof fab === 'string' ? fab : 'New')}</span></button>`
+    : '';
   $app.innerHTML = `
+    ${sidenavHTML(view)}
     ${back !== 'none' ? `
     <header class="topbar">
       ${back ? `<button class="icon-btn" id="back-btn">←</button>` : ''}
       <h2>${esc(title)}</h2>
-      <button class="icon-btn" id="signout-btn" title="Sign out">⏻</button>
+      <div class="topsearch">
+        <span class="topsearch-ico">🔍</span>
+        <input id="quick-search" type="search" placeholder="Search anything" autocomplete="off" aria-label="Search the app">
+        <div class="quick-results" id="quick-results" hidden></div>
+      </div>
+      <button class="user-chip" id="signout-btn" title="Sign out">
+        <span class="avatar" style="background:${esc(state.me?.color || '#888')}">${esc(initials(state.me?.name || '?'))}</span>
+        <span class="user-name">${esc(state.me?.name || '')}</span>
+        <span class="user-power">⏻</span>
+      </button>
     </header>` : ''}
-    <div class="main" id="main">${contentHTML}</div>
-    ${fab ? `<button class="fab" id="fab">＋</button>` : ''}
-    ${tabbarHTML(view)}`;
+    <div class="main" id="main">
+      <div class="page">
+        <div class="page-head">
+          <span class="nav-tile lg" style="background:${item?.tone || 'var(--brand)'}">${item?.icon || '✳️'}</span>
+          <h3 class="page-title">${esc(title)}</h3>
+          ${fabButton}
+        </div>
+        <div class="page-body">${contentHTML}</div>
+      </div>
+    </div>
+    ${tabbarHTML(tab)}`;
   bindTabbar();
+  bindQuickSearch();
   const backBtn = document.getElementById('back-btn');
   if (backBtn) backBtn.onclick = back;
   const signoutBtn = document.getElementById('signout-btn');
@@ -625,7 +867,9 @@ async function markPickerConflicts(root, { id = 'picker', starts_at, ends_at, sh
   }
 }
 
-function bindPeoplePicker(root, selected, { id = 'picker' } = {}) {
+// `onChange` fires after each tick/untick, for callers that show a running
+// count of who the thing is going to.
+function bindPeoplePicker(root, selected, { id = 'picker', onChange = null } = {}) {
   const search = root.querySelector(`#${id}-search`);
   const empty = root.querySelector(`#${id}-empty`);
   const options = [...root.querySelectorAll(`#${id}-list [data-user]`)];
@@ -648,6 +892,7 @@ function bindPeoplePicker(root, selected, { id = 'picker' } = {}) {
       const uid = Number(opt.dataset.user);
       selected.has(uid) ? selected.delete(uid) : selected.add(uid);
       opt.classList.toggle('on');
+      onChange?.(selected);
     };
   }
   return filter;
@@ -807,7 +1052,7 @@ function renderSchedule() {
     ${weekStatusHTML()}
     ${CAL_LEGEND}
     ${weekCalendarHTML(days, byDay)}
-  `, { fab: isAdmin });
+  `, { fab: isAdmin && 'New job' });
 
   document.getElementById('prev-week').onclick = () => {
     state.weekStart.setDate(state.weekStart.getDate() - 7);
@@ -1325,7 +1570,7 @@ async function renderChatList() {
         <span class="avatar lg" style="background:${esc(u.color)}">${esc(initials(u.name))}</span>
         <span class="info"><div class="name">${esc(u.name)}</div><div class="preview">Send a direct message</div></span>
       </button>`).join('')}
-  `, { fab: isAdmin });
+  `, { fab: isAdmin && 'New channel' });
 
   document.querySelectorAll('[data-channel]').forEach((b) => {
     b.onclick = () => { location.hash = `#/chat/${b.dataset.channel}`; };
@@ -1375,7 +1620,8 @@ async function renderChat(channelId) {
   state.chatMessages = messages;
 
   $app.innerHTML = `
-    <header class="topbar">
+    ${sidenavHTML('chat')}
+    <header class="topbar titled">
       <button class="icon-btn" id="back-btn">←</button>
       <h2>${esc(channel.name)}</h2>
     </header>
@@ -1439,7 +1685,7 @@ function renderVenues() {
         ${v.address ? `<button class="icon-btn" data-map="${encodeURIComponent(v.address)}" title="Open in Maps">🗺️</button>` : ''}
       </div>`).join('') : `
       <div class="empty"><div class="big">📍</div>No venues yet${isAdmin ? '<br>Tap ＋ to add your first venue' : ''}</div>`}
-  `, { fab: isAdmin, back: () => { location.hash = '#/more'; } });
+  `, { fab: isAdmin && 'New venue', back: () => { location.hash = '#/more'; } });
 
   document.querySelectorAll('[data-map]').forEach((b) => {
     b.onclick = (e) => { e.stopPropagation(); window.open(`https://maps.google.com/?q=${b.dataset.map}`, '_blank'); };
@@ -1790,11 +2036,38 @@ async function renderSettings() {
       <button class="btn secondary" id="goto-notif-prefs" style="margin-top:8px">Choose which notifications you get</button>
     </div>
 
+    ${state.me.role === 'admin' ? `
+      <div class="section-title">Text messaging</div>
+      <div class="card">
+        <div class="sub">The number team texts are sent from, and what the carrier charges per 160-character segment.</div>
+        <label>Sending number</label>
+        <input id="sms-from" value="${esc(state.settings.sms_from_number || '')}" placeholder="+1 209 555 0143">
+        <label>Price per segment (USD)</label>
+        <input id="sms-price" type="number" step="0.0001" min="0" value="${esc(state.settings.sms_price || '')}">
+        <p class="hint">Leave the number blank to use the <b>TWILIO_FROM_NUMBER</b> the server was started with. The account SID and auth token stay in the server's environment, never in the app.</p>
+        <button class="btn secondary" id="sms-save" style="margin-top:12px">Save texting settings</button>
+      </div>` : ''}
+
     <div class="section-title">Account</div>
     <div class="card">
       <button class="btn danger" id="logout">Sign out</button>
     </div>
   `, { back: () => { location.hash = '#/more'; } });
+
+  const smsSave = document.getElementById('sms-save');
+  if (smsSave) smsSave.onclick = async () => {
+    try {
+      const { settings } = await api('/api/settings', {
+        method: 'PUT',
+        body: {
+          sms_from_number: document.getElementById('sms-from').value,
+          sms_price: document.getElementById('sms-price').value,
+        },
+      });
+      state.settings = settings;
+      toast('Texting settings saved');
+    } catch (err) { toast(err.message); }
+  };
   document.querySelectorAll('[data-theme-opt]').forEach((b) => {
     b.onclick = () => { applyTheme(b.dataset.themeOpt); renderSettings(); };
   });
@@ -2319,7 +2592,7 @@ async function renderHours() {
     ${pending.length ? `<div class="section-title">Pending${isAdmin ? ' approval' : ''}</div>${pending.map(reqCard).join('')}` : ''}
     <div class="section-title">History</div>
     ${rest.length ? rest.map(reqCard).join('') : '<div class="empty"><div class="big">🕐</div>No hours requests yet.<br>Approved requests land straight in the timesheet.</div>'}
-  `, { back: () => { location.hash = '#/more'; }, fab: true });
+  `, { back: () => { location.hash = '#/more'; }, fab: 'Submit hours' });
 
   document.getElementById('fab').onclick = () => openHourRequestModal();
   document.querySelectorAll('[data-decide-hours]').forEach((b) => {
@@ -2352,7 +2625,7 @@ async function renderRoles() {
         <button class="icon-btn" data-edit-role="${r.id}">✏️</button>
         <button class="icon-btn" data-del-role="${r.id}">🗑️</button>
       </div>`).join('') : '<div class="empty"><div class="big">🧑‍🍳</div>No jobs yet — tap ＋ to add Server, Bar Back, Set Up…</div>'}
-  `, { back: () => { location.hash = '#/more'; }, fab: true });
+  `, { back: () => { location.hash = '#/more'; }, fab: 'New job type' });
 
   document.getElementById('fab').onclick = async () => {
     const name = prompt('New job name (e.g. Server, Bar Back):');
@@ -2410,7 +2683,7 @@ async function renderPositions() {
         <button class="icon-btn" data-edit-pos="${r.id}">✏️</button>
         <button class="icon-btn" data-del-pos="${r.id}">🗑️</button>
       </div>`).join('') : '<div class="empty"><div class="big">👥</div>No positions yet — tap ＋ to add e.g. Operations Manager, Shift Lead…</div>'}
-  `, { back: () => { location.hash = '#/more'; }, fab: true });
+  `, { back: () => { location.hash = '#/more'; }, fab: 'New position' });
 
   document.getElementById('fab').onclick = async () => {
     const name = prompt('New position name (e.g. Operations Manager, Shift Lead):');
@@ -2595,7 +2868,7 @@ async function renderChecklists() {
       <button class="btn" id="cl-week-pdf" style="margin-top:10px">⬇️ Download this week (PDF)</button>
       <p class="hint">Every checklist above, with each answer, photo and signature turned in between
         ${weekLabel(week)}.</p>` : ''}
-  `, { back: () => { location.hash = '#/more'; }, fab: isAdmin });
+  `, { back: () => { location.hash = '#/more'; }, fab: isAdmin && 'New checklist' });
 
   if (isAdmin) {
     document.getElementById('cl-week-prev').onclick = () => { state.clWeek = shiftWeek(week, -7); render(); };
@@ -2657,8 +2930,9 @@ const PHONE_STATUS_ICONS = `
   </svg>`;
 
 // `action` is the button at the foot of the phone; pass '' for a screen that
-// has nothing to submit.
-function phonePreviewHTML(id, { title = '', subtitle = '', action = '' } = {}) {
+// has nothing to submit. `reset` offers to redraw the screen — worth having
+// where the preview is tappable, pointless where it only mirrors typing.
+function phonePreviewHTML(id, { title = '', subtitle = '', action = '', reset = true } = {}) {
   return `
     <div class="phone-preview" id="${id}">
       <div class="phone-preview-label">Mobile Preview</div>
@@ -2670,7 +2944,7 @@ function phonePreviewHTML(id, { title = '', subtitle = '', action = '' } = {}) {
         ${action ? `<div class="phone-foot"><button type="button" class="phone-send" disabled>${esc(action)}</button></div>` : ''}
         <div class="phone-home"></div>
       </div>
-      <button type="button" class="phone-reset" data-phone-reset>↺ Reset preview</button>
+      ${reset ? '<button type="button" class="phone-reset" data-phone-reset>↺ Reset preview</button>' : ''}
     </div>`;
 }
 
@@ -2686,7 +2960,8 @@ function bindPhonePreview(root, paint, { onPaint = null } = {}) {
     screen.scrollTop = at;
     onPaint?.(screen);
   };
-  root.querySelector('[data-phone-reset]').onclick = () => { repaint(); screen.scrollTop = 0; };
+  const resetBtn = root.querySelector('[data-phone-reset]');
+  if (resetBtn) resetBtn.onclick = () => { repaint(); screen.scrollTop = 0; };
   repaint();
   return {
     repaint,
@@ -2732,6 +3007,8 @@ function openChecklistEditor(list) {
   const draw = () => {
     panel.innerHTML = `
       <h3>${draft.id ? 'Edit checklist' : 'New checklist'}</h3>
+      <div class="editor-split">
+      <div class="editor-main">
       <label>Title</label>
       <input id="cl-title" value="${esc(draft.title)}" placeholder="e.g. Cleaning Checklist — The Grand Oak">
       <label>Venue</label>
@@ -2771,7 +3048,11 @@ function openChecklistEditor(list) {
           <button type="button" class="pill" data-cl-add="${type}" title="${esc(spec.hint)}">${spec.icon} ${spec.label}</button>`).join('')}
       </div>
 
-      ${phonePreviewHTML('cl-preview', { title: previewTitle(), subtitle: previewVenue(), action: '➤ Send' })}
+      </div>
+      <div class="editor-side">
+        ${phonePreviewHTML('cl-preview', { title: previewTitle(), subtitle: previewVenue(), action: '➤ Send' })}
+      </div>
+      </div>
 
       <div class="actions">
         <button type="button" class="btn secondary" id="cl-cancel">Cancel</button>
@@ -2959,25 +3240,51 @@ function openChecklistFill(list, shiftId = null, onDone = null) {
   const answers = {};
   const pads = {};
   const body = checklistFieldsHTML(list.fields);
+  // One draft per checklist per shift, so the same checklist filled at two jobs
+  // never overwrites itself.
+  const draftId = `${list.id}:${shiftId || 0}`;
+  const draft = loadDraft('checklist', draftId);
+  const heavyFields = list.fields.filter((f) => f.type === 'photo' || f.type === 'signature').map((f) => f.id);
 
   const modal = openModal(`
     <h3>${esc(list.title)}</h3>
     <p class="sub">${esc(list.venue_name || '')}</p>
+    ${draft ? `
+      <div class="review-banner" id="cl-resume">
+        ↩︎ Picked up where you left off — saved ${esc(draftAgo(draft.saved_at))}${draft.trimmed ? ' (photos and signatures were not held)' : ''}.
+        <button type="button" class="btn small secondary" id="cl-restart" style="margin-top:8px">Start over</button>
+      </div>` : ''}
     <div class="cl-fill">${body || '<p class="hint">This checklist has no fields yet.</p>'}</div>
+    <div class="draft-note" id="cl-draft-note"></div>
     <div class="actions">
-      <button type="button" class="btn secondary" id="cl-fill-cancel">Cancel</button>
+      <button type="button" class="btn secondary" id="cl-fill-cancel">Close</button>
       <button type="button" class="btn" id="cl-fill-send">Send</button>
     </div>
   `, { wide: true });
 
+  const note = modal.querySelector('#cl-draft-note');
+  // Every tap, every keystroke: the answers go to the device before anything
+  // else happens, so nothing depends on remembering to save.
+  const keep = () => {
+    for (const [id, pad] of Object.entries(pads)) {
+      if (!pad.isEmpty()) answers[id] = pad.toDataURL();
+    }
+    const light = Object.fromEntries(Object.entries(answers).filter(([id]) => !heavyFields.includes(id)));
+    showDraftState(note, saveDraft('checklist', draftId, { answers }, { fallback: { answers: light } }));
+  };
+
+  if (draft?.answers) Object.assign(answers, draft.answers);
+
   // Yes / Not Applicable
   modal.querySelectorAll('[data-answer]').forEach((b) => {
+    if (answers[b.dataset.for] === b.dataset.answer) b.classList.remove('secondary');
     b.onclick = () => {
       const id = b.dataset.for;
       answers[id] = b.dataset.answer;
       modal.querySelectorAll(`[data-for="${id}"]`).forEach((other) => {
         other.classList.toggle('secondary', other !== b);
       });
+      keep();
     };
   });
 
@@ -2985,10 +3292,16 @@ function openChecklistFill(list, shiftId = null, onDone = null) {
     const id = input.dataset.input;
     if (input.type === 'range') {
       const out = modal.querySelector(`[data-out="${id}"]`);
-      answers[id] = Number(input.value);
+      if (answers[id] !== undefined) { input.value = answers[id]; out.textContent = input.value; }
+      else answers[id] = Number(input.value);
       input.oninput = () => { answers[id] = Number(input.value); out.textContent = input.value; };
+      input.onchange = keep;
     } else {
-      input.onchange = () => { answers[id] = input.value ? new Date(input.value).toISOString() : ''; };
+      if (answers[id]) input.value = toLocalInput(answers[id]);
+      input.onchange = () => {
+        answers[id] = input.value ? new Date(input.value).toISOString() : '';
+        keep();
+      };
     }
   });
 
@@ -2996,6 +3309,11 @@ function openChecklistFill(list, shiftId = null, onDone = null) {
     const id = b.dataset.photoBtn;
     const file = modal.querySelector(`[data-photo="${id}"]`);
     const preview = modal.querySelector(`[data-photo-preview="${id}"]`);
+    if (answers[id]) {
+      preview.src = answers[id];
+      preview.hidden = false;
+      b.textContent = '📷 Replace photo';
+    }
     b.onclick = () => file.click();
     file.onchange = async () => {
       const chosen = file.files?.[0];
@@ -3005,6 +3323,7 @@ function openChecklistFill(list, shiftId = null, onDone = null) {
         preview.src = answers[id];
         preview.hidden = false;
         b.textContent = '📷 Replace photo';
+        keep();
       } catch { toast('That photo could not be read'); }
     };
   });
@@ -3012,9 +3331,19 @@ function openChecklistFill(list, shiftId = null, onDone = null) {
   for (const f of list.fields.filter((x) => x.type === 'signature')) {
     pads[f.id] = initSignaturePad(
       modal.querySelector(`[data-sign="${f.id}"]`),
-      modal.querySelector(`[data-sign-clear="${f.id}"]`)
+      modal.querySelector(`[data-sign-clear="${f.id}"]`),
+      { onChange: keep }
     );
+    if (answers[f.id]) pads[f.id].load(answers[f.id]);
   }
+
+  const restart = modal.querySelector('#cl-restart');
+  if (restart) restart.onclick = () => {
+    if (!confirm('Clear the saved answers and start this checklist over?')) return;
+    clearDraft('checklist', draftId);
+    closeModal();
+    openChecklistFill(list, shiftId, onDone);
+  };
 
   modal.querySelector('#cl-fill-cancel').onclick = closeModal;
   modal.querySelector('#cl-fill-send').onclick = async () => {
@@ -3038,6 +3367,7 @@ function openChecklistFill(list, shiftId = null, onDone = null) {
     send.disabled = true;
     try {
       await api(`/api/checklists/${list.id}/submit`, { method: 'POST', body: { shift_id: shiftId, answers } });
+      clearDraft('checklist', draftId);   // it's on the server now
       closeModal();
       toast('Checklist sent ✅');
       onDone ? onDone() : render();
@@ -3263,7 +3593,7 @@ async function renderKnowledge() {
       : `<div class="empty"><div class="big">📖</div>${state.kbQuery
         ? 'Nothing matches that search'
         : (isAdmin ? 'No articles yet — tap ＋ to write the first rule sheet' : 'No articles shared with your position yet')}</div>`}
-  `, { back: () => { location.hash = '#/more'; }, fab: isAdmin });
+  `, { back: () => { location.hash = '#/more'; }, fab: isAdmin && 'New article' });
 
   // Filter without a full re-render so the box keeps focus as you type.
   const search = document.getElementById('kb-search');
@@ -3320,6 +3650,8 @@ function openArticleEditor(article, all = []) {
 
   const modal = openModal(`
     <h3>${article ? 'Edit article' : 'New article'}</h3>
+    <div class="editor-split">
+    <div class="editor-main">
     <label>Folder</label>
     <input id="kb-folder" list="kb-folders" value="${esc(article?.folder || '')}" placeholder="e.g. Professionalism">
     <datalist id="kb-folders">${folders.map((f) => `<option value="${esc(f)}">`).join('')}</datalist>
@@ -3352,16 +3684,19 @@ function openArticleEditor(article, all = []) {
 ## FOOD SAFETY
 - Touch your face? **Change your gloves.**">${esc(article?.body || '')}</textarea>
 
-    ${phonePreviewHTML('kb-preview', {
-      title: article?.title || 'Untitled article',
-      subtitle: article?.folder || 'General',
-      action: 'Close',
-    })}
-
     <label class="check-label">
       <input type="checkbox" id="kb-published" style="width:auto" ${article?.published !== 0 ? 'checked' : ''}>
       Published — visible to the team
     </label>
+    </div>
+    <div class="editor-side">
+      ${phonePreviewHTML('kb-preview', {
+        title: article?.title || 'Untitled article',
+        subtitle: article?.folder || 'General',
+        action: 'Close',
+      })}
+    </div>
+    </div>
 
     <div class="actions">
       ${article ? '<button type="button" class="btn danger" id="kb-delete">Delete</button>' : ''}
@@ -3523,7 +3858,7 @@ async function renderAvailability() {
     ${singles.size ? `<div class="section-title">One-off</div>${singleCards}` : ''}
     ${!series.size && !singles.size
       ? '<div class="empty"><div class="big">📗</div>You have no unavailability set.<br>Tap ＋ to add a day or time you can\'t work.</div>' : ''}
-  `, { fab: true });
+  `, { fab: 'Mark unavailable' });
 
   document.getElementById('fab').onclick = () => openUnavailModal();
   document.querySelectorAll('[data-del-unavail]').forEach((b) => {
@@ -3680,7 +4015,7 @@ async function renderForms() {
           ${isAdmin ? `<button class="btn small danger" data-del-form="${f.id}">Delete</button>` : ''}
         </div>
       </div>`).join('') : `<div class="empty"><div class="big">📄</div>No documents yet${isAdmin ? '<br>Tap ＋ to upload a PDF for the team to sign' : ''}</div>`}
-  `, { back: () => { location.hash = '#/more'; }, fab: isAdmin });
+  `, { back: () => { location.hash = '#/more'; }, fab: isAdmin && 'Upload document' });
 
   if (isAdmin) {
     document.getElementById('fab').onclick = openDocumentUpload;
@@ -3759,6 +4094,7 @@ function openDocumentUpload() {
 }
 
 function openSignDocument(form) {
+  const draft = loadDraft('document', form.id);
   const modal = openModal(`
     <h3>${esc(form.title)}</h3>
     ${form.description ? `<p class="sub">${esc(form.description)}</p>` : ''}
@@ -3775,11 +4111,13 @@ function openSignDocument(form) {
       </div>`}
     <button type="button" class="btn secondary" id="open-doc">📄 Open document full screen</button>
     <form id="sign-form">
-      <label class="check-label"><input type="checkbox" id="read-ack" required style="width:auto"> I have read this document</label>
+      ${draft ? `<div class="review-banner">↩︎ Picked up where you left off — saved ${esc(draftAgo(draft.saved_at))}${
+        draft.trimmed ? ' (the signature was too big to hold)' : ''}.</div>` : ''}
+      <label class="check-label"><input type="checkbox" id="read-ack" required style="width:auto" ${draft?.read ? 'checked' : ''}> I have read this document</label>
       <div class="sign-block">
         <div class="sign-head">Signature</div>
         <label>Type your full legal name</label>
-        <input name="signed_name" required autocomplete="name" placeholder="Jane Doe" value="${esc(state.me.name)}">
+        <input name="signed_name" required autocomplete="name" placeholder="Jane Doe" value="${esc(draft?.signed_name ?? state.me.name)}">
         <label>Draw your signature</label>
         <div class="sign-pad-wrap">
           <canvas id="sign-pad" class="sign-pad"></canvas>
@@ -3787,14 +4125,31 @@ function openSignDocument(form) {
         </div>
         <p class="hint">By signing you agree this electronic signature is the legal equivalent of your handwritten signature on this document.</p>
       </div>
+      <div class="draft-note" id="sign-draft-note"></div>
       <div class="actions">
-        <button type="button" class="btn secondary" id="sign-cancel">Cancel</button>
+        <button type="button" class="btn secondary" id="sign-cancel">Close</button>
         <button type="submit" class="btn">Sign document</button>
       </div>
     </form>
   `);
 
-  const pad = initSignaturePad(modal.querySelector('#sign-pad'), modal.querySelector('#sign-clear'));
+  const ack = modal.querySelector('#read-ack');
+  const nameInput = modal.querySelector('[name="signed_name"]');
+  const note = modal.querySelector('#sign-draft-note');
+  // The tick, the typed name and the drawn signature are all kept as they
+  // happen, so reading a long PDF and coming back later starts where it stopped.
+  const keep = () => {
+    const full = { read: ack.checked, signed_name: nameInput.value, signature: pad.isEmpty() ? '' : pad.toDataURL() };
+    showDraftState(note, saveDraft('document', form.id, full, {
+      fallback: { read: full.read, signed_name: full.signed_name },
+    }));
+  };
+
+  const pad = initSignaturePad(modal.querySelector('#sign-pad'), modal.querySelector('#sign-clear'), { onChange: keep });
+  if (draft?.signature) pad.load(draft.signature);
+  ack.onchange = keep;
+  nameInput.oninput = keep;
+
   modal.querySelector('#open-doc').onclick = () => window.open(`/api/forms/${form.id}/document`, '_blank');
   modal.querySelector('#sign-cancel').onclick = closeModal;
   modal.querySelector('#sign-form').onsubmit = async (e) => {
@@ -3805,6 +4160,7 @@ function openSignDocument(form) {
         method: 'POST',
         body: { signature: pad.toDataURL(), signed_name: e.target.elements.signed_name.value },
       });
+      clearDraft('document', form.id);
       closeModal(); toast('Signed ✅');
       render();
     } catch (err) { toast(err.message); }
@@ -3840,7 +4196,7 @@ async function renderFieldPlacer(formId) {
   const placed = fields.map((f) => ({ ...f }));
 
   $app.innerHTML = `
-    <header class="topbar">
+    <header class="topbar titled">
       <button class="icon-btn" id="fp-back">←</button>
       <h2>Place signatures</h2>
       <button class="btn small" id="fp-save">Save</button>
@@ -4034,7 +4390,9 @@ async function renderSignedDocs() {
 }
 
 // Finger/mouse signature capture on a canvas sized to its container.
-function initSignaturePad(canvas, clearBtn) {
+// `onChange` fires when a stroke ends or the pad is cleared, so a form can save
+// the signature the moment it is drawn rather than only on submit.
+function initSignaturePad(canvas, clearBtn, { onChange = null } = {}) {
   const ratio = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
   canvas.width = rect.width * ratio;
@@ -4061,7 +4419,11 @@ function initSignaturePad(canvas, clearBtn) {
     ctx.lineTo(x, y); ctx.stroke();
     dirty = true;
   };
-  const end = () => { drawing = false; };
+  const end = () => {
+    if (!drawing) return;
+    drawing = false;
+    if (dirty) onChange?.();
+  };
 
   canvas.addEventListener('mousedown', start);
   canvas.addEventListener('mousemove', move);
@@ -4070,10 +4432,24 @@ function initSignaturePad(canvas, clearBtn) {
   canvas.addEventListener('touchmove', move, { passive: false });
   canvas.addEventListener('touchend', end);
 
-  clearBtn.onclick = () => { ctx.clearRect(0, 0, canvas.width, canvas.height); dirty = false; };
+  clearBtn.onclick = () => {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    dirty = false;
+    onChange?.();
+  };
 
   return {
     isEmpty: () => !dirty,
+    // Puts a saved signature back on the pad, so a resumed form shows the name
+    // the person already drew instead of a blank box.
+    load: (dataUrl) => {
+      const img = new Image();
+      img.onload = () => {
+        ctx.drawImage(img, 0, 0, canvas.width / ratio, canvas.height / ratio);
+        dirty = true;
+      };
+      img.src = dataUrl;
+    },
     // Flatten onto white so the PNG reads correctly in the PDF.
     toDataURL: () => {
       const out = document.createElement('canvas');
@@ -4155,7 +4531,7 @@ async function renderAttire() {
         ${a.description ? `<span class="sub attire-desc">${esc(a.description)}</span>` : ''}
       </button>`).join('')}</div>`
       : `<div class="empty"><div class="big">👔</div>No attire set up yet${isAdmin ? '<br>Tap ＋ to add one (e.g. Black Formal, Banquet Whites)' : ''}</div>`}
-  `, { fab: isAdmin, back: () => { location.hash = '#/more'; } });
+  `, { fab: isAdmin && 'New outfit', back: () => { location.hash = '#/more'; } });
 
   if (isAdmin) document.getElementById('fab').onclick = () => openAttireModal();
   document.querySelectorAll('[data-attire]').forEach((b) => {
@@ -4482,7 +4858,7 @@ async function renderUpdates() {
       <button class="pill ${tab === 'posts' ? 'active' : ''}" data-utab="posts">Company updates</button>
     </div>
     ${tab === 'activity' ? activity : announcements}
-  `, { fab: isAdmin && tab === 'posts' });
+  `, { fab: isAdmin && tab === 'posts' && 'New update' });
 
   document.querySelectorAll('[data-utab]').forEach((b) => {
     b.onclick = () => { state.updatesTab = b.dataset.utab; render(); };
@@ -4547,6 +4923,312 @@ async function renderUpdates() {
   });
 }
 
+/* ------------------------------- text messages ------------------------------- */
+
+/* One message from the office number, out to every phone on the team, now or at
+   a time you pick. The screen is the record of what went where: who sent it,
+   how many it reached, and what it cost. */
+
+const TEXT_STATUS = {
+  delivered: { label: 'Delivered', tone: 'accepted' },
+  app: { label: 'Sent in app', tone: 'accepted' },
+  queued: { label: 'Queued', tone: 'pending' },
+  failed: { label: 'Failed', tone: 'declined' },
+  no_number: { label: 'No number', tone: 'pending' },
+  canceled: { label: 'Canceled', tone: 'declined' },
+};
+
+// 160 GSM-7 characters a segment, 70 once the text needs unicode — the same
+// arithmetic the server bills on, so the estimate matches the invoice.
+function smsSegments(body) {
+  const text = String(body || '');
+  if (!text.length) return 0;
+  const unicode = /[^\x00-\x7F]/.test(text);
+  const single = unicode ? 70 : 160;
+  const multi = unicode ? 67 : 153;
+  return text.length <= single ? 1 : Math.ceil(text.length / multi);
+}
+
+function money(n) {
+  const value = Number(n) || 0;
+  return value && value < 0.01 ? `$${value.toFixed(5)}` : `$${value.toFixed(2)}`;
+}
+
+function fmtStamp(iso) {
+  if (!iso) return '';
+  const d = new Date(iso.endsWith('Z') || iso.includes('+') ? iso : iso + 'Z');
+  return d.toLocaleString([], { month: '2-digit', day: '2-digit', year: 'numeric', hour: 'numeric', minute: '2-digit' });
+}
+
+function deliveryRate(msg) {
+  if (!msg.recipients) return { pct: 0, cls: 'none' };
+  const pct = Math.round((msg.delivered / msg.recipients) * 100);
+  return { pct, cls: pct === 100 ? 'good' : pct > 0 ? 'part' : 'none' };
+}
+
+async function renderTexts() {
+  if (state.me.role !== 'admin') { location.hash = '#/schedule'; return; }
+  const [{ messages }, config] = await Promise.all([api('/api/texts'), api('/api/texts/config')]);
+  state.textConfig = config;
+
+  const banner = config.configured
+    ? `<div class="review-banner ok">📲 Texts go out from <b>${esc(config.from_number)}</b> to ${config.reachable} of ${config.headcount} team members with a mobile number on file.</div>`
+    : `<div class="review-banner">📲 No texting account connected yet — messages reach the team as a notification in the app instead. Add <b>TWILIO_ACCOUNT_SID</b>, <b>TWILIO_AUTH_TOKEN</b> and a sending number to send real texts.</div>`;
+
+  const rows = messages.map((m) => {
+    const rate = deliveryRate(m);
+    const scheduled = m.status === 'scheduled';
+    return `
+      <tr class="row-link" data-text="${m.id}">
+        <td class="cell-main" data-label="Date & time">
+          ${esc(fmtStamp(m.sent_at || m.scheduled_at || m.created_at))}
+          ${scheduled ? '<span class="status-tag pending" style="margin-left:6px">Scheduled</span>' : ''}
+          ${m.status === 'canceled' ? '<span class="status-tag denied" style="margin-left:6px">Canceled</span>' : ''}
+        </td>
+        <td class="cell-who" data-label="Sent by">
+          <span class="avatar" style="background:${esc(m.sent_by_color || '#888')}">${esc(initials(m.sent_by_name || '?'))}</span>
+          ${esc(m.sent_by_name || 'Removed user')}
+        </td>
+        <td class="cell-via" data-label="Sent via">${config.configured ? 'Text Messages' : 'App notification'}</td>
+        <td class="cell-msg" data-label="Message"><span class="msg-snippet">${esc(m.body)}</span></td>
+        <td class="cell-people" data-label="Recipients">${m.recipients} user${m.recipients === 1 ? '' : 's'}</td>
+        <td data-label="Delivered to">${m.sent_at ? `<span class="rate ${rate.cls}">${rate.pct}%</span>` : '—'}</td>
+        <td class="cell-num" data-label="Price">${money(m.price)}</td>
+      </tr>`;
+  }).join('');
+
+  shell('Text messages', `
+    ${banner}
+    ${messages.length ? `
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Date &amp; time</th><th>Sent by</th><th>Sent via</th><th>Message</th>
+              <th>Recipients</th><th>Delivered to</th><th class="cell-num">Price</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`
+      : `<div class="empty"><div class="big">✉️</div>No messages sent yet<br>Write one and it lands on every phone at once.</div>`}
+  `, { back: () => { location.hash = '#/more'; }, fab: 'New message' });
+
+  document.getElementById('fab').onclick = () => openTextComposer();
+  document.querySelectorAll('[data-text]').forEach((row) => {
+    row.onclick = () => openTextDetail(Number(row.dataset.text));
+  });
+}
+
+async function openTextDetail(id) {
+  const { message, recipients } = await api(`/api/texts/${id}`);
+  const rate = deliveryRate(message);
+  const modal = openModal(`
+    <h3>${esc(message.body.slice(0, 60))}${message.body.length > 60 ? '…' : ''}</h3>
+    <p class="sub">${esc(fmtStamp(message.sent_at || message.scheduled_at || message.created_at))}${
+      message.status === 'scheduled' ? ' · scheduled' : ''}</p>
+
+    <div class="card" style="margin-top:12px;white-space:pre-wrap">${esc(message.body)}</div>
+
+    <div class="detail-rows">
+      <div class="detail-row"><span class="detail-ico">👤</span><span>Sent by</span><b>${esc(message.sent_by_name || 'Removed user')}</b></div>
+      <div class="detail-row"><span class="detail-ico">📶</span><span>Delivered to</span>
+        ${message.sent_at
+          ? `<b class="rate ${rate.cls}">${rate.pct}% · ${message.delivered} of ${message.recipients}</b>`
+          : `<b>${message.status === 'canceled' ? 'Canceled before sending' : 'Not sent yet'}</b>`}
+      </div>
+      <div class="detail-row"><span class="detail-ico">👥</span><span>Recipients</span><b>${message.recipients} user${message.recipients === 1 ? '' : 's'}</b></div>
+      <div class="detail-row"><span class="detail-ico">💲</span><span>Cost</span><b>${money(message.price)}</b></div>
+      <div class="detail-row"><span class="detail-ico">✉️</span><span>Length</span><b>${message.body.length} chars · ${message.segments} segment${message.segments === 1 ? '' : 's'}</b></div>
+    </div>
+
+    <div class="section-title">Recipients</div>
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead><tr><th>Name</th><th>Mobile phone</th><th>Status</th><th class="cell-num">Price</th></tr></thead>
+        <tbody>
+          ${recipients.map((r) => {
+            const spec = TEXT_STATUS[r.status] || { label: r.status, tone: 'pending' };
+            return `
+            <tr>
+              <td class="cell-main cell-who" data-label="Name">
+                <span class="avatar" style="background:${esc(r.user_color || '#888')}">${esc(initials(r.name || '?'))}</span>
+                ${esc(r.name)}
+              </td>
+              <td data-label="Mobile phone">${esc(fmtPhone(r.phone) || '—')}</td>
+              <td data-label="Status">
+                <span class="status-tag ${spec.tone === 'accepted' ? 'approved' : spec.tone === 'declined' ? 'denied' : 'pending'}">${esc(spec.label)}</span>
+                ${r.error ? `<div class="sub">${esc(r.error)}</div>` : ''}
+              </td>
+              <td class="cell-num" data-label="Price">${money(r.price)}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="actions">
+      <button type="button" class="btn danger" id="text-delete">${message.status === 'scheduled' ? 'Cancel send' : 'Delete record'}</button>
+      <button type="button" class="btn secondary" id="text-close">Close</button>
+    </div>
+  `, { wide: true });
+
+  modal.querySelector('#text-close').onclick = closeModal;
+  modal.querySelector('#text-delete').onclick = async () => {
+    const scheduled = message.status === 'scheduled';
+    if (!confirm(scheduled ? 'Cancel this scheduled message?' : 'Delete this message record?')) return;
+    try {
+      await api(`/api/texts/${id}`, { method: 'DELETE' });
+      closeModal();
+      toast(scheduled ? 'Send canceled' : 'Record deleted');
+      render();
+    } catch (err) { toast(err.message); }
+  };
+}
+
+function openTextComposer() {
+  const config = state.textConfig || { configured: false, price: 0, reachable: 0, headcount: state.users.length };
+  const selected = new Set();          // empty = the whole team
+  let audience = 'all';
+  let timing = 'now';
+
+  // Default a scheduled send to the next round hour, so the pickers open on
+  // something sensible rather than on midnight.
+  const soon = new Date(Date.now() + 60 * 60 * 1000);
+  soon.setMinutes(0, 0, 0);
+  const pad = (n) => String(n).padStart(2, '0');
+  const defaultDate = `${soon.getFullYear()}-${pad(soon.getMonth() + 1)}-${pad(soon.getDate())}`;
+  const defaultTime = `${pad(soon.getHours())}:${pad(soon.getMinutes())}`;
+
+  const modal = openModal(`
+    <h3>New message</h3>
+    <p class="sub">${config.configured
+      ? `Sent as a text from ${esc(config.from_number)}.`
+      : 'Delivered in the app as a notification — connect a texting account to send real texts.'}</p>
+
+    <div class="editor-split">
+      <div class="editor-main">
+        <label>Who gets it</label>
+        <div class="filter-row">
+          <button type="button" class="pill active" data-aud="all">Everyone (${config.headcount})</button>
+          <button type="button" class="pill" data-aud="some">Pick people</button>
+        </div>
+        <div id="tx-people" hidden>
+          ${peoplePickerHTML(state.users, selected, { id: 'tx', placeholder: 'Search by name or position…' })}
+        </div>
+
+        <label>Message</label>
+        <textarea id="tx-body" rows="5" maxlength="1600" placeholder="Hello — most of the schedule has been dropped for the month…"></textarea>
+        <div class="sub" id="tx-count" style="margin-top:6px"></div>
+
+        <label style="margin-top:14px">When</label>
+        <div class="filter-row">
+          <button type="button" class="pill active" data-when="now">Send now</button>
+          <button type="button" class="pill" data-when="later">Schedule</button>
+        </div>
+        <div id="tx-schedule" hidden>
+          <div class="row" style="gap:10px;align-items:flex-end">
+            <span class="grow"><label style="margin-top:0">Date</label><input type="date" id="tx-date" value="${defaultDate}"></span>
+            <span class="grow"><label style="margin-top:0">Time</label><input type="time" id="tx-time" value="${defaultTime}"></span>
+          </div>
+          <p class="hint">Held until then, and sent automatically — you don't have to be online.</p>
+        </div>
+      </div>
+
+      <div class="editor-side">
+        ${phonePreviewHTML('tx-preview', {
+          title: config.configured ? config.from_number : 'E&E Management',
+          subtitle: 'Text message',
+          reset: false,
+        })}
+      </div>
+    </div>
+
+    <div class="actions">
+      <button type="button" class="btn secondary" id="tx-cancel">Cancel</button>
+      <button type="button" class="btn" id="tx-send">Send now</button>
+    </div>
+  `, { wide: true });
+
+  const body = modal.querySelector('#tx-body');
+  const count = modal.querySelector('#tx-count');
+  const sendBtn = modal.querySelector('#tx-send');
+  const preview = bindPhonePreview(
+    modal.querySelector('#tx-preview'),
+    () => (body.value.trim()
+      ? `<div class="sms-bubble">${esc(body.value)}</div>`
+      : '<p class="phone-empty">Type the message and it appears here, the way it lands on their phone.</p>')
+  );
+
+  const audienceCount = () => (audience === 'all' ? config.headcount : selected.size);
+  const refresh = () => {
+    const segments = smsSegments(body.value);
+    const people = audienceCount();
+    const cost = config.configured ? segments * (config.price || 0) * people : 0;
+    count.textContent = `${body.value.length} characters · ${segments} segment${segments === 1 ? '' : 's'} · `
+      + `${people} recipient${people === 1 ? '' : 's'}`
+      + (config.configured ? ` · about ${money(cost)}` : '');
+    sendBtn.textContent = timing === 'later' ? 'Schedule message' : 'Send now';
+    preview.repaint();
+  };
+
+  bindPeoplePicker(modal, selected, { id: 'tx', onChange: () => refresh() });
+
+  body.oninput = refresh;
+  modal.querySelectorAll('[data-aud]').forEach((b) => {
+    b.onclick = () => {
+      audience = b.dataset.aud;
+      modal.querySelectorAll('[data-aud]').forEach((x) => x.classList.toggle('active', x === b));
+      modal.querySelector('#tx-people').hidden = audience === 'all';
+      refresh();
+    };
+  });
+  modal.querySelectorAll('[data-when]').forEach((b) => {
+    b.onclick = () => {
+      timing = b.dataset.when;
+      modal.querySelectorAll('[data-when]').forEach((x) => x.classList.toggle('active', x === b));
+      modal.querySelector('#tx-schedule').hidden = timing === 'now';
+      refresh();
+    };
+  });
+
+  modal.querySelector('#tx-cancel').onclick = closeModal;
+  sendBtn.onclick = async () => {
+    const text = body.value.trim();
+    if (!text) return toast('Write the message first');
+    if (audience === 'some' && !selected.size) return toast('Pick who it goes to');
+
+    let scheduled_at = null;
+    if (timing === 'later') {
+      const date = modal.querySelector('#tx-date').value;
+      const time = modal.querySelector('#tx-time').value;
+      if (!date || !time) return toast('Pick the date and time to send it');
+      const at = new Date(`${date}T${time}`);
+      if (Number.isNaN(at.getTime())) return toast('That date and time is not valid');
+      if (at.getTime() <= Date.now()) return toast('Pick a time in the future');
+      scheduled_at = at.toISOString();
+    }
+
+    sendBtn.disabled = true;
+    try {
+      const out = await api('/api/texts', {
+        method: 'POST',
+        body: { body: text, scheduled_at, user_ids: audience === 'all' ? null : [...selected] },
+      });
+      closeModal();
+      toast(out.scheduled
+        ? `Scheduled for ${out.recipients} recipient${out.recipients === 1 ? '' : 's'}`
+        : `Sending to ${out.recipients} recipient${out.recipients === 1 ? '' : 's'}…`);
+      render();
+    } catch (err) {
+      sendBtn.disabled = false;
+      toast(err.message);
+    }
+  };
+
+  refresh();
+}
+
 /* ---------------------------------- more hub --------------------------------- */
 
 function renderMore() {
@@ -4557,6 +5239,7 @@ function renderMore() {
     { href: '#/checklists', icon: '📋', label: 'Checklists', sub: isAdmin ? 'Build the per-shift checklists for each venue' : 'Shift checklists you fill in' },
     { href: '#/knowledge', icon: '📖', label: 'Knowledge Base', sub: 'The rules we all work to' },
     ...(isAdmin ? [
+      { href: '#/texts', icon: '✉️', label: 'Text Messages', sub: 'One message to every phone, now or scheduled' },
       { href: '#/attire', icon: '👔', label: 'Attire', sub: 'What the team wears on each job' },
       { href: '#/timesheets', icon: '🧾', label: 'Timesheets', sub: 'Review, approve & download hours' },
       { href: '#/kiosk', icon: '🔢', label: 'Kiosk Mode', sub: 'Lock this device into a PIN punch clock' },
@@ -4621,6 +5304,7 @@ async function render() {
     else if (view === 'checklist-subs' && arg) await renderChecklistSubmissions(Number(arg));
     else if (view === 'place' && arg) await renderFieldPlacer(Number(arg));
     else if (view === 'updates') await renderUpdates();
+    else if (view === 'texts') await renderTexts();
     else if (view === 'more') renderMore();
     else if (view === 'venues') renderVenues();
     else if (view === 'team') renderTeam();
