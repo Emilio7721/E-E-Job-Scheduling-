@@ -1029,10 +1029,14 @@ function renderSchedule() {
   for (const s of state.shifts) (byDay[dateKey(new Date(s.starts_at))] ||= []).push(s);
   const isAdmin = state.me.role === 'admin';
 
-  // New jobs default to today when the visible week contains it.
+  // The day a new job lands on. Whatever was tapped stays picked while it is on
+  // screen; paging to another week falls back to today, else that week's Monday.
   const todayKey = dateKey(new Date());
-  state.selectedDay = byDay[todayKey] !== undefined || days.some((d) => dateKey(d) === todayKey)
-    ? todayKey : dateKey(days[0]);
+  const weekKeys = days.map(dateKey);
+  if (!weekKeys.includes(state.selectedDay)) {
+    state.selectedDay = weekKeys.includes(todayKey) ? todayKey : weekKeys[0];
+  }
+  const selectedDate = new Date(`${state.selectedDay}T12:00`);
 
   const rangeLabel = `${days[0].toLocaleDateString([], { month: 'short', day: 'numeric' })} – ${days[6].toLocaleDateString([], { month: 'short', day: 'numeric' })}`;
 
@@ -1052,6 +1056,9 @@ function renderSchedule() {
     ${weekStatusHTML()}
     ${CAL_LEGEND}
     ${weekCalendarHTML(days, byDay)}
+    ${isAdmin ? `<p class="cal-hint">Tap a date to schedule on it — new jobs start on <b id="sel-day">${
+      esc(selectedDate.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' }))
+    }</b>. Tap an empty slot to add a job at that hour.</p>` : ''}
   `, { fab: isAdmin && 'New job' });
 
   document.getElementById('prev-week').onclick = () => {
@@ -1071,6 +1078,26 @@ function renderSchedule() {
     el.onclick = () => openShiftDetail(state.shifts.find((s) => s.id === Number(el.dataset.shift)));
   });
 
+  // Tapping a date picks the day every new job starts on — no reload needed,
+  // the week's jobs are already in hand.
+  document.querySelectorAll('.cal-day[data-day]').forEach((btn) => {
+    btn.onclick = () => { state.selectedDay = btn.dataset.day; render(); };
+  });
+
+  // Tapping empty space in a day is the quick way in: it picks the day *and*
+  // the hour, and opens the sheet already filled in.
+  if (isAdmin) {
+    document.querySelectorAll('.cal-col[data-day]').forEach((col) => {
+      col.onclick = (e) => {
+        if (e.target.closest('.grid-shift')) return;   // that's a job, not empty space
+        const y = e.clientY - col.getBoundingClientRect().top;
+        const minutes = Math.max(0, Math.min(23 * 60 + 30, Math.floor(y / CAL_PX_PER_HOUR * 2) * 30));
+        state.selectedDay = col.dataset.day;
+        openShiftModal(null, { day: col.dataset.day, startMin: minutes });
+      };
+    });
+  }
+
   // The banner is a shortcut straight to the first job that needs an answer.
   const jump = document.getElementById('jump-pending');
   if (jump) jump.onclick = () => {
@@ -1078,13 +1105,29 @@ function renderSchedule() {
     if (next) openShiftDetail(next);
   };
 
-  // Scroll so the working part of the day is what you land on.
+  // The grid runs midnight to midnight, so where it opens matters. Down: the
+  // now-line, else the first job of the week, else 7 AM. Across: on a phone the
+  // week is wider than the screen, so it opens on today — or on whichever day
+  // is picked when today isn't in this week.
   const body = document.querySelector('.cal-scroll');
   if (body) {
-    const marker = document.querySelector('.cal-now');
-    const firstShift = document.querySelector('.grid-shift');
-    const target = marker || firstShift;
-    if (target) body.scrollTop = Math.max(0, target.offsetTop - 90);
+    const target = document.querySelector('.cal-now') || document.querySelector('.grid-shift');
+    body.scrollTop = target
+      ? Math.max(0, target.offsetTop - 90)
+      : 7 * CAL_PX_PER_HOUR;
+
+    const column = document.querySelector(`.cal-col[data-day="${state.selectedDay}"]`)
+      || document.querySelector('.cal-col.today');
+    if (column && body.scrollWidth > body.clientWidth) {
+      // Sit the day just right of the pinned hour gutter, and never scroll past
+      // the end of the week.
+      const gutter = document.querySelector('.cal-gutter')?.offsetWidth || 48;
+      const delta = column.getBoundingClientRect().left - body.getBoundingClientRect().left - gutter;
+      body.scrollLeft = Math.max(0, Math.min(
+        body.scrollLeft + delta,
+        body.scrollWidth - body.clientWidth
+      ));
+    }
   }
 }
 
@@ -1119,15 +1162,12 @@ function hourLabel(h) {
 
 function weekCalendarHTML(days, byDay) {
   const all = state.shifts;
-  let earliest = 9 * 60, latest = 18 * 60;
-  for (const s of all) {
-    const st = new Date(s.starts_at), en = new Date(s.ends_at);
-    earliest = Math.min(earliest, st.getHours() * 60 + st.getMinutes());
-    latest = Math.max(latest, dateKey(en) === dateKey(st) ? en.getHours() * 60 + en.getMinutes() : 24 * 60);
-  }
-  const startHour = Math.max(0, Math.floor(earliest / 60) - 1);
-  const endHour = Math.min(24, Math.ceil(latest / 60) + 1);
-  const hours = Math.max(6, endHour - startHour);
+  // Midnight to midnight, always. Load-outs run past 2 AM and deliveries start
+  // before six, so the grid covers the whole day rather than a window guessed
+  // from whatever happens to be booked — it opens scrolled to the working part.
+  const startHour = 0;
+  const endHour = 24;
+  const hours = endHour - startHour;
   const height = hours * CAL_PX_PER_HOUR;
   const todayKey = dateKey(new Date());
 
@@ -1143,11 +1183,12 @@ function weekCalendarHTML(days, byDay) {
       .map((k) => `<span class="cal-mark ${k}" title="${tally[k]} ${STATUS_LABEL[k].toLowerCase()}">${tally[k]}</span>`)
       .join('');
     return `
-      <div class="cal-day ${key === todayKey ? 'today' : ''}">
+      <button type="button" class="cal-day ${key === todayKey ? 'today' : ''} ${key === state.selectedDay ? 'selected' : ''}"
+              data-day="${key}" title="Schedule on ${d.toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric' })}">
         <div class="cal-dow">${d.toLocaleDateString([], { weekday: 'short' }).toUpperCase()}</div>
         <div class="cal-date">${d.getDate()}</div>
         <div class="cal-marks">${marks}</div>
-      </div>`;
+      </button>`;
   }).join('');
 
   const gutter = [...Array(hours)].map((_, i) => `
@@ -1196,7 +1237,8 @@ function weekCalendarHTML(days, byDay) {
     const lines = [...Array(hours)].map((_, i) => `
       <div class="cal-line" style="top:${i * CAL_PX_PER_HOUR}px"></div>`).join('');
 
-    return `<div class="cal-col ${key === todayKey ? 'today' : ''}">${lines}${blocks}</div>`;
+    return `<div class="cal-col ${key === todayKey ? 'today' : ''} ${key === state.selectedDay ? 'selected' : ''}"
+                 data-day="${key}">${lines}${blocks}</div>`;
   }).join('');
 
   // Red "now" line, like the reference calendar.
@@ -1406,14 +1448,23 @@ function openShiftDetail(s) {
   });
 }
 
-function openShiftModal(shift = null) {
+// `prefill` comes from tapping an empty slot in the calendar: { day, startMin }.
+// Without it a new job starts at 9 AM on whichever day is picked, and every new
+// job runs eight hours until the admin says otherwise — a start past 4 PM simply
+// ends the following morning, which is what a load-out actually does.
+function openShiftModal(shift = null, prefill = null) {
   const selected = new Set(shift ? shift.assignees.map((a) => a.id) : []);
-  const day = shift ? dateKey(new Date(shift.starts_at)) : state.selectedDay;
-  const startVal = shift ? toLocalInput(shift.starts_at) : `${day}T09:00`;
-  const endVal = shift ? toLocalInput(shift.ends_at) : `${day}T17:00`;
+  const day = shift ? dateKey(new Date(shift.starts_at)) : (prefill?.day || state.selectedDay);
+  const startMin = prefill?.startMin ?? 9 * 60;
+  const start = new Date(`${day}T00:00`);
+  start.setMinutes(startMin);
+  const end = new Date(start.getTime() + 8 * 3600 * 1000);
+  const startVal = shift ? toLocalInput(shift.starts_at) : toLocalInput(start.toISOString());
+  const endVal = shift ? toLocalInput(shift.ends_at) : toLocalInput(end.toISOString());
+  const dayLabel = new Date(`${day}T12:00`).toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' });
 
   const modal = openModal(`
-    <h3>${shift ? 'Edit job' : 'New job'}</h3>
+    <h3>${shift ? 'Edit job' : `New job — ${esc(dayLabel)}`}</h3>
     <form id="shift-form">
       <label>Title</label><input name="title" required placeholder="e.g. Bar setup — wedding" value="${esc(shift?.title || '')}">
       <label>Venue</label>
