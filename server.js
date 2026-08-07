@@ -698,9 +698,18 @@ app.patch('/api/shifts/:id', requireAuth, requireAdmin, (req, res) => {
   if (shift.attire_id !== updated.attire_id) changes.push('attire');
   if (shift.notes !== updated.notes) changes.push('notes');
 
+  // Being put on a job that already exists is not the same as a job being
+  // created, and it is easy to miss among the rest of the crew's chatter — so it
+  // says so plainly, names the venue and the job, and asks for the reply it
+  // needs. (A brand-new job says "New job" from the POST route above.)
+  const addedBody = [
+    fmtShiftTime(updated.starts_at),
+    updated.venue_name ? `@ ${updated.venue_name}` : '',
+    updated.role_name ? `· ${updated.role_name}` : '',
+  ].filter(Boolean).join(' ');
   notify(added.filter((id) => id !== req.user.id), {
-    title: `New job: ${updated.title}`,
-    body: `${fmtShiftTime(updated.starts_at)}${updated.venue_name ? ' @ ' + updated.venue_name : ''}`,
+    title: `You've been added: ${updated.title}`,
+    body: `${addedBody} — open the job to accept or decline`,
     url: '/#/schedule',
     category: 'jobs',
   });
