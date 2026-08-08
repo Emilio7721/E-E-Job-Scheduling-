@@ -29,6 +29,10 @@ npm install
 npm start          # http://localhost:3000
 ```
 
+Hosting it for the team? **[docs/DEPLOY.md](docs/DEPLOY.md)** covers Railway,
+including the volume you need so a redeploy doesn't wipe the database, the
+signed documents and everyone's session.
+
 No database server or configuration needed — it uses SQLite (built into Node 22+) and stores everything in `data/`. VAPID keys for push notifications are generated automatically on first boot.
 
 **Requires Node.js 22 or newer.**
@@ -53,6 +57,7 @@ Use the **Test** button in Settings to confirm the device receives notifications
 | Env var | Default | Purpose |
 |---|---|---|
 | `PORT` | `3000` | HTTP port |
+| `DATA_DIR` | `./data` | Where the database, secrets and uploads live — point this at a mounted volume when hosting |
 | `APP_TZ` | `America/New_York` | Time zone used in notification text |
 | `VAPID_CONTACT` | `mailto:admin@example.com` | Contact for push service |
 | `TWILIO_ACCOUNT_SID` | — | Carrier account for real text messages |
