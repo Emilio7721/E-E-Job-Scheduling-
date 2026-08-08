@@ -2,7 +2,13 @@ const { DatabaseSync } = require('node:sqlite');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const DATA_DIR = path.join(__dirname, '..', 'data');
+// Everything that must survive a restart lives here: the SQLite database, the
+// session-signing secret, the VAPID keys, and uploaded/signed documents. On a
+// host with an ephemeral filesystem (Railway, Fly, Render) point DATA_DIR at a
+// mounted volume — see docs/DEPLOY.md — or a redeploy takes the lot with it.
+const DATA_DIR = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : path.join(__dirname, '..', 'data');
 const UPLOAD_DIR = path.join(DATA_DIR, 'documents');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });

@@ -3,7 +3,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
 const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
-const { db, UPLOAD_DIR, newPin } = require('./src/db');
+const { db, DATA_DIR, UPLOAD_DIR, newPin } = require('./src/db');
 const {
   hashPassword, verifyPassword, issueToken, verifyToken, tokenFromReq,
   requireAuth, requireAdmin,
@@ -72,6 +72,22 @@ function notify(userIds, { title, body = '', url = '/', category = 'jobs' }) {
     if (wantsPush(userId, category)) push.pushToUser(userId, { title, body, url }).catch(() => {});
   }
 }
+
+/* ---------------------------------- health --------------------------------- */
+
+// What a platform health check should hit. The catch-all below serves the app
+// shell for any unknown path, so "/" answers 200 even when the database is
+// unreachable — this actually touches it, and reports the data directory so a
+// misconfigured volume mount shows up immediately instead of silently starting
+// a brand-new database on ephemeral disk.
+app.get('/api/health', (req, res) => {
+  try {
+    const { n } = db.prepare('SELECT COUNT(*) AS n FROM users').get();
+    res.json({ ok: true, users: n, data_dir: DATA_DIR, uptime: Math.round(process.uptime()) });
+  } catch (err) {
+    res.status(503).json({ ok: false, error: err.message });
+  }
+});
 
 /* ---------------------------------- auth ---------------------------------- */
 
